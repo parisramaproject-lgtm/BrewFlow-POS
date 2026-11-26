@@ -237,3 +237,39 @@ export function getSupabaseGoogleAuthErrorMessage(error: unknown): string {
   }
   return 'Gagal masuk menggunakan Google melalui Supabase Auth. Silakan coba lagi.';
 }
+
+export const CANONICAL_PRODUCTION_URL = 'https://brewflow-pos.vercel.app/';
+
+/**
+ * Resolves the safe OAuth `redirectTo` URL for Supabase Google sign-in.
+ * - Uses explicit `VITE_APP_URL` / `NEXT_PUBLIC_APP_URL` when configured.
+ * - Pins any `brewflow-pos*.vercel.app` deployment/preview host to the canonical
+ *   production alias (`https://brewflow-pos.vercel.app/`) so redeploys never break
+ *   Supabase Redirect URLs or trigger Vercel Deployment Protection screens.
+ */
+export function resolveOAuthRedirectUrl(
+  currentOrigin: string,
+  configuredAppUrl?: string | null
+): string {
+  const candidate = (configuredAppUrl ?? '').trim();
+  if (candidate && candidate !== 'MY_APP_URL') {
+    try {
+      const parsed = new URL(candidate);
+      if (parsed.protocol === 'https:' || parsed.protocol === 'http:') {
+        return `${parsed.origin}/`;
+      }
+    } catch {
+      // Ignore malformed env var and fall through to origin resolution
+    }
+  }
+
+  try {
+    const parsedOrigin = new URL(currentOrigin);
+    if (/^brewflow-pos(?:-[a-z0-9-]+)?\.vercel\.app$/i.test(parsedOrigin.hostname)) {
+      return CANONICAL_PRODUCTION_URL;
+    }
+    return `${parsedOrigin.origin}/`;
+  } catch {
+    return CANONICAL_PRODUCTION_URL;
+  }
+}

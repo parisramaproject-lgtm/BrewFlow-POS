@@ -11,6 +11,7 @@ import {
   mergeGoogleProfileIntoEmployee,
   normalizeEmail,
   normalizeEmployeeRole,
+  resolveOAuthRedirectUrl,
 } from './googleAuth';
 
 const SAMPLE_EMPLOYEES: UserProfile[] = [
@@ -152,5 +153,25 @@ test('normalizeEmployeeRole and isEmployeeRowActive handle minimal schemas clean
   assert.equal(isEmployeeRowActive({ is_active: true }), true);
   assert.equal(isEmployeeRowActive({ is_active: false }), false);
   assert.equal(isEmployeeRowActive({ is_active: 'false' }), false);
+});
+
+test('resolveOAuthRedirectUrl pins Vercel preview hosts to canonical production URL', () => {
+  assert.equal(
+    resolveOAuthRedirectUrl('https://brewflow-pos-git-main-abc123.vercel.app'),
+    'https://brewflow-pos.vercel.app/'
+  );
+  assert.equal(
+    resolveOAuthRedirectUrl('https://brewflow-pos.vercel.app'),
+    'https://brewflow-pos.vercel.app/'
+  );
+  assert.equal(resolveOAuthRedirectUrl('http://localhost:3000'), 'http://localhost:3000/');
+  assert.equal(
+    resolveOAuthRedirectUrl('https://brewflow-pos.vercel.app', 'https://pos.kopiku.id/login'),
+    'https://pos.kopiku.id/'
+  );
+  assert.equal(
+    resolveOAuthRedirectUrl('https://brewflow-pos-xyz.vercel.app', 'MY_APP_URL'),
+    'https://brewflow-pos.vercel.app/'
+  );
 });
 

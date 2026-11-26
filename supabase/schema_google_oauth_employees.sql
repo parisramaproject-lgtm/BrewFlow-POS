@@ -72,7 +72,31 @@ SET
 WHERE email <> lower(trim(email))
    OR (username IS NOT NULL AND username <> lower(trim(username)));
 
--- 2. Fungsi helper RLS (SECURITY DEFINER agar tidak terjadi infinite recursion)
+-- 2. Tabel sesi login Username & fungsi helper RLS (SECURITY DEFINER agar tidak terjadi infinite recursion)
+CREATE TABLE IF NOT EXISTS public.app_sessions (
+  token text PRIMARY KEY,
+  employee_id uuid NOT NULL REFERENCES public.employees(id) ON DELETE CASCADE,
+  role text NOT NULL,
+  expires_at timestamptz NOT NULL DEFAULT (now() + interval '7 days'),
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+ALTER TABLE public.app_sessions ENABLE ROW LEVEL SECURITY;
+
+CREATE OR REPLACE FUNCTION public.get_app_session_token()
+RETURNS text
+LANGUAGE sql
+STABLE
+AS $$
+  SELECT nullif(
+    substring(
+      coalesce((current_setting('request.headers', true)::jsonb ->> 'x-client-info'), '')
+      FROM 'bf-sess=([a-f0-9]{64})'
+    ),
+    ''
+  );
+$$;
+
 CREATE OR REPLACE FUNCTION public.is_active_owner()
 RETURNS boolean
 LANGUAGE sql
@@ -80,12 +104,23 @@ STABLE
 SECURITY DEFINER
 SET search_path = public
 AS $$
-  SELECT EXISTS (
-    SELECT 1
-    FROM public.employees e
-    WHERE lower(trim(e.email)) = lower(trim(coalesce(auth.jwt() ->> 'email', '')))
-      AND lower(trim(e.role)) = 'owner'
-      AND e.is_active = true
+  SELECT (
+    EXISTS (
+      SELECT 1
+      FROM public.employees e
+      WHERE lower(trim(e.email)) = lower(trim(coalesce(auth.jwt() ->> 'email', '')))
+        AND lower(trim(e.role::text)) = 'owner'
+        AND e.is_active = true
+    )
+    OR EXISTS (
+      SELECT 1
+      FROM public.app_sessions s
+      JOIN public.employees e ON e.id = s.employee_id
+      WHERE s.token = public.get_app_session_token()
+        AND s.expires_at > now()
+        AND lower(trim(e.role::text)) = 'owner'
+        AND e.is_active = true
+    )
   );
 $$;
 
@@ -128,7 +163,7 @@ END;
 $$;
 
 -- 2c. RPC SECURITY DEFINER untuk Login Username & Password (tanpa Google OAuth)
--- Memverifikasi bcrypt hash di sisi server (pgcrypto) dan mencatat log audit login.
+-- Memverifikasi bcrypt hash di sisi server (pgcrypto), menerbitkan token sesi 7 hari, dan mencatat log audit login.
 CREATE OR REPLACE FUNCTION public.authenticate_employee_username(
   p_username text,
   p_password text
@@ -141,6 +176,7 @@ AS $$
 DECLARE
   v_clean_username text;
   v_emp public.employees%ROWTYPE;
+  v_token text;
 BEGIN
   v_clean_username := lower(trim(regexp_replace(coalesce(p_username, ''), '^@+', '')));
 
@@ -169,13 +205,83 @@ BEGIN
     );
   END IF;
 
+  DELETE FROM public.app_sessions WHERE expires_at < now();
+  v_token := encode(gen_random_bytes(32), 'hex');
+  INSERT INTO public.app_sessions (token, employee_id, role, expires_at)
+  VALUES (v_token, v_emp.id, v_emp.role::text, now() + interval '7 days');
+
   INSERT INTO public.login_audit_logs (employee_id, username, employee_name, role, owner_email)
-  VALUES (v_emp.id, v_emp.username, v_emp.full_name, v_emp.role, 'parisramaproject@gmail.com');
+  VALUES (v_emp.id, v_emp.username, v_emp.full_name, v_emp.role::text, 'parisramaproject@gmail.com');
+
+  RETURN jsonb_build_object(
+    'status', 'ok',
+    'session_token', v_token,
+    'employee', (to_jsonb(v_emp) - 'password_hash') || jsonb_build_object('has_password', true)
+  );
+END;
+$$;
+
+-- 2c2. RPC SECURITY DEFINER untuk memulihkan sesi Username saat browser di-reload
+CREATE OR REPLACE FUNCTION public.get_app_session_profile()
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_token text;
+  v_emp public.employees%ROWTYPE;
+BEGIN
+  v_token := public.get_app_session_token();
+  IF v_token IS NULL THEN
+    RETURN jsonb_build_object('status', 'invalid');
+  END IF;
+
+  SELECT e.*
+  INTO v_emp
+  FROM public.app_sessions s
+  JOIN public.employees e ON e.id = s.employee_id
+  WHERE s.token = v_token
+    AND s.expires_at > now()
+  LIMIT 1;
+
+  IF NOT FOUND THEN
+    DELETE FROM public.app_sessions WHERE token = v_token;
+    RETURN jsonb_build_object('status', 'invalid');
+  END IF;
+
+  IF v_emp.is_active = false THEN
+    DELETE FROM public.app_sessions WHERE token = v_token;
+    RETURN jsonb_build_object(
+      'status', 'inactive',
+      'message', format('Akun karyawan "%s" (@%s) sedang berstatus Nonaktif. Hubungi Owner.', v_emp.full_name, coalesce(v_emp.username, v_emp.email))
+    );
+  END IF;
+
+  UPDATE public.app_sessions
+  SET expires_at = now() + interval '7 days'
+  WHERE token = v_token;
 
   RETURN jsonb_build_object(
     'status', 'ok',
     'employee', (to_jsonb(v_emp) - 'password_hash') || jsonb_build_object('has_password', true)
   );
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION public.revoke_app_session()
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_token text;
+BEGIN
+  v_token := public.get_app_session_token();
+  IF v_token IS NOT NULL THEN
+    DELETE FROM public.app_sessions WHERE token = v_token;
+  END IF;
 END;
 $$;
 
@@ -231,11 +337,15 @@ END;
 $$;
 
 GRANT USAGE ON SCHEMA public TO anon, authenticated;
-GRANT SELECT, INSERT, UPDATE, DELETE ON public.employees TO authenticated;
+GRANT SELECT, INSERT, UPDATE, DELETE ON public.employees TO anon, authenticated;
 GRANT SELECT ON public.login_audit_logs TO authenticated;
+GRANT EXECUTE ON FUNCTION public.get_app_session_token() TO anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.is_active_owner() TO anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.get_my_employee_profile() TO authenticated;
 GRANT EXECUTE ON FUNCTION public.authenticate_employee_username(text, text) TO anon, authenticated;
-GRANT EXECUTE ON FUNCTION public.set_employee_username_credentials(text, text, text) TO authenticated;
+GRANT EXECUTE ON FUNCTION public.get_app_session_profile() TO anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.revoke_app_session() TO anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.set_employee_username_credentials(text, text, text) TO anon, authenticated;
 
 -- 3. Aktifkan Row Level Security (RLS) pada tabel employees & login_audit_logs
 ALTER TABLE public.employees ENABLE ROW LEVEL SECURITY;

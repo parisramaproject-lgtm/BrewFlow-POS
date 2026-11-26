@@ -132,11 +132,11 @@ BEGIN
     );
   END IF;
 
-  -- Hapus sesi kadaluarsa & terbitkan token sesi acak baru (24 jam)
+  -- Hapus sesi kadaluarsa & terbitkan token sesi acak baru (7 hari)
   DELETE FROM public.app_sessions WHERE expires_at < now();
   v_token := encode(gen_random_bytes(32), 'hex');
   INSERT INTO public.app_sessions (token, employee_id, role, expires_at)
-  VALUES (v_token, v_emp.id, v_emp.role::text, now() + interval '24 hours');
+  VALUES (v_token, v_emp.id, v_emp.role::text, now() + interval '7 days');
 
   IF to_regclass('public.login_audit_logs') IS NOT NULL THEN
     INSERT INTO public.login_audit_logs (employee_id, username, employee_name, role, owner_email)
@@ -146,6 +146,55 @@ BEGIN
   RETURN jsonb_build_object(
     'status', 'ok',
     'session_token', v_token,
+    'employee', (to_jsonb(v_emp) - 'password_hash') || jsonb_build_object('has_password', true)
+  );
+END;
+$$;
+
+-- RPC untuk memulihkan sesi login Username secara aman setelah browser di-reload (F5)
+CREATE OR REPLACE FUNCTION public.get_app_session_profile()
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_token text;
+  v_emp public.employees%ROWTYPE;
+BEGIN
+  v_token := public.get_app_session_token();
+  IF v_token IS NULL THEN
+    RETURN jsonb_build_object('status', 'invalid');
+  END IF;
+
+  SELECT e.*
+  INTO v_emp
+  FROM public.app_sessions s
+  JOIN public.employees e ON e.id = s.employee_id
+  WHERE s.token = v_token
+    AND s.expires_at > now()
+  LIMIT 1;
+
+  IF NOT FOUND THEN
+    DELETE FROM public.app_sessions WHERE token = v_token;
+    RETURN jsonb_build_object('status', 'invalid');
+  END IF;
+
+  IF v_emp.is_active = false THEN
+    DELETE FROM public.app_sessions WHERE token = v_token;
+    RETURN jsonb_build_object(
+      'status', 'inactive',
+      'message', format('Akun karyawan "%s" (@%s) sedang berstatus Nonaktif. Hubungi Owner.', v_emp.full_name, coalesce(v_emp.username, v_emp.email))
+    );
+  END IF;
+
+  -- Perpanjang masa berlaku sesi aktif (sliding 7 hari)
+  UPDATE public.app_sessions
+  SET expires_at = now() + interval '7 days'
+  WHERE token = v_token;
+
+  RETURN jsonb_build_object(
+    'status', 'ok',
     'employee', (to_jsonb(v_emp) - 'password_hash') || jsonb_build_object('has_password', true)
   );
 END;
@@ -173,10 +222,11 @@ GRANT EXECUTE ON FUNCTION public.get_app_session_token() TO anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.is_active_employee() TO anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.is_active_owner() TO anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.authenticate_employee_username(text, text) TO anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.get_app_session_profile() TO anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.set_employee_username_credentials(text, text, text) TO anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.revoke_app_session() TO anon, authenticated;
 
--- Perbarui policy employees agar Owner yang login via Username juga bisa mengelola karyawan
+-- Perbarui policy employees agar Owner & karyawan aktif (Google/Email/Username) dapat membaca data yang berhak diakses
 GRANT SELECT, INSERT, UPDATE, DELETE ON public.employees TO anon, authenticated;
 DROP POLICY IF EXISTS "Employees read own or owner reads all" ON public.employees;
 CREATE POLICY "Employees read own or owner reads all"
@@ -187,6 +237,13 @@ CREATE POLICY "Employees read own or owner reads all"
     lower(trim(email)) = lower(trim(coalesce(auth.jwt() ->> 'email', '')))
     OR auth_user_id = auth.uid()
     OR public.is_active_owner()
+    OR EXISTS (
+      SELECT 1
+      FROM public.app_sessions s
+      WHERE s.token = public.get_app_session_token()
+        AND s.employee_id = employees.id
+        AND s.expires_at > now()
+    )
   );
 
 DROP POLICY IF EXISTS "Owner can insert employees" ON public.employees;

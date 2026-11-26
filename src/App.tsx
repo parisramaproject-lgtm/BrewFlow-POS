@@ -19,14 +19,47 @@ import { TVDisplayPage } from './pages/TVDisplayPage';
 import type { PageId } from './types';
 import { getDefaultPageForRole } from './utils/rbac';
 
+const ACTIVE_PAGE_STORAGE_KEY = 'brewflow_active_page_v1';
+const VALID_PAGES: PageId[] = [
+  'dashboard',
+  'pos',
+  'orders',
+  'menu-hpp',
+  'inventory',
+  'purchasing',
+  'stock-opname',
+  'membership',
+  'tv-display',
+  'employees',
+  'settings',
+];
+
+function loadInitialActivePage(): PageId {
+  try {
+    const saved = window.sessionStorage.getItem(ACTIVE_PAGE_STORAGE_KEY) as PageId | null;
+    if (saved && VALID_PAGES.includes(saved)) {
+      return saved;
+    }
+  } catch {
+    // Ignore storage restrictions
+  }
+  return 'pos';
+}
+
 function AuthenticatedApp() {
   const { user, isLoading, canAccess } = useAuth();
-  const [activePage, setActivePage] = useState<PageId>('pos');
+  const [activePage, setActivePage] = useState<PageId>(loadInitialActivePage);
   const [searchQuery, setSearchQuery] = useState('');
 
   useEffect(() => {
     if (user && !canAccess(activePage)) {
-      setActivePage(getDefaultPageForRole(user.role));
+      const fallback = getDefaultPageForRole(user.role);
+      setActivePage(fallback);
+      try {
+        window.sessionStorage.setItem(ACTIVE_PAGE_STORAGE_KEY, fallback);
+      } catch {
+        // Ignore storage restrictions
+      }
     }
   }, [user, activePage, canAccess]);
 
@@ -50,6 +83,11 @@ function AuthenticatedApp() {
   const handleSelectPage = (page: PageId) => {
     setSearchQuery('');
     setActivePage(page);
+    try {
+      window.sessionStorage.setItem(ACTIVE_PAGE_STORAGE_KEY, page);
+    } catch {
+      // Ignore storage restrictions
+    }
   };
 
   const renderPage = () => {

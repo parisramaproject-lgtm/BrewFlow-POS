@@ -4,12 +4,23 @@ import fs from 'fs';
 import path from 'path';
 import {defineConfig} from 'vite';
 
+import handleAuthSessionRequest from './api/auth-session';
+
 export default defineConfig(() => {
   return {
     envPrefix: ['VITE_', 'NEXT_PUBLIC_'],
     plugins: [
       react(),
       tailwindcss(),
+      {
+        name: 'brewflow-dev-auth-session-api',
+        apply: 'serve',
+        configureServer(server) {
+          server.middlewares.use('/api/auth-session', (req, res) => {
+            void handleAuthSessionRequest(req, res);
+          });
+        },
+      },
       // Copies src/assets into dist/ so root-relative URLs like
       // "/src/assets/images/..." (e.g. generate_image output) still resolve
       // in production builds. Do not remove.

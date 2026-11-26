@@ -5,8 +5,20 @@ const env = ((import.meta as { env?: Record<string, string | undefined> }).env ?
   string | undefined
 >;
 
+export function normalizeSupabaseUrl(rawUrl: string): string {
+  const trimmed = rawUrl.trim().replace(/\/+$/, '');
+  if (!trimmed) return '';
+  try {
+    const parsed = new URL(trimmed);
+    const cleanPath = parsed.pathname.replace(/\/+(rest|auth|storage|realtime)\/v\d+\/?$/i, '').replace(/\/+$/, '');
+    return `${parsed.origin}${cleanPath}`;
+  } catch {
+    return trimmed.replace(/\/+(rest|auth|storage|realtime)\/v\d+\/?$/i, '').replace(/\/+$/, '');
+  }
+}
+
 // Support both Vite (`VITE_*`) and Vercel-Supabase Marketplace (`NEXT_PUBLIC_*`) public env vars.
-const supabaseUrl = (env.VITE_SUPABASE_URL || env.NEXT_PUBLIC_SUPABASE_URL || '').trim();
+const supabaseUrl = normalizeSupabaseUrl(env.VITE_SUPABASE_URL || env.NEXT_PUBLIC_SUPABASE_URL || '');
 const supabaseAnonKey = (
   env.VITE_SUPABASE_ANON_KEY ||
   env.NEXT_PUBLIC_SUPABASE_ANON_KEY ||

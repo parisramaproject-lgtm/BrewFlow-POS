@@ -19,6 +19,7 @@ import {
   mergeGoogleProfileIntoEmployee,
   normalizeEmail,
   normalizeEmployeeRole,
+  resolveOAuthRedirectUrl,
 } from '../utils/googleAuth';
 import {
   canAccessPage as checkCanAccessPage,
@@ -31,10 +32,62 @@ import {
   DEFAULT_OWNER_ALERT_EMAIL,
   sendOwnerUsernameLoginAlert,
 } from '../services/loginAlertService';
+import {
+  clearAppSessionCookie,
+  persistAppSessionCookie,
+  restoreAppSessionCookie,
+} from '../services/sessionCookieService';
 import { normalizeUsername, verifyPasswordLocal } from '../utils/usernameAuth';
 import { useStore } from './StoreContext';
 
 const LEGACY_DEMO_STORAGE_KEY = 'brewflow_demo_role_v1';
+
+function mapEmployeeRowToProfile(
+  row: Record<string, unknown>,
+  fallbackUsername?: string
+): UserProfile {
+  const cleanFallback = fallbackUsername ? normalizeUsername(fallbackUsername) : '';
+  const fullName = String(row.full_name || row.name || cleanFallback || 'Karyawan').trim();
+  const initials = fullName
+    .split(/\s+/)
+    .map((part) => part[0])
+    .join('')
+    .slice(0, 2)
+    .toUpperCase();
+
+  return {
+    id: String(row.id || `usr-${Date.now()}`),
+    full_name: fullName,
+    email: normalizeEmail(typeof row.email === 'string' ? row.email : ''),
+    username:
+      typeof row.username === 'string' && row.username.trim()
+        ? normalizeUsername(row.username)
+        : cleanFallback || undefined,
+    has_password: Boolean(row.has_password ?? true),
+    role: normalizeEmployeeRole(row.role),
+    phone_number: String(row.phone_number || '-'),
+    avatar_initials: initials || 'BF',
+    is_active: row.is_active !== false,
+    shift: typeof row.shift === 'string' ? row.shift : undefined,
+    position: typeof row.position === 'string' ? row.position : undefined,
+    created_at: String(row.created_at || new Date().toISOString()),
+  };
+}
+
+function isLikelyTransientAuthOrNetworkError(message: string | null): boolean {
+  if (!message) return false;
+  const lower = message.toLowerCase();
+  return (
+    lower.includes('jwt') ||
+    lower.includes('expired') ||
+    lower.includes('401') ||
+    lower.includes('failed to fetch') ||
+    lower.includes('load failed') ||
+    lower.includes('network') ||
+    lower.includes('timeout') ||
+    lower.includes('abort')
+  );
+}
 
 interface AuthContextValue {
   user: UserProfile | null;
@@ -109,244 +162,282 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
    * Strictly rejects unregistered or inactive Google accounts and signs them out immediately,
    * while surfacing actionable RLS/permission diagnostics if the database query itself was blocked.
    */
-  const resolveSupabaseUserInner = useCallback(async (sbUser: SupabaseUser) => {
-    const identity = extractSupabaseUserIdentity(sbUser);
-    const isGoogleLogin = identity.provider === 'google';
-    const normalizedEmail = normalizeEmail(identity.email);
-    let dbAccessError: string | null = null;
+  const resolveSupabaseUserInner = useCallback(
+    async (sbUser: SupabaseUser, options?: { isSessionRestore?: boolean }) => {
+      const identity = extractSupabaseUserIdentity(sbUser);
+      const isGoogleLogin = identity.provider === 'google';
+      const normalizedEmail = normalizeEmail(identity.email);
+      let dbAccessError: string | null = null;
 
-    if (supabase) {
-      try {
-        let matchedRow: Record<string, unknown> | null = null;
-        let matchedFromEmployeesTable = false;
+      if (supabase) {
+        const client = supabase;
+        const queryEmployeeFromSupabase = async (): Promise<{
+          matchedRow: Record<string, unknown> | null;
+          matchedFromEmployeesTable: boolean;
+          accessError: string | null;
+        }> => {
+          let matchedRow: Record<string, unknown> | null = null;
+          let matchedFromEmployeesTable = false;
+          let accessError: string | null = null;
 
-        // 1. Try SECURITY DEFINER RPC if deployed (immune to client-side RLS edge cases)
+          // 1. Try SECURITY DEFINER RPC if deployed (immune to client-side RLS edge cases)
+          try {
+            const { data: rpcData, error: rpcError } = await client.rpc('get_my_employee_profile');
+            if (!rpcError && rpcData && typeof rpcData === 'object') {
+              const candidate = Array.isArray(rpcData) ? rpcData[0] : rpcData;
+              if (candidate && typeof candidate === 'object') {
+                matchedRow = candidate as Record<string, unknown>;
+                matchedFromEmployeesTable = true;
+              }
+            } else if (rpcError) {
+              const code = String(rpcError.code ?? '');
+              if (code !== 'PGRST202' && code !== '42883') {
+                accessError = rpcError.message;
+              }
+            }
+          } catch (err) {
+            if (err instanceof Error) accessError = err.message;
+          }
+
+          // 2. Query `employees` with select('*') so optional/missing columns never cause a query error
+          if (!matchedRow && normalizedEmail) {
+            const { data: empExactRows, error: empExactErr } = await client
+              .from('employees')
+              .select('*')
+              .ilike('email', normalizedEmail)
+              .limit(5);
+
+            if (empExactErr) {
+              const code = String(empExactErr.code ?? '');
+              if (code !== '42P01' && code !== 'PGRST205') {
+                accessError = empExactErr.message;
+              }
+            } else if (empExactRows && empExactRows.length > 0) {
+              matchedRow = findMatchingDatabaseRow(
+                empExactRows as Array<Record<string, unknown>>,
+                normalizedEmail,
+                sbUser.id
+              );
+              if (matchedRow) matchedFromEmployeesTable = true;
+            }
+          }
+
+          // 2b. Fallback scan of visible `employees` rows
+          if (!matchedRow) {
+            const { data: empListRows, error: empListErr } = await client
+              .from('employees')
+              .select('*')
+              .limit(200);
+
+            if (!empListErr && empListRows && empListRows.length > 0) {
+              matchedRow = findMatchingDatabaseRow(
+                empListRows as Array<Record<string, unknown>>,
+                normalizedEmail,
+                sbUser.id
+              );
+              if (matchedRow) matchedFromEmployeesTable = true;
+            } else if (empListErr && !accessError) {
+              const code = String(empListErr.code ?? '');
+              if (code !== '42P01' && code !== 'PGRST205') {
+                accessError = empListErr.message;
+              }
+            }
+          }
+
+          // 3. Fallback to `profiles` table by auth user ID
+          if (!matchedRow) {
+            const { data: profByIdRows, error: profByIdErr } = await client
+              .from('profiles')
+              .select('*')
+              .eq('id', sbUser.id)
+              .limit(1);
+
+            if (!profByIdErr && profByIdRows && profByIdRows.length > 0) {
+              matchedRow = profByIdRows[0] as Record<string, unknown>;
+            }
+          }
+
+          // 3b. Fallback to `profiles` table by email
+          if (!matchedRow && normalizedEmail) {
+            const { data: profByEmailRows, error: profEmailErr } = await client
+              .from('profiles')
+              .select('*')
+              .ilike('email', normalizedEmail)
+              .limit(5);
+
+            if (!profEmailErr && profByEmailRows && profByEmailRows.length > 0) {
+              matchedRow = findMatchingDatabaseRow(
+                profByEmailRows as Array<Record<string, unknown>>,
+                normalizedEmail,
+                sbUser.id
+              );
+            }
+          }
+
+          return { matchedRow, matchedFromEmployeesTable, accessError };
+        };
+
         try {
-          const { data: rpcData, error: rpcError } = await supabase.rpc('get_my_employee_profile');
-          if (!rpcError && rpcData && typeof rpcData === 'object') {
-            const candidate = Array.isArray(rpcData) ? rpcData[0] : rpcData;
-            if (candidate && typeof candidate === 'object') {
-              matchedRow = candidate as Record<string, unknown>;
-              matchedFromEmployeesTable = true;
+          let result = await queryEmployeeFromSupabase();
+          dbAccessError = result.accessError;
+
+          // If the JWT just expired or a transient 401 occurred on reload, refresh session once & retry
+          if (
+            !result.matchedRow &&
+            (isLikelyTransientAuthOrNetworkError(dbAccessError) || options?.isSessionRestore)
+          ) {
+            const { data: refreshed } = await client.auth.refreshSession();
+            if (refreshed.session?.user) {
+              result = await queryEmployeeFromSupabase();
+              dbAccessError = result.accessError;
             }
           }
-        } catch {
-          // RPC not installed yet — proceed with direct table queries
-        }
 
-        // 2. Query `employees` with select('*') so optional/missing columns never cause a query error
-        if (!matchedRow && normalizedEmail) {
-          const { data: empExactRows, error: empExactErr } = await supabase
-            .from('employees')
-            .select('*')
-            .ilike('email', normalizedEmail)
-            .limit(5);
-
-          if (empExactErr) {
-            const code = String(empExactErr.code ?? '');
-            if (code !== '42P01' && code !== 'PGRST205') {
-              dbAccessError = empExactErr.message;
+          if (result.matchedRow) {
+            const matchedRow = result.matchedRow;
+            if (!isEmployeeRowActive(matchedRow)) {
+              const name = String(matchedRow.full_name || normalizedEmail || 'Karyawan');
+              await supabase.auth.signOut();
+              setUser(null);
+              setAuthMode(null);
+              setAuthProvider(null);
+              setAuthError(
+                `Akun karyawan "${name}" (${normalizedEmail}) sedang berstatus Nonaktif. Hubungi Owner untuk mengaktifkan kembali akses.`
+              );
+              return;
             }
-          } else if (empExactRows && empExactRows.length > 0) {
-            matchedRow = findMatchingDatabaseRow(
-              empExactRows as Array<Record<string, unknown>>,
-              normalizedEmail,
-              sbUser.id
-            );
-            if (matchedRow) matchedFromEmployeesTable = true;
-          }
-        }
 
-        // 2b. Fallback scan of visible `employees` rows (handles accidental leading/trailing spaces in DB email or auth_user_id match)
-        if (!matchedRow) {
-          const { data: empListRows, error: empListErr } = await supabase
-            .from('employees')
-            .select('*')
-            .limit(200);
+            const fullName = String(
+              matchedRow.full_name ||
+                matchedRow.name ||
+                identity.displayName ||
+                normalizedEmail.split('@')[0] ||
+                'Karyawan'
+            ).trim();
+            const initials = fullName
+              .split(/\s+/)
+              .map((part) => part[0])
+              .join('')
+              .slice(0, 2)
+              .toUpperCase();
 
-          if (!empListErr && empListRows && empListRows.length > 0) {
-            matchedRow = findMatchingDatabaseRow(
-              empListRows as Array<Record<string, unknown>>,
-              normalizedEmail,
-              sbUser.id
-            );
-            if (matchedRow) matchedFromEmployeesTable = true;
-          } else if (empListErr && !dbAccessError) {
-            const code = String(empListErr.code ?? '');
-            if (code !== '42P01' && code !== 'PGRST205') {
-              dbAccessError = empListErr.message;
+            const dbEmployee: UserProfile = {
+              id: sbUser.id,
+              full_name: fullName,
+              email: normalizeEmail(
+                typeof matchedRow.email === 'string' ? matchedRow.email : normalizedEmail
+              ),
+              role: normalizeEmployeeRole(matchedRow.role),
+              phone_number: String(matchedRow.phone_number || '-'),
+              avatar_initials: initials || 'BF',
+              is_active: true,
+              shift: typeof matchedRow.shift === 'string' ? matchedRow.shift : undefined,
+              position: typeof matchedRow.position === 'string' ? matchedRow.position : undefined,
+              created_at: String(matchedRow.created_at || new Date().toISOString()),
+            };
+
+            if (result.matchedFromEmployeesTable) {
+              void (async () => {
+                try {
+                  await supabase.from('profiles').upsert(
+                    {
+                      id: sbUser.id,
+                      full_name: dbEmployee.full_name,
+                      role: dbEmployee.role,
+                      phone_number: dbEmployee.phone_number,
+                    },
+                    { onConflict: 'id' }
+                  );
+                } catch {
+                  // Non-blocking FK sync
+                }
+              })();
             }
-          }
-        }
 
-        // 3. Fallback to `profiles` table by auth user ID (works for both Google OAuth and Email logins)
-        if (!matchedRow) {
-          const { data: profByIdRows, error: profByIdErr } = await supabase
-            .from('profiles')
-            .select('*')
-            .eq('id', sbUser.id)
-            .limit(1);
-
-          if (!profByIdErr && profByIdRows && profByIdRows.length > 0) {
-            matchedRow = profByIdRows[0] as Record<string, unknown>;
-          }
-        }
-
-        // 3b. Fallback to `profiles` table by email (if `email` column exists in `profiles`)
-        if (!matchedRow && normalizedEmail) {
-          const { data: profByEmailRows, error: profEmailErr } = await supabase
-            .from('profiles')
-            .select('*')
-            .ilike('email', normalizedEmail)
-            .limit(5);
-
-          if (!profEmailErr && profByEmailRows && profByEmailRows.length > 0) {
-            matchedRow = findMatchingDatabaseRow(
-              profByEmailRows as Array<Record<string, unknown>>,
-              normalizedEmail,
-              sbUser.id
-            );
-          }
-        }
-
-        if (matchedRow) {
-          if (!isEmployeeRowActive(matchedRow)) {
-            const name = String(matchedRow.full_name || normalizedEmail || 'Karyawan');
-            await supabase.auth.signOut();
-            setUser(null);
-            setAuthMode(null);
-            setAuthProvider(null);
-            setAuthError(
-              `Akun karyawan "${name}" (${normalizedEmail}) sedang berstatus Nonaktif. Hubungi Owner untuk mengaktifkan kembali akses.`
-            );
+            setAppSessionToken(null);
+            void clearAppSessionCookie();
+            setAuthError(null);
+            setUser(mergeGoogleProfileIntoEmployee(dbEmployee, identity));
+            setAuthMode('supabase');
+            setAuthProvider(isGoogleLogin ? 'google' : 'email');
+            void refreshAllFromSupabase();
             return;
           }
-
-          const fullName = String(
-            matchedRow.full_name ||
-              matchedRow.name ||
-              identity.displayName ||
-              normalizedEmail.split('@')[0] ||
-              'Karyawan'
-          ).trim();
-          const initials = fullName
-            .split(/\s+/)
-            .map((part) => part[0])
-            .join('')
-            .slice(0, 2)
-            .toUpperCase();
-
-          const dbEmployee: UserProfile = {
-            id: sbUser.id,
-            full_name: fullName,
-            email: normalizeEmail(
-              typeof matchedRow.email === 'string' ? matchedRow.email : normalizedEmail
-            ),
-            role: normalizeEmployeeRole(matchedRow.role),
-            phone_number: String(matchedRow.phone_number || '-'),
-            avatar_initials: initials || 'BF',
-            is_active: true,
-            shift: typeof matchedRow.shift === 'string' ? matchedRow.shift : undefined,
-            position: typeof matchedRow.position === 'string' ? matchedRow.position : undefined,
-            created_at: String(matchedRow.created_at || new Date().toISOString()),
-          };
-
-          if (matchedFromEmployeesTable) {
-            void (async () => {
-              try {
-                await supabase.from('profiles').upsert(
-                  {
-                    id: sbUser.id,
-                    full_name: dbEmployee.full_name,
-                    role: dbEmployee.role,
-                    phone_number: dbEmployee.phone_number,
-                  },
-                  { onConflict: 'id' }
-                );
-              } catch {
-                // Non-blocking FK sync
-              }
-            })();
+        } catch (err) {
+          if (!dbAccessError && err instanceof Error) {
+            dbAccessError = err.message;
           }
+        }
+      }
 
-          setAppSessionToken(null);
-          setAuthError(null);
-          setUser(mergeGoogleProfileIntoEmployee(dbEmployee, identity));
-          setAuthMode('supabase');
-          setAuthProvider(isGoogleLogin ? 'google' : 'email');
-          void refreshAllFromSupabase();
+      const localMatch = matchEmployeeByEmail(identity.email, employeesRef.current);
+
+      if (localMatch.status === 'matched') {
+        setAppSessionToken(null);
+        void clearAppSessionCookie();
+        setAuthError(null);
+        setUser(mergeGoogleProfileIntoEmployee(localMatch.employee, identity));
+        setAuthMode('supabase');
+        setAuthProvider(isGoogleLogin ? 'google' : 'email');
+        void refreshAllFromSupabase();
+        return;
+      }
+
+      if (localMatch.status === 'inactive') {
+        if (supabase) await supabase.auth.signOut();
+        setUser(null);
+        setAuthMode(null);
+        setAuthProvider(null);
+        setAuthError(localMatch.message);
+        return;
+      }
+
+      if (isGoogleLogin) {
+        // Never destroy a valid Google OAuth session on a transient DB/network hiccup during reload
+        if (dbAccessError) {
+          setAuthError(
+            `Gagal membaca tabel karyawan di Supabase untuk "${normalizedEmail}" (${dbAccessError}). Muat ulang halaman atau pastikan policy RLS di supabase/schema_full_brewflow.sql sudah dijalankan.`
+          );
           return;
         }
-      } catch (err) {
-        if (!dbAccessError && err instanceof Error) {
-          dbAccessError = err.message;
-        }
+        if (supabase) await supabase.auth.signOut();
+        setUser(null);
+        setAuthMode(null);
+        setAuthProvider(null);
+        setAuthError(
+          `Email "${normalizedEmail}" belum terbaca di tabel employees Supabase. Pastikan email terdaftar aktif di tabel public.employees (bukan hanya di Authentication → Users) dan policy RLS dari supabase/schema_full_brewflow.sql sudah dijalankan.`
+        );
+        return;
       }
-    }
 
-    const localMatch = matchEmployeeByEmail(identity.email, employeesRef.current);
-
-    if (localMatch.status === 'matched') {
+      // Email/password Supabase user fallback when profile row is not yet created
+      const fallbackName = identity.displayName || normalizedEmail.split('@')[0] || 'Pengguna';
       setAppSessionToken(null);
+      void clearAppSessionCookie();
       setAuthError(null);
-      setUser(mergeGoogleProfileIntoEmployee(localMatch.employee, identity));
+      setUser({
+        id: sbUser.id,
+        full_name: fallbackName,
+        email: normalizedEmail,
+        role: 'cashier',
+        phone_number: '-',
+        avatar_initials: fallbackName.slice(0, 2).toUpperCase(),
+        is_active: true,
+        created_at: new Date().toISOString(),
+      });
       setAuthMode('supabase');
-      setAuthProvider(isGoogleLogin ? 'google' : 'email');
+      setAuthProvider('email');
       void refreshAllFromSupabase();
-      return;
-    }
-
-    if (localMatch.status === 'inactive') {
-      if (supabase) await supabase.auth.signOut();
-      setUser(null);
-      setAuthMode(null);
-      setAuthProvider(null);
-      setAuthError(localMatch.message);
-      return;
-    }
-
-    if (isGoogleLogin) {
-      if (supabase) await supabase.auth.signOut();
-      setUser(null);
-      setAuthMode(null);
-      setAuthProvider(null);
-      if (dbAccessError) {
-        setAuthError(
-          `Gagal membaca tabel karyawan di Supabase untuk "${normalizedEmail}" (${dbAccessError}). Pastikan file SQL supabase/schema_google_oauth_employees.sql sudah dijalankan di Supabase SQL Editor agar policy RLS mengizinkan verifikasi email.`
-        );
-      } else {
-        setAuthError(
-          `Email "${normalizedEmail}" belum terbaca di tabel employees Supabase. Pastikan email terdaftar aktif di tabel public.employees (bukan hanya di Authentication → Users) dan policy RLS dari supabase/schema_google_oauth_employees.sql sudah dijalankan.`
-        );
-      }
-      return;
-    }
-
-    // Email/password Supabase user fallback when profile row is not yet created
-    const fallbackName = identity.displayName || normalizedEmail.split('@')[0] || 'Pengguna';
-    setAppSessionToken(null);
-    setAuthError(null);
-    setUser({
-      id: sbUser.id,
-      full_name: fallbackName,
-      email: normalizedEmail,
-      role: 'cashier',
-      phone_number: '-',
-      avatar_initials: fallbackName.slice(0, 2).toUpperCase(),
-      is_active: true,
-      created_at: new Date().toISOString(),
-    });
-    setAuthMode('supabase');
-    setAuthProvider('email');
-    void refreshAllFromSupabase();
-  }, [refreshAllFromSupabase]);
+    },
+    [refreshAllFromSupabase]
+  );
 
   const resolveSupabaseUser = useCallback(
-    async (sbUser: SupabaseUser) => {
+    async (sbUser: SupabaseUser, options?: { isSessionRestore?: boolean }) => {
       if (resolvingRef.current && resolvingRef.current.userId === sbUser.id) {
         return resolvingRef.current.promise;
       }
-      const promise = resolveSupabaseUserInner(sbUser).finally(() => {
+      const promise = resolveSupabaseUserInner(sbUser, options).finally(() => {
         if (resolvingRef.current?.userId === sbUser.id) {
           resolvingRef.current = null;
         }
@@ -356,6 +447,104 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     },
     [resolveSupabaseUserInner]
   );
+
+  const restoreUsernameSession = useCallback(async (): Promise<boolean> => {
+    if (!supabase) return false;
+    const cookieSession = await restoreAppSessionCookie();
+    if (!cookieSession?.token) return false;
+
+    setAppSessionToken(cookieSession.token);
+
+    try {
+      const { data, error } = await supabase.rpc('get_app_session_profile');
+
+      if (!error && data && typeof data === 'object') {
+        const payload = data as {
+          status?: string;
+          message?: string;
+          employee?: Record<string, unknown>;
+        };
+
+        if (payload.status === 'ok' && payload.employee) {
+          const restoredUser = mapEmployeeRowToProfile(
+            payload.employee,
+            cookieSession.username ?? undefined
+          );
+          setAuthError(null);
+          setUser(restoredUser);
+          setAuthMode('supabase');
+          setAuthProvider('username');
+          void persistAppSessionCookie(cookieSession.token, restoredUser.username);
+          void refreshAllFromSupabase();
+          return true;
+        }
+
+        if (payload.status === 'inactive') {
+          setAppSessionToken(null);
+          await clearAppSessionCookie();
+          setAuthError(
+            payload.message || 'Akun karyawan Anda sedang berstatus Nonaktif. Hubungi Owner.'
+          );
+          return false;
+        }
+
+        // Session expired or revoked in PostgreSQL
+        setAppSessionToken(null);
+        await clearAppSessionCookie();
+        return false;
+      }
+
+      // Graceful fallback if user hasn't run updated SQL (`get_app_session_profile` not yet deployed)
+      const errCode = String(error?.code ?? '');
+      if (errCode === 'PGRST202' || errCode === '42883') {
+        const [activeEmpRes, activeOwnerRes] = await Promise.all([
+          supabase.rpc('is_active_employee'),
+          supabase.rpc('is_active_owner'),
+        ]);
+
+        if (activeEmpRes.data === true && activeOwnerRes.data === true) {
+          const { data: empRows } = await supabase
+            .from('employees')
+            .select('*')
+            .eq('is_active', true)
+            .limit(200);
+
+          if (empRows && empRows.length > 0) {
+            const matched =
+              (cookieSession.username
+                ? empRows.find(
+                    (row) =>
+                      typeof row.username === 'string' &&
+                      normalizeUsername(row.username) === cookieSession.username
+                  )
+                : null) ||
+              empRows.find((row) => normalizeEmployeeRole(row.role) === 'owner');
+
+            if (matched) {
+              const restoredUser = mapEmployeeRowToProfile(
+                matched as Record<string, unknown>,
+                cookieSession.username ?? undefined
+              );
+              setAuthError(null);
+              setUser(restoredUser);
+              setAuthMode('supabase');
+              setAuthProvider('username');
+              void refreshAllFromSupabase();
+              return true;
+            }
+          }
+        } else if (activeEmpRes.data === false) {
+          setAppSessionToken(null);
+          await clearAppSessionCookie();
+        }
+      }
+    } catch {
+      // Keep HttpOnly cookie intact on transient network failure so user isn't permanently logged out
+      setAppSessionToken(null);
+    }
+
+    return false;
+  }, [refreshAllFromSupabase]);
 
   useEffect(() => {
     let active = true;
@@ -373,16 +562,40 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         setAuthError(callbackError);
       }
 
+      let restoredFromSupabaseAuth = false;
+
       if (supabase) {
         try {
           const {
             data: { session },
           } = await supabase.auth.getSession();
+
           if (session?.user && active) {
-            await resolveSupabaseUser(session.user);
+            let activeUser = session.user;
+            const expiresSoon =
+              typeof session.expires_at === 'number' &&
+              session.expires_at * 1000 <= Date.now() + 60_000;
+
+            if (expiresSoon) {
+              try {
+                const { data: refreshed } = await supabase.auth.refreshSession();
+                if (refreshed.session?.user) {
+                  activeUser = refreshed.session.user;
+                }
+              } catch {
+                // Continue with current session user if refresh fails transiently
+              }
+            }
+
+            await resolveSupabaseUser(activeUser, { isSessionRestore: true });
+            restoredFromSupabaseAuth = true;
           }
         } catch {
-          // Stay logged out on session read error
+          // Fall through to check HttpOnly username session cookie
+        }
+
+        if (!restoredFromSupabaseAuth && active) {
+          await restoreUsernameSession();
         }
       }
 
@@ -393,10 +606,12 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
     void bootstrapSession();
 
-    const subscription = supabase?.auth.onAuthStateChange((_event, session) => {
+    const subscription = supabase?.auth.onAuthStateChange((event, session) => {
       if (session?.user) {
-        void resolveSupabaseUser(session.user);
-      } else if (authProviderRef.current !== 'username') {
+        void resolveSupabaseUser(session.user, {
+          isSessionRestore: event === 'INITIAL_SESSION' || event === 'TOKEN_REFRESHED',
+        });
+      } else if (event === 'SIGNED_OUT' && authProviderRef.current !== 'username') {
         setUser(null);
         setAuthMode(null);
         setAuthProvider(null);
@@ -407,7 +622,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       active = false;
       subscription?.data.subscription.unsubscribe();
     };
-  }, [resolveSupabaseUser]);
+  }, [resolveSupabaseUser, restoreUsernameSession]);
 
   // Keep active Google/Username-authenticated user synced if Owner edits or deactivates them
   useEffect(() => {
@@ -420,7 +635,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     );
     if (!matched) return;
     if (!matched.is_active) {
-      if (supabase && authProvider === 'google') void supabase.auth.signOut();
+      if (supabase && authProvider === 'google') {
+        void supabase.auth.signOut();
+      } else if (authProvider === 'username') {
+        if (supabase) void supabase.rpc('revoke_app_session');
+        setAppSessionToken(null);
+        void clearAppSessionCookie();
+      }
       setUser(null);
       setAuthMode(null);
       setAuthProvider(null);
@@ -447,10 +668,18 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     }
 
     try {
+      const env = ((import.meta as { env?: Record<string, string | undefined> }).env ?? {}) as Record<
+        string,
+        string | undefined
+      >;
+      const redirectTo = resolveOAuthRedirectUrl(
+        window.location.origin,
+        env.VITE_APP_URL || env.NEXT_PUBLIC_APP_URL
+      );
       const { error } = await supabase.auth.signInWithOAuth({
         provider: 'google',
         options: {
-          redirectTo: `${window.location.origin}/`,
+          redirectTo,
           queryParams: {
             prompt: 'select_account',
           },
@@ -537,33 +766,11 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
               employee?: Record<string, unknown>;
             };
             if (payload.status === 'ok' && payload.employee) {
+              authenticatedUser = mapEmployeeRowToProfile(payload.employee, cleanUsername);
               if (typeof payload.session_token === 'string' && payload.session_token.length >= 32) {
                 setAppSessionToken(payload.session_token);
+                await persistAppSessionCookie(payload.session_token, authenticatedUser.username);
               }
-              const row = payload.employee;
-              const fullName = String(row.full_name || cleanUsername).trim();
-              const initials = fullName
-                .split(/\s+/)
-                .map((part) => part[0])
-                .join('')
-                .slice(0, 2)
-                .toUpperCase();
-              authenticatedUser = {
-                id: String(row.id || `usr-${Date.now()}`),
-                full_name: fullName,
-                email: normalizeEmail(typeof row.email === 'string' ? row.email : ''),
-                username: normalizeUsername(
-                  typeof row.username === 'string' ? row.username : cleanUsername
-                ),
-                has_password: true,
-                role: normalizeEmployeeRole(row.role),
-                phone_number: String(row.phone_number || '-'),
-                avatar_initials: initials || 'BF',
-                is_active: true,
-                shift: typeof row.shift === 'string' ? row.shift : undefined,
-                position: typeof row.position === 'string' ? row.position : undefined,
-                created_at: String(row.created_at || new Date().toISOString()),
-              };
             } else if (payload.status === 'inactive') {
               return {
                 error:
@@ -644,6 +851,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         await supabase.auth.signOut();
       }
     }
+    await clearAppSessionCookie();
     setAppSessionToken(null);
     setUser(null);
     setAuthMode(null);
