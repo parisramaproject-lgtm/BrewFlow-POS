@@ -16,22 +16,48 @@ import { useStore } from '../context/StoreContext';
 import type {
   ExpenseCategoryId,
   ExpensePaymentMethod,
+  InventoryItem,
+  ItemCategoryType,
   PurchaseItemRecord,
   PurchaseRecord,
 } from '../types';
 import { buildPurchasingExcelData } from '../utils/excelExport';
 import {
   EXPENSE_CATEGORIES,
+  getDefaultExpenseCategoryForInventory,
   getExpenseCategory,
   getExpenseCategoryLabel,
+  getInventoryTypeForExpenseCategory,
   isInventoryLinkedExpenseCategory,
 } from '../utils/expenseCategories';
 import { formatDateTime, formatRupiah } from '../utils/format';
+
+const OTHER_INVENTORY_VALUE = '__other__';
+
+const INVENTORY_CATEGORY_OPTIONS: Array<{ id: ItemCategoryType; label: string; defaultUnit: string }> = [
+  { id: 'raw_material', label: 'Bahan Baku', defaultUnit: 'gr' },
+  { id: 'packaging', label: 'Kemasan', defaultUnit: 'pcs' },
+  { id: 'asset', label: 'Aset Coffee Shop', defaultUnit: 'unit' },
+  { id: 'operational', label: 'Operasional & Lainnya', defaultUnit: 'pcs' },
+];
+
+function getDefaultUnitForInventoryCategory(cat: ItemCategoryType): string {
+  return INVENTORY_CATEGORY_OPTIONS.find((opt) => opt.id === cat)?.defaultUnit ?? 'pcs';
+}
+
+function getInventoryCategoryLabel(cat: ItemCategoryType): string {
+  return INVENTORY_CATEGORY_OPTIONS.find((opt) => opt.id === cat)?.label ?? 'Bahan Baku';
+}
 
 interface DraftPurchaseLine {
   rowId: string;
   mode: 'inventory' | 'custom';
   inventory_item_id: string;
+  new_item_name: string;
+  new_item_unit: string;
+  new_item_sku: string;
+  new_item_min_stock: string;
+  new_item_category: ItemCategoryType;
   custom_name: string;
   custom_unit: string;
   quantity: string;
@@ -47,7 +73,7 @@ const PAYMENT_METHOD_LABELS: Record<ExpensePaymentMethod, string> = {
 
 export function PurchasingPage() {
   const { user, authMode } = useAuth();
-  const { inventory, purchases, settings, createPurchase } = useStore();
+  const { inventory, purchases, settings, addInventoryItem, createPurchase } = useStore();
   const liveSupabaseEnabled = authMode === 'supabase';
 
   const inventoryById = useMemo(
@@ -81,6 +107,9 @@ export function PurchasingPage() {
     preferUnusedFrom?: DraftPurchaseLine[]
   ): DraftPurchaseLine => {
     const isInvLinked = isInventoryLinkedExpenseCategory(catId);
+    const defaultInvCategory = getInventoryTypeForExpenseCategory(catId);
+    const defaultInvUnit = getDefaultUnitForInventoryCategory(defaultInvCategory);
+
     if (isInvLinked) {
       const cat = getExpenseCategory(catId);
       const pool = inventory.filter(
@@ -92,9 +121,14 @@ export function PurchasingPage() {
       return {
         rowId,
         mode: 'inventory',
-        inventory_item_id: picked?.id ?? '',
+        inventory_item_id: picked?.id ?? OTHER_INVENTORY_VALUE,
+        new_item_name: '',
+        new_item_unit: defaultInvUnit,
+        new_item_sku: '',
+        new_item_min_stock: defaultInvCategory === 'asset' ? '0' : '10',
+        new_item_category: defaultInvCategory,
         custom_name: '',
-        custom_unit: picked?.unit ?? 'pcs',
+        custom_unit: picked?.unit ?? defaultInvUnit,
         quantity: '',
         unit_price: picked ? String(picked.last_purchase_price) : '',
       };
@@ -113,6 +147,11 @@ export function PurchasingPage() {
       rowId,
       mode: 'custom',
       inventory_item_id: '',
+      new_item_name: '',
+      new_item_unit: defaultInvUnit,
+      new_item_sku: '',
+      new_item_min_stock: '0',
+      new_item_category: defaultInvCategory,
       custom_name: '',
       custom_unit: defaultUnit,
       quantity: '1',
@@ -171,7 +210,18 @@ export function PurchasingPage() {
 
   const handleUpdateLine = (
     rowId: string,
-    field: 'mode' | 'inventory_item_id' | 'custom_name' | 'custom_unit' | 'quantity' | 'unit_price',
+    field:
+      | 'mode'
+      | 'inventory_item_id'
+      | 'new_item_name'
+      | 'new_item_unit'
+      | 'new_item_sku'
+      | 'new_item_min_stock'
+      | 'new_item_category'
+      | 'custom_name'
+      | 'custom_unit'
+      | 'quantity'
+      | 'unit_price',
     value: string
   ) => {
     setLines((prev) =>
@@ -179,12 +229,15 @@ export function PurchasingPage() {
         if (line.rowId !== rowId) return line;
         if (field === 'mode') {
           const nextMode = value as 'inventory' | 'custom';
+          const defaultInvCat = getInventoryTypeForExpenseCategory(expenseCategory);
           if (nextMode === 'inventory') {
             const firstInv = suggestedInventoryForCategory[0] ?? inventory[0];
             return {
               ...line,
               mode: 'inventory',
-              inventory_item_id: firstInv?.id ?? '',
+              inventory_item_id: firstInv?.id ?? OTHER_INVENTORY_VALUE,
+              new_item_category: defaultInvCat,
+              new_item_unit: getDefaultUnitForInventoryCategory(defaultInvCat),
               unit_price: firstInv ? String(firstInv.last_purchase_price) : line.unit_price,
             };
           }
@@ -195,11 +248,32 @@ export function PurchasingPage() {
           };
         }
         if (field === 'inventory_item_id') {
+          if (value === OTHER_INVENTORY_VALUE) {
+            const defaultInvCat = getInventoryTypeForExpenseCategory(expenseCategory);
+            return {
+              ...line,
+              inventory_item_id: OTHER_INVENTORY_VALUE,
+              new_item_category: line.new_item_category || defaultInvCat,
+              new_item_unit:
+                line.new_item_unit || getDefaultUnitForInventoryCategory(defaultInvCat),
+              new_item_min_stock: defaultInvCat === 'asset' ? '0' : line.new_item_min_stock || '10',
+              unit_price: '',
+            };
+          }
           const inv = inventoryById.get(value);
           return {
             ...line,
             inventory_item_id: value,
             unit_price: inv ? String(inv.last_purchase_price) : line.unit_price,
+          };
+        }
+        if (field === 'new_item_category') {
+          const nextCat = value as ItemCategoryType;
+          return {
+            ...line,
+            new_item_category: nextCat,
+            new_item_unit: getDefaultUnitForInventoryCategory(nextCat),
+            new_item_min_stock: nextCat === 'asset' ? '0' : line.new_item_min_stock || '10',
           };
         }
         return { ...line, [field]: value };
@@ -220,26 +294,35 @@ export function PurchasingPage() {
       return;
     }
 
-    const parsedItems: PurchaseItemRecord[] = [];
+    // Validate all lines upfront before mutating inventory or creating the purchase
     for (const line of lines) {
       const qtyNum = Number(line.quantity);
       const priceNum = Number(line.unit_price);
 
       if (line.mode === 'inventory') {
-        const inv = inventoryById.get(line.inventory_item_id);
-        if (!inv || !qtyNum || qtyNum <= 0 || !priceNum || priceNum <= 0) {
-          setErrorMsg(
-            'Pastikan setiap baris inventori memiliki item, jumlah (> 0), dan harga satuan (> 0) yang valid.'
-          );
-          return;
+        if (line.inventory_item_id === OTHER_INVENTORY_VALUE) {
+          if (
+            !line.new_item_name.trim() ||
+            !line.new_item_unit.trim() ||
+            !qtyNum ||
+            qtyNum <= 0 ||
+            !priceNum ||
+            priceNum <= 0
+          ) {
+            setErrorMsg(
+              'Untuk pilihan "Lainnya", isi nama item inventori baru, satuan, jumlah (> 0), dan harga satuan (> 0).'
+            );
+            return;
+          }
+        } else {
+          const inv = inventoryById.get(line.inventory_item_id);
+          if (!inv || !qtyNum || qtyNum <= 0 || !priceNum || priceNum <= 0) {
+            setErrorMsg(
+              'Pastikan setiap baris inventori memiliki item, jumlah (> 0), dan harga satuan (> 0) yang valid.'
+            );
+            return;
+          }
         }
-        parsedItems.push({
-          inventory_item_id: inv.id,
-          item_name: inv.name,
-          unit: inv.unit,
-          quantity: qtyNum,
-          unit_price: priceNum,
-        });
       } else {
         if (!line.custom_name.trim() || !qtyNum || qtyNum <= 0 || !priceNum || priceNum <= 0) {
           setErrorMsg(
@@ -247,6 +330,75 @@ export function PurchasingPage() {
           );
           return;
         }
+      }
+    }
+
+    if (lines.length === 0) {
+      setErrorMsg('Tambahkan minimal 1 rincian pembelian atau pengeluaran.');
+      return;
+    }
+
+    setSubmitting(true);
+    const parsedItems: PurchaseItemRecord[] = [];
+    const newlyCreatedInventoryItems: InventoryItem[] = [];
+    const createdByKey = new Map<string, InventoryItem>();
+
+    for (const line of lines) {
+      const qtyNum = Number(line.quantity);
+      const priceNum = Number(line.unit_price);
+
+      if (line.mode === 'inventory') {
+        if (line.inventory_item_id === OTHER_INVENTORY_VALUE) {
+          const cleanName = line.new_item_name.trim();
+          const cleanUnit = line.new_item_unit.trim() || 'pcs';
+          const targetCategory =
+            line.new_item_category || getInventoryTypeForExpenseCategory(expenseCategory);
+          const dedupKey = `${targetCategory}:${cleanName.toLowerCase()}`;
+
+          let targetItem = createdByKey.get(dedupKey);
+          if (!targetItem) {
+            const minStockNum =
+              targetCategory === 'asset' ? 0 : Math.max(0, Number(line.new_item_min_stock) || 0);
+            const itemExpenseCat =
+              getInventoryTypeForExpenseCategory(expenseCategory) === targetCategory
+                ? expenseCategory
+                : getDefaultExpenseCategoryForInventory(targetCategory);
+
+            // Start with current_stock: 0 because createPurchase immediately adds qtyNum
+            targetItem = await addInventoryItem({
+              name: cleanName,
+              sku: line.new_item_sku.trim(),
+              category_type: targetCategory,
+              expense_category: itemExpenseCat,
+              unit: cleanUnit,
+              current_stock: 0,
+              min_stock_threshold: minStockNum,
+              last_purchase_price: priceNum,
+              asset_condition: targetCategory === 'asset' ? 'Baik' : undefined,
+              enableSupabaseSync: liveSupabaseEnabled,
+            });
+            createdByKey.set(dedupKey, targetItem);
+            newlyCreatedInventoryItems.push(targetItem);
+          }
+
+          parsedItems.push({
+            inventory_item_id: targetItem.id,
+            item_name: targetItem.name,
+            unit: targetItem.unit,
+            quantity: qtyNum,
+            unit_price: priceNum,
+          });
+        } else {
+          const inv = inventoryById.get(line.inventory_item_id)!;
+          parsedItems.push({
+            inventory_item_id: inv.id,
+            item_name: inv.name,
+            unit: inv.unit,
+            quantity: qtyNum,
+            unit_price: priceNum,
+          });
+        }
+      } else {
         parsedItems.push({
           inventory_item_id: null,
           item_name: line.custom_name.trim(),
@@ -257,12 +409,6 @@ export function PurchasingPage() {
       }
     }
 
-    if (parsedItems.length === 0) {
-      setErrorMsg('Tambahkan minimal 1 rincian pembelian atau pengeluaran.');
-      return;
-    }
-
-    setSubmitting(true);
     const { purchase } = await createPurchase({
       expense_category: expenseCategory,
       supplier_name: supplierName,
@@ -272,6 +418,7 @@ export function PurchasingPage() {
       purchased_by_id: user.id,
       purchased_by_name: user.full_name,
       items: parsedItems,
+      extraInventoryItems: newlyCreatedInventoryItems,
       enableSupabaseSync: liveSupabaseEnabled,
     });
     setSubmitting(false);
@@ -286,7 +433,11 @@ export function PurchasingPage() {
     );
 
     const nextResetLine = makeDefaultLine(expenseCategory, `line-${Date.now()}`);
-    if (nextResetLine.mode === 'inventory' && nextResetLine.inventory_item_id) {
+    if (
+      nextResetLine.mode === 'inventory' &&
+      nextResetLine.inventory_item_id &&
+      nextResetLine.inventory_item_id !== OTHER_INVENTORY_VALUE
+    ) {
       const updatedUnitPrice = latestPriceById.get(nextResetLine.inventory_item_id);
       if (updatedUnitPrice !== undefined) {
         nextResetLine.unit_price = String(updatedUnitPrice);
@@ -298,12 +449,20 @@ export function PurchasingPage() {
     setNotes('');
     setLines([nextResetLine]);
     setErrorMsg(null);
-    setSavedMsg(
-      hasStockUpdates
-        ? `${getExpenseCategoryLabel(expenseCategory)} (${purchase.invoice_number} · ${formatRupiah(purchase.total_cost)}) tersimpan. Stok inventori & harga referensi HPP otomatis diperbarui.`
-        : `Pengeluaran "${getExpenseCategoryLabel(expenseCategory)}" (${purchase.invoice_number} · ${formatRupiah(purchase.total_cost)}) berhasil dicatat.`
-    );
-    window.setTimeout(() => setSavedMsg(null), 6000);
+
+    if (newlyCreatedInventoryItems.length > 0) {
+      const addedNames = newlyCreatedInventoryItems.map((i) => i.name).join(', ');
+      setSavedMsg(
+        `${getExpenseCategoryLabel(expenseCategory)} (${purchase.invoice_number} · ${formatRupiah(purchase.total_cost)}) tersimpan. ${newlyCreatedInventoryItems.length} item inventori baru (${addedNames}) otomatis ditambahkan ke menu Inventori & stok diperbarui.`
+      );
+    } else {
+      setSavedMsg(
+        hasStockUpdates
+          ? `${getExpenseCategoryLabel(expenseCategory)} (${purchase.invoice_number} · ${formatRupiah(purchase.total_cost)}) tersimpan. Stok inventori & harga referensi HPP otomatis diperbarui.`
+          : `Pengeluaran "${getExpenseCategoryLabel(expenseCategory)}" (${purchase.invoice_number} · ${formatRupiah(purchase.total_cost)}) berhasil dicatat.`
+      );
+    }
+    window.setTimeout(() => setSavedMsg(null), 7000);
   };
 
   const isCurrentCategoryStockLinked = isInventoryLinkedExpenseCategory(expenseCategory);
@@ -509,8 +668,18 @@ export function PurchasingPage() {
 
           <div className="space-y-2.5">
             {lines.map((line, index) => {
+              const isOtherInventory =
+                line.mode === 'inventory' && line.inventory_item_id === OTHER_INVENTORY_VALUE;
               const selectedInv =
-                line.mode === 'inventory' ? inventoryById.get(line.inventory_item_id) : undefined;
+                line.mode === 'inventory' && !isOtherInventory
+                  ? inventoryById.get(line.inventory_item_id)
+                  : undefined;
+              const activeUnit =
+                line.mode === 'inventory'
+                  ? isOtherInventory
+                    ? line.new_item_unit.trim() || 'unit'
+                    : selectedInv?.unit ?? 'unit'
+                  : line.custom_unit || 'unit';
               const qtyNum = Number(line.quantity) || 0;
               const priceNum = Number(line.unit_price) || 0;
               const lineSubtotal = qtyNum * priceNum;
@@ -551,6 +720,9 @@ export function PurchasingPage() {
                             {item.name} ({item.sku} · Stok: {item.current_stock} {item.unit})
                           </option>
                         ))}
+                        <option value={OTHER_INVENTORY_VALUE}>
+                          Lainnya (Tambah Item Inventori Baru)
+                        </option>
                       </select>
                     </div>
                   ) : (
@@ -563,15 +735,13 @@ export function PurchasingPage() {
                           >
                             Deskripsi Pengeluaran #{index + 1}
                           </label>
-                          {inventory.length > 0 && (
-                            <button
-                              type="button"
-                              onClick={() => handleUpdateLine(line.rowId, 'mode', 'inventory')}
-                              className="text-[11px] font-semibold text-[#109A58] hover:underline"
-                            >
-                              Tautkan Inventori
-                            </button>
-                          )}
+                          <button
+                            type="button"
+                            onClick={() => handleUpdateLine(line.rowId, 'mode', 'inventory')}
+                            className="text-[11px] font-semibold text-[#109A58] hover:underline"
+                          >
+                            Tautkan Inventori
+                          </button>
                         </div>
                         <input
                           id={`po-custom-name-${index}`}
@@ -610,7 +780,7 @@ export function PurchasingPage() {
                       htmlFor={`po-qty-${index}`}
                       className="block text-[11px] font-medium text-[#6B7280]"
                     >
-                      Jumlah ({selectedInv?.unit ?? line.custom_unit ?? 'unit'})
+                      Jumlah ({activeUnit})
                     </label>
                     <input
                       id={`po-qty-${index}`}
@@ -629,7 +799,7 @@ export function PurchasingPage() {
                       htmlFor={`po-price-${index}`}
                       className="block text-[11px] font-medium text-[#6B7280]"
                     >
-                      Nominal / {selectedInv?.unit ?? line.custom_unit ?? 'unit'} (Rp)
+                      Nominal / {activeUnit} (Rp)
                     </label>
                     <input
                       id={`po-price-${index}`}
@@ -676,6 +846,129 @@ export function PurchasingPage() {
                       <Trash2 className="h-4 w-4" />
                     </button>
                   </div>
+
+                  {/* Inline New Inventory Item Fields when "Lainnya" is selected */}
+                  {isOtherInventory && (
+                    <div
+                      data-testid={`po-new-item-panel-${index}`}
+                      className="grid grid-cols-1 gap-3 rounded-xl border border-[#109A58]/30 bg-[#E6F5EE]/50 p-3 sm:grid-cols-2 lg:col-span-12 lg:grid-cols-12"
+                    >
+                      <div className="sm:col-span-2 lg:col-span-12">
+                        <p className="text-[11px] font-semibold text-[#109A58]">
+                          Item baru ini akan otomatis ditambahkan ke menu Inventori kategori{' '}
+                          <span className="underline">
+                            {getInventoryCategoryLabel(line.new_item_category)}
+                          </span>{' '}
+                          dengan stok sesuai jumlah pembelian.
+                        </p>
+                      </div>
+
+                      <div className="lg:col-span-4">
+                        <label
+                          htmlFor={`po-new-name-${index}`}
+                          className="block text-[11px] font-medium text-[#1A2E26]"
+                        >
+                          Nama Item Inventori Baru *
+                        </label>
+                        <input
+                          id={`po-new-name-${index}`}
+                          type="text"
+                          value={line.new_item_name}
+                          onChange={(e) =>
+                            handleUpdateLine(line.rowId, 'new_item_name', e.target.value)
+                          }
+                          placeholder="Misal: Sirup Hazelnut / Cup 12oz / Grinder"
+                          className="mt-1 h-9 w-full rounded-lg border border-[#E5E7EB] bg-white px-3 text-xs font-medium text-[#1A2E26] focus:border-[#109A58] focus:outline-none"
+                        />
+                      </div>
+
+                      <div className="lg:col-span-3">
+                        <label
+                          htmlFor={`po-new-category-${index}`}
+                          className="block text-[11px] font-medium text-[#1A2E26]"
+                        >
+                          Kategori Inventori *
+                        </label>
+                        <select
+                          id={`po-new-category-${index}`}
+                          value={line.new_item_category}
+                          onChange={(e) =>
+                            handleUpdateLine(line.rowId, 'new_item_category', e.target.value)
+                          }
+                          className="mt-1 h-9 w-full rounded-lg border border-[#E5E7EB] bg-white px-2.5 text-xs font-medium text-[#1A2E26] focus:border-[#109A58] focus:outline-none"
+                        >
+                          {INVENTORY_CATEGORY_OPTIONS.map((opt) => (
+                            <option key={opt.id} value={opt.id}>
+                              {opt.label}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+
+                      <div className="lg:col-span-2">
+                        <label
+                          htmlFor={`po-new-unit-${index}`}
+                          className="block text-[11px] font-medium text-[#1A2E26]"
+                        >
+                          Satuan *
+                        </label>
+                        <input
+                          id={`po-new-unit-${index}`}
+                          type="text"
+                          value={line.new_item_unit}
+                          onChange={(e) =>
+                            handleUpdateLine(line.rowId, 'new_item_unit', e.target.value)
+                          }
+                          placeholder="gr / ml / pcs / unit"
+                          className="mt-1 h-9 w-full rounded-lg border border-[#E5E7EB] bg-white px-2.5 text-xs text-[#1A2E26] focus:border-[#109A58] focus:outline-none"
+                        />
+                      </div>
+
+                      {line.new_item_category !== 'asset' && (
+                        <div className="lg:col-span-1">
+                          <label
+                            htmlFor={`po-new-min-${index}`}
+                            className="block text-[11px] font-medium text-[#1A2E26] whitespace-nowrap"
+                          >
+                            Stok Min.
+                          </label>
+                          <input
+                            id={`po-new-min-${index}`}
+                            type="number"
+                            min={0}
+                            value={line.new_item_min_stock}
+                            onChange={(e) =>
+                              handleUpdateLine(line.rowId, 'new_item_min_stock', e.target.value)
+                            }
+                            className="mt-1 h-9 w-full rounded-lg border border-[#E5E7EB] bg-white px-2 text-xs text-[#1A2E26] tabular-nums focus:border-[#109A58] focus:outline-none"
+                          />
+                        </div>
+                      )}
+
+                      <div
+                        className={
+                          line.new_item_category === 'asset' ? 'lg:col-span-3' : 'lg:col-span-2'
+                        }
+                      >
+                        <label
+                          htmlFor={`po-new-sku-${index}`}
+                          className="block text-[11px] font-medium text-[#1A2E26]"
+                        >
+                          SKU (Opsional)
+                        </label>
+                        <input
+                          id={`po-new-sku-${index}`}
+                          type="text"
+                          value={line.new_item_sku}
+                          onChange={(e) =>
+                            handleUpdateLine(line.rowId, 'new_item_sku', e.target.value)
+                          }
+                          placeholder="Otomatis"
+                          className="mt-1 h-9 w-full rounded-lg border border-[#E5E7EB] bg-white px-2.5 font-mono text-xs text-[#1A2E26] uppercase focus:border-[#109A58] focus:outline-none"
+                        />
+                      </div>
+                    </div>
+                  )}
                 </div>
               );
             })}

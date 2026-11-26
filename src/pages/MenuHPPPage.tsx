@@ -13,6 +13,7 @@ import { AccessDenied } from '../components/common/AccessDenied';
 import { PeriodicExcelExport } from '../components/common/PeriodicExcelExport';
 import { ProductVisual } from '../components/common/ProductVisual';
 import { MenuFormModal } from '../components/menu/MenuFormModal';
+import { OwnerPricingAdvisor } from '../components/menu/OwnerPricingAdvisor';
 import { useAuth } from '../context/AuthContext';
 import { useStore, type MenuItemInput } from '../context/StoreContext';
 import type { MenuItem } from '../types';
@@ -64,6 +65,8 @@ export function MenuHPPPage({ searchQuery }: MenuHPPPageProps) {
   );
   const [newIngredientQty, setNewIngredientQty] = useState<string>('');
   const [recipeError, setRecipeError] = useState<string | null>(null);
+  const [hppSellingPriceInput, setHppSellingPriceInput] = useState<string>('');
+  const [savingTabPrice, setSavingTabPrice] = useState(false);
 
   useEffect(() => {
     if (
@@ -92,10 +95,40 @@ export function MenuHPPPage({ searchQuery }: MenuHPPPageProps) {
   const selectedMenu: MenuItem | undefined =
     menus.find((m) => m.id === selectedMenuId) ?? menus[0];
 
+  useEffect(() => {
+    if (selectedMenu) {
+      setHppSellingPriceInput(String(selectedMenu.selling_price));
+    }
+  }, [selectedMenu?.id, selectedMenu?.selling_price]);
+
   const selectedHpp = useMemo(() => {
     if (!selectedMenu || !isOwnerHppAuthorized) return null;
     return calculateMenuHpp(selectedMenu.selling_price, selectedMenu.recipes, inventory);
   }, [selectedMenu, isOwnerHppAuthorized, inventory]);
+
+  const handleApplyHppSellingPrice = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!selectedMenu || !isOwnerHppAuthorized) return;
+    if (!selectedHpp || selectedHpp.totalHpp <= 0) {
+      setRecipeError('Isi komposisi resep HPP terlebih dahulu sebelum menetapkan harga jual.');
+      return;
+    }
+    const nextPrice = Number(hppSellingPriceInput);
+    if (!nextPrice || nextPrice <= 0) {
+      setRecipeError('Harga jual harus berupa angka lebih dari 0.');
+      return;
+    }
+    setSavingTabPrice(true);
+    await updateMenuItem(selectedMenu.id, {
+      selling_price: nextPrice,
+      enableSupabaseSync: liveSupabaseEnabled,
+    });
+    setSavingTabPrice(false);
+    setRecipeError(null);
+    showFeedback(
+      `Harga jual "${selectedMenu.name}" diperbarui menjadi ${formatRupiah(nextPrice)}.`
+    );
+  };
 
   const showFeedback = (msg: string) => {
     setFeedbackBanner(msg);
@@ -652,6 +685,74 @@ export function MenuHPPPage({ searchQuery }: MenuHPPPageProps) {
                     </div>
                   </form>
                 </div>
+
+                {/* Owner Pricing Suggestions & Selling Price Determination (AFTER HPP Calculation) */}
+                <div
+                  data-testid="hpp-tab-pricing-card"
+                  className="rounded-2xl border border-[#109A58]/25 bg-[#FFFFFF] p-5 space-y-4"
+                >
+                  <div>
+                    <h3 className="text-sm font-semibold text-[#1A2E26]">
+                      Penentuan &amp; Saran Harga Jual — {selectedMenu.name}
+                    </h3>
+                    <p className="mt-0.5 text-xs text-[#6B7280]">
+                      Tetapkan harga jual setelah komposisi HPP di atas selesai diisi. Rekomendasi
+                      harga otomatis dihitung dari total modal HPP saat ini.
+                    </p>
+                  </div>
+
+                  <OwnerPricingAdvisor
+                    totalHpp={selectedHpp.totalHpp}
+                    currentSellingPrice={Number(hppSellingPriceInput) || 0}
+                    onSelectSuggestedPrice={(suggested) => {
+                      setHppSellingPriceInput(String(suggested));
+                      setRecipeError(null);
+                    }}
+                    testIdPrefix="hpp-tab-pricing"
+                  />
+
+                  <form
+                    onSubmit={handleApplyHppSellingPrice}
+                    className="flex flex-wrap items-end gap-3 border-t border-[#E5E7EB] pt-4"
+                  >
+                    <div className="min-w-[200px] flex-1">
+                      <label
+                        htmlFor="hpp-tab-selling-price"
+                        className="block text-xs font-semibold text-[#1A2E26]"
+                      >
+                        Harga Jual Menu (Rp)
+                      </label>
+                      <input
+                        id="hpp-tab-selling-price"
+                        type="number"
+                        min={500}
+                        step={500}
+                        disabled={selectedHpp.totalHpp <= 0}
+                        value={hppSellingPriceInput}
+                        onChange={(e) => setHppSellingPriceInput(e.target.value)}
+                        placeholder={
+                          selectedHpp.totalHpp > 0
+                            ? 'Pilih saran di atas atau masukkan harga jual'
+                            : 'Tambahkan bahan HPP terlebih dahulu'
+                        }
+                        className="mt-1.5 h-10 w-full rounded-xl border border-[#E5E7EB] bg-white px-3 text-sm font-bold text-[#1A2E26] tabular-nums focus:border-[#109A58] focus:outline-none disabled:cursor-not-allowed disabled:bg-[#F4F6F5] disabled:text-[#9CA3AF]"
+                      />
+                    </div>
+                    <button
+                      type="submit"
+                      data-testid="hpp-tab-apply-price"
+                      disabled={
+                        savingTabPrice ||
+                        selectedHpp.totalHpp <= 0 ||
+                        Number(hppSellingPriceInput) <= 0 ||
+                        Number(hppSellingPriceInput) === selectedMenu.selling_price
+                      }
+                      className="h-10 rounded-full bg-[#109A58] px-5 text-xs font-semibold text-white transition-colors hover:bg-[#0D8A4E] disabled:cursor-not-allowed disabled:opacity-50 whitespace-nowrap"
+                    >
+                      {savingTabPrice ? 'Menyimpan...' : 'Terapkan Harga Jual'}
+                    </button>
+                  </form>
+                </div>
               </div>
             </div>
           )
@@ -662,6 +763,8 @@ export function MenuHPPPage({ searchQuery }: MenuHPPPageProps) {
         isOpen={menuModalOpen}
         categories={categories}
         editingMenu={editingMenu}
+        inventory={inventory}
+        showHppWorkflow={isOwnerHppAuthorized}
         onClose={() => {
           setMenuModalOpen(false);
           setEditingMenu(null);

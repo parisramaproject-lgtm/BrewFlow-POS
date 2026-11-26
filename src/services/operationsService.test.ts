@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
   applyPurchaseToInventory,
   getInventoryStockStatus,
+  mergeInventoryWithNewItems,
   persistStockOpnameToSupabase,
   removeInventoryAndPruneRecipes,
 } from './operationsService';
@@ -182,3 +183,39 @@ test('persistStockOpnameToSupabase returns local synced status when Supabase syn
   assert.equal(status.mode, 'local');
   assert.equal(status.synced, true);
 });
+
+test('mergeInventoryWithNewItems + applyPurchaseToInventory adds new Lainnya item and increments its stock cleanly', () => {
+  const newItem: InventoryItem = {
+    id: 'inv-new-hazelnut',
+    name: 'Sirup Hazelnut Monin',
+    sku: 'RM-901',
+    category_type: 'raw_material',
+    expense_category: 'pembelian_bahan_baku',
+    unit: 'ml',
+    current_stock: 0,
+    min_stock_threshold: 250,
+    last_purchase_price: 180,
+    updated_at: '2026-11-26T10:00:00Z',
+  };
+
+  const merged = mergeInventoryWithNewItems(seedInventory, [newItem]);
+  assert.equal(merged.length, seedInventory.length + 1);
+  // Deduplicates if already present
+  assert.equal(mergeInventoryWithNewItems(merged, [newItem]).length, merged.length);
+
+  const lines: PurchaseItemRecord[] = [
+    {
+      inventory_item_id: 'inv-new-hazelnut',
+      item_name: 'Sirup Hazelnut Monin',
+      unit: 'ml',
+      quantity: 750,
+      unit_price: 185,
+    },
+  ];
+  const afterPurchase = applyPurchaseToInventory(merged, lines, '2026-11-26T10:05:00Z');
+  const created = afterPurchase.find((i) => i.id === 'inv-new-hazelnut');
+  assert.equal(created?.current_stock, 750);
+  assert.equal(created?.last_purchase_price, 185);
+  assert.equal(created?.category_type, 'raw_material');
+});
+

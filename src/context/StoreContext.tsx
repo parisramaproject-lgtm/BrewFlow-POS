@@ -75,6 +75,7 @@ import {
   deleteMenuItemFromSupabase,
   deleteOpnameScheduleFromSupabase,
   fetchActiveOpnameSchedulesFromSupabase,
+  mergeInventoryWithNewItems,
   persistPurchaseToSupabase,
   persistStockOpnameToSupabase,
   persistStoreSettingsToSupabase,
@@ -157,6 +158,7 @@ export interface MenuItemInput {
   visual_tone: MenuItem['visual_tone'];
   image_url?: string;
   is_available?: boolean;
+  recipes?: MenuItem['recipes'];
   enableSupabaseSync?: boolean;
 }
 
@@ -273,6 +275,7 @@ interface StoreContextValue {
     purchased_by_id: string;
     purchased_by_name: string;
     items: PurchaseItemRecord[];
+    extraInventoryItems?: InventoryItem[];
     enableSupabaseSync?: boolean;
   }) => Promise<{ purchase: PurchaseRecord; syncStatus: SupabaseSyncStatus }>;
   submitStockOpname: (input: {
@@ -1147,8 +1150,14 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   );
 
   const addMenuItem = useCallback(async (input: MenuItemInput): Promise<MenuItem> => {
+    const tempId = `menu-${Date.now()}`;
+    const initialRecipes: MenuItem['recipes'] = (input.recipes ?? []).map((r, idx) => ({
+      ...r,
+      id: r.id || `rec-${Date.now()}-${idx}`,
+      menu_id: tempId,
+    }));
     const created: MenuItem = {
-      id: `menu-${Date.now()}`,
+      id: tempId,
       category_id: input.category_id,
       name: input.name.trim(),
       description: input.description.trim(),
@@ -1156,13 +1165,18 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       selling_price: input.selling_price,
       is_available: input.is_available ?? true,
       visual_tone: input.visual_tone,
-      recipes: [],
+      recipes: initialRecipes,
     };
     setMenus((prev) => [created, ...prev]);
-    const sync = await upsertMenuItemToSupabase(created, true, input.enableSupabaseSync ?? false);
+    const enableSync = input.enableSupabaseSync ?? false;
+    const sync = await upsertMenuItemToSupabase(created, true, enableSync);
     if (sync.synced && sync.id) {
-      const persisted = { ...created, id: sync.id };
+      const syncedRecipes = initialRecipes.map((r) => ({ ...r, menu_id: sync.id! }));
+      const persisted: MenuItem = { ...created, id: sync.id, recipes: syncedRecipes };
       setMenus((prev) => prev.map((m) => (m.id === created.id ? persisted : m)));
+      if (syncedRecipes.length > 0) {
+        await syncMenuRecipesToSupabase(sync.id, syncedRecipes, enableSync);
+      }
       return persisted;
     }
     return created;
@@ -1171,6 +1185,14 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   const updateMenuItem = useCallback(
     async (menuId: string, patch: Partial<MenuItemInput>): Promise<void> => {
       let updatedMenu: MenuItem | null = null;
+      const normalizedRecipes =
+        patch.recipes !== undefined
+          ? patch.recipes.map((r, idx) => ({
+              ...r,
+              id: r.id || `rec-${Date.now()}-${idx}`,
+              menu_id: menuId,
+            }))
+          : undefined;
       setMenus((prev) =>
         prev.map((m) => {
           if (m.id !== menuId) return m;
@@ -1184,12 +1206,17 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
             visual_tone: patch.visual_tone ?? m.visual_tone,
             image_url: 'image_url' in patch ? patch.image_url : m.image_url,
             is_available: patch.is_available ?? m.is_available,
+            recipes: normalizedRecipes !== undefined ? normalizedRecipes : m.recipes,
           };
           return updatedMenu;
         })
       );
       if (updatedMenu) {
-        await upsertMenuItemToSupabase(updatedMenu, false, patch.enableSupabaseSync ?? false);
+        const enableSync = patch.enableSupabaseSync ?? false;
+        await upsertMenuItemToSupabase(updatedMenu, false, enableSync);
+        if (normalizedRecipes !== undefined) {
+          await syncMenuRecipesToSupabase(menuId, normalizedRecipes, enableSync);
+        }
       }
     },
     []
@@ -1236,10 +1263,14 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
             : input.category_type === 'asset'
               ? 'AS'
               : 'OP';
+      const uniqueSuffix = `${Date.now().toString().slice(-4)}${Math.random()
+        .toString(36)
+        .slice(2, 4)
+        .toUpperCase()}`;
       const created: InventoryItem = {
-        id: `inv-${Date.now()}`,
+        id: `inv-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
         name: input.name.trim(),
-        sku: input.sku.trim().toUpperCase() || `${prefix}-${Date.now().toString().slice(-3)}`,
+        sku: input.sku.trim().toUpperCase() || `${prefix}-${uniqueSuffix}`,
         category_type: input.category_type,
         expense_category:
           input.expense_category ?? getDefaultExpenseCategoryForInventory(input.category_type),
@@ -1366,6 +1397,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       purchased_by_id: string;
       purchased_by_name: string;
       items: PurchaseItemRecord[];
+      extraInventoryItems?: InventoryItem[];
       enableSupabaseSync?: boolean;
     }): Promise<{ purchase: PurchaseRecord; syncStatus: SupabaseSyncStatus }> => {
       const nowIso = new Date().toISOString();
@@ -1385,6 +1417,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       setPurchases((prev) => [record, ...prev]);
 
       // Update inventory stock and latest purchase price for any stock-linked items
+      const extraItems = input.extraInventoryItems ?? [];
       const touchedIds = new Set(
         input.items
           .map((i) => i.inventory_item_id)
@@ -1393,9 +1426,12 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
 
       let updatedInventoryItems: InventoryItem[] = [];
       if (touchedIds.size > 0) {
-        const nextInventory = applyPurchaseToInventory(inventory, input.items, nowIso);
-        setInventory(nextInventory);
-        updatedInventoryItems = nextInventory.filter((inv) => touchedIds.has(inv.id));
+        const mergedSnapshot = mergeInventoryWithNewItems(inventory, extraItems);
+        const nextSnapshot = applyPurchaseToInventory(mergedSnapshot, input.items, nowIso);
+        updatedInventoryItems = nextSnapshot.filter((inv) => touchedIds.has(inv.id));
+        setInventory((prev) =>
+          applyPurchaseToInventory(mergeInventoryWithNewItems(prev, extraItems), input.items, nowIso)
+        );
       }
 
       const syncStatus = await persistPurchaseToSupabase({

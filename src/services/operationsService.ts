@@ -66,6 +66,21 @@ export function applyPurchaseToInventory(
 }
 
 /**
+ * Pure function: prepends newly created inventory items (e.g. via "Lainnya" in Purchasing)
+ * without creating duplicate IDs so subsequent purchase stock updates never lose new rows.
+ */
+export function mergeInventoryWithNewItems(
+  existing: InventoryItem[],
+  extraItems: InventoryItem[]
+): InventoryItem[] {
+  if (extraItems.length === 0) return existing;
+  const existingIds = new Set(existing.map((i) => i.id));
+  const uniqueExtras = extraItems.filter((item) => !existingIds.has(item.id));
+  if (uniqueExtras.length === 0) return existing;
+  return [...uniqueExtras, ...existing];
+}
+
+/**
  * Pure function: removes an inventory item and cleans up any menu_recipes
  * referencing it so HPP calculations and BOM deductions never hold stale IDs.
  */
