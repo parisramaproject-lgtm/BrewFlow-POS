@@ -6,6 +6,7 @@ import {
   LayoutDashboard,
   LogOut,
   MonitorPlay,
+  PanelLeftClose,
   ReceiptText,
   Settings,
   ShoppingBag,
@@ -24,6 +25,8 @@ interface SidebarProps {
   onSelectPage: (page: PageId) => void;
   mobileOpen: boolean;
   onCloseMobile: () => void;
+  desktopHidden: boolean;
+  onHideDesktop: () => void;
 }
 
 const PAGE_ICONS: Record<PageId, React.ComponentType<{ className?: string }>> = {
@@ -40,7 +43,14 @@ const PAGE_ICONS: Record<PageId, React.ComponentType<{ className?: string }>> = 
   settings: Settings,
 };
 
-export function Sidebar({ activePage, onSelectPage, mobileOpen, onCloseMobile }: SidebarProps) {
+export function Sidebar({
+  activePage,
+  onSelectPage,
+  mobileOpen,
+  onCloseMobile,
+  desktopHidden,
+  onHideDesktop,
+}: SidebarProps) {
   const { user, logout } = useAuth();
   const { hasDueOpname, dueOpnameSchedules, settings } = useStore();
 
@@ -85,6 +95,16 @@ export function Sidebar({ activePage, onSelectPage, mobileOpen, onCloseMobile }:
           className="flex h-8 w-8 items-center justify-center rounded-lg text-[#6B7280] hover:bg-[#F4F6F5] lg:hidden"
         >
           <X className="h-4 w-4" />
+        </button>
+        <button
+          type="button"
+          onClick={onHideDesktop}
+          title="Sembunyikan sidebar"
+          aria-label="Sembunyikan sidebar menu"
+          data-testid="sidebar-hide-button"
+          className="hidden h-8 w-8 shrink-0 items-center justify-center rounded-lg text-[#6B7280] transition-colors hover:bg-[#F4F6F5] hover:text-[#109A58] lg:flex"
+        >
+          <PanelLeftClose className="h-4 w-4" />
         </button>
       </div>
 
@@ -145,8 +165,15 @@ export function Sidebar({ activePage, onSelectPage, mobileOpen, onCloseMobile }:
 
   return (
     <>
-      {/* Desktop Fixed 220px Sidebar */}
-      <div className="hidden h-full lg:block">{sidebarContent}</div>
+      {/* Desktop Fixed 220px Sidebar (Hideable) */}
+      <div
+        className={`hidden h-full shrink-0 overflow-hidden transition-all duration-200 lg:block ${
+          desktopHidden ? 'w-0' : 'w-[220px]'
+        }`}
+        aria-hidden={desktopHidden}
+      >
+        {!desktopHidden && sidebarContent}
+      </div>
 
       {/* Mobile / Tablet Drawer */}
       {mobileOpen && (

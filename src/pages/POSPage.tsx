@@ -222,11 +222,11 @@ export function POSPage({ searchQuery }: POSPageProps) {
   };
 
   return (
-    <div className="flex min-h-full flex-col xl:h-full xl:min-h-0 xl:flex-row xl:overflow-hidden">
+    <div className="flex min-h-full flex-col md:h-full md:min-h-0 md:flex-row md:overflow-hidden">
       {/* Column 2: Center Menu Catalog */}
       <section
         aria-label="Katalog Menu POS"
-        className="flex min-w-0 flex-col px-4 py-5 lg:px-6 xl:flex-1 xl:overflow-y-auto"
+        className="flex min-w-0 flex-col px-4 py-4 md:flex-1 md:overflow-y-auto lg:px-6 lg:py-5"
       >
         {feedbackBanner && (
           <div
@@ -296,7 +296,7 @@ export function POSPage({ searchQuery }: POSPageProps) {
             </p>
           </div>
         ) : (
-          <div className="grid grid-cols-2 gap-4 md:grid-cols-3 2xl:grid-cols-4">
+          <div className="grid grid-cols-2 gap-3.5 md:grid-cols-[repeat(auto-fill,minmax(168px,1fr))] lg:gap-4">
             {filteredMenus.map((menu) => {
               const inCartQty = cart.find((item) => item.menu.id === menu.id)?.quantity ?? 0;
               return (
@@ -344,15 +344,15 @@ export function POSPage({ searchQuery }: POSPageProps) {
         )}
       </section>
 
-      {/* Column 3: Right Fixed 360px Current Order Panel */}
+      {/* Column 3: Right Order Panel (Side-by-side on tablet md+ and desktop) */}
       <aside
         aria-label="Pesanan Saat Ini"
-        className="flex w-full shrink-0 flex-col border-t border-[#E5E7EB] bg-[#FFFFFF] xl:h-full xl:w-[360px] xl:border-l xl:border-t-0"
+        className="flex w-full shrink-0 flex-col border-t border-[#E5E7EB] bg-[#FFFFFF] md:h-full md:w-[300px] md:border-l md:border-t-0 lg:w-[330px] xl:w-[360px]"
       >
         {/* Order Header */}
-        <div className="border-b border-[#E5E7EB] px-5 py-4">
-          <div className="flex items-center justify-between gap-2">
-            <div>
+        <div className="border-b border-[#E5E7EB] px-4 py-3.5 xl:px-5 xl:py-4">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="min-w-0">
               <h2 className="text-base font-semibold text-[#1A2E26]">Pesanan Saat Ini</h2>
               <p className="mt-0.5 font-mono text-xs text-[#6B7280] tabular-nums">
                 {nextOrderNumber}
@@ -481,7 +481,7 @@ export function POSPage({ searchQuery }: POSPageProps) {
         </div>
 
         {/* Cart Items List */}
-        <div className="min-h-[180px] flex-1 overflow-y-auto px-5 py-3">
+        <div className="min-h-[180px] flex-1 overflow-y-auto px-4 py-3 xl:px-5">
           {cart.length === 0 ? (
             <div className="flex h-full flex-col items-center justify-center py-10 text-center">
               <div className="flex h-12 w-12 items-center justify-center rounded-full bg-[#F4F6F5] text-[#6B7280]">
@@ -582,7 +582,7 @@ export function POSPage({ searchQuery }: POSPageProps) {
         </div>
 
         {/* Order Note + Payment Summary + Bottom Actions */}
-        <div className="border-t border-[#E5E7EB] px-5 py-4">
+        <div className="border-t border-[#E5E7EB] px-4 py-3.5 xl:px-5 xl:py-4">
           <div className="relative mb-4">
             <Pencil
               className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-[#6B7280]"

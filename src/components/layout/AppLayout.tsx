@@ -4,6 +4,16 @@ import { Sidebar } from './Sidebar';
 import { TopHeader } from './TopHeader';
 import type { PageId } from '../../types';
 
+const SIDEBAR_HIDDEN_STORAGE_KEY = 'brewflow_sidebar_hidden_v1';
+
+function loadSidebarHiddenPreference(): boolean {
+  try {
+    return window.localStorage.getItem(SIDEBAR_HIDDEN_STORAGE_KEY) === 'true';
+  } catch {
+    return false;
+  }
+}
+
 interface AppLayoutProps {
   activePage: PageId;
   onSelectPage: (page: PageId) => void;
@@ -20,17 +30,34 @@ export function AppLayout({
   children,
 }: AppLayoutProps) {
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
+  const [desktopSidebarHidden, setDesktopSidebarHidden] = useState<boolean>(
+    loadSidebarHiddenPreference
+  );
+
+  const toggleDesktopSidebar = () => {
+    setDesktopSidebarHidden((prev) => {
+      const next = !prev;
+      try {
+        window.localStorage.setItem(SIDEBAR_HIDDEN_STORAGE_KEY, String(next));
+      } catch {
+        // Ignore storage quota errors
+      }
+      return next;
+    });
+  };
 
   return (
     <div className="flex h-screen w-full overflow-hidden bg-[#F4F6F5] text-[#1A2E26]">
       <NotificationWatcher />
 
-      {/* Column 1: Left Navigation Sidebar (220px) */}
+      {/* Column 1: Left Navigation Sidebar (220px, hideable on desktop + drawer on tablet/mobile) */}
       <Sidebar
         activePage={activePage}
         onSelectPage={onSelectPage}
         mobileOpen={mobileNavOpen}
         onCloseMobile={() => setMobileNavOpen(false)}
+        desktopHidden={desktopSidebarHidden}
+        onHideDesktop={toggleDesktopSidebar}
       />
 
       {/* Columns 2 (+ 3 on POS): Header + Main Content Viewport */}
@@ -39,6 +66,8 @@ export function AppLayout({
           searchQuery={searchQuery}
           onSearchChange={onSearchChange}
           onOpenMobileNav={() => setMobileNavOpen(true)}
+          desktopSidebarHidden={desktopSidebarHidden}
+          onToggleDesktopSidebar={toggleDesktopSidebar}
           onNavigate={onSelectPage}
         />
 

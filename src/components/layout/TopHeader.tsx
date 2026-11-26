@@ -1,5 +1,14 @@
 import { useEffect, useRef, useState } from 'react';
-import { AlertTriangle, Bell, ClipboardCheck, Menu, Search, X } from 'lucide-react';
+import {
+  AlertTriangle,
+  Bell,
+  ClipboardCheck,
+  Menu,
+  PanelLeftClose,
+  PanelLeftOpen,
+  Search,
+  X,
+} from 'lucide-react';
 import { useAuth } from '../../context/AuthContext';
 import { useStore } from '../../context/StoreContext';
 import type { PageId } from '../../types';
@@ -9,6 +18,8 @@ interface TopHeaderProps {
   searchQuery: string;
   onSearchChange: (value: string) => void;
   onOpenMobileNav: () => void;
+  desktopSidebarHidden: boolean;
+  onToggleDesktopSidebar: () => void;
   onNavigate: (page: PageId) => void;
 }
 
@@ -16,6 +27,8 @@ export function TopHeader({
   searchQuery,
   onSearchChange,
   onOpenMobileNav,
+  desktopSidebarHidden,
+  onToggleDesktopSidebar,
   onNavigate,
 }: TopHeaderProps) {
   const { user, authProvider } = useAuth();
@@ -56,6 +69,22 @@ export function TopHeader({
           className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-[#E5E7EB] bg-white text-[#1A2E26] hover:bg-[#E6F5EE] hover:text-[#109A58] lg:hidden"
         >
           <Menu className="h-5 w-5" />
+        </button>
+
+        <button
+          type="button"
+          onClick={onToggleDesktopSidebar}
+          title={desktopSidebarHidden ? 'Tampilkan sidebar menu' : 'Sembunyikan sidebar menu'}
+          aria-label={desktopSidebarHidden ? 'Tampilkan sidebar menu' : 'Sembunyikan sidebar menu'}
+          aria-pressed={desktopSidebarHidden}
+          data-testid="header-toggle-sidebar"
+          className="hidden h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-[#E5E7EB] bg-white text-[#1A2E26] transition-colors hover:border-[#109A58] hover:bg-[#E6F5EE] hover:text-[#109A58] lg:flex"
+        >
+          {desktopSidebarHidden ? (
+            <PanelLeftOpen className="h-5 w-5" />
+          ) : (
+            <PanelLeftClose className="h-5 w-5" />
+          )}
         </button>
 
         <div className="relative w-full max-w-md">
