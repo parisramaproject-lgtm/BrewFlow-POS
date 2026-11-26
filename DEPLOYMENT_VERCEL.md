@@ -12,7 +12,7 @@ Aplikasi **BrewFlow POS** menggunakan **Supabase** secara penuh (Supabase Auth G
 2. Buka **Supabase Dashboard → Authentication → Providers → Google**:
    - Aktifkan **Enable Sign in with Google**.
    - Tempel **Client ID** dan **Client Secret** dari Google Cloud Console, lalu simpan.
-3. Jalankan file SQL `supabase/schema_google_oauth_employees.sql` di **Supabase Dashboard → SQL Editor** agar tabel `profiles` siap mencocokkan email karyawan aktif secara otomatis saat login Google.
+3. Jalankan file SQL `supabase/schema_google_oauth_employees.sql` di **Supabase Dashboard → SQL Editor** agar tabel `employees` siap mencocokkan email karyawan aktif secara otomatis saat login Google (bahkan sebelum karyawan login pertama kali).
 
 ## 2. Deploy & Hosting ke Vercel
 
@@ -35,4 +35,4 @@ Aplikasi **BrewFlow POS** menggunakan **Supabase** secara penuh (Supabase Auth G
 ## 4. Fitur Tambahan Otomatis di Vercel
 
 - **Printer Thermal Bluetooth & USB Serial**: Di Vercel (domain HTTPS top-level, di luar iframe preview), `vercel.json` sudah menyertakan header `Permissions-Policy: bluetooth=(self), serial=(self), usb=(self)` sehingga printer thermal dapat terhubung langsung lewat Chrome/Edge.
-- **Verifikasi Email Karyawan**: Setiap login Google melalui Supabase Auth akan langsung dicocokkan dengan tabel `profiles` Supabase (dan daftar karyawan aktif). Email yang tidak terdaftar atau berstatus **Nonaktif** otomatis ditolak dan dikeluarkan.
+- **Verifikasi Email Karyawan**: Setiap login Google melalui Supabase Auth akan langsung dicocokkan dengan tabel `employees` Supabase. Email yang tidak terdaftar atau berstatus **Nonaktif** otomatis ditolak dan dikeluarkan.

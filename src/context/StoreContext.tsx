@@ -1,4 +1,4 @@
-import React, { createContext, useCallback, useContext, useMemo, useState } from 'react';
+import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
 import {
   INITIAL_CATEGORIES,
   INITIAL_CUSTOMERS,
@@ -1368,6 +1368,77 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     }
   }, []);
 
+  // Hydrate employee directory from Supabase `employees` table when an authenticated session is active
+  useEffect(() => {
+    if (!supabase) return;
+    let active = true;
+
+    async function loadRemoteEmployees() {
+      if (!supabase) return;
+      try {
+        const {
+          data: { session },
+        } = await supabase.auth.getSession();
+        if (!session) return;
+
+        const { data, error } = await supabase
+          .from('employees')
+          .select(
+            'id, full_name, email, role, phone_number, is_active, shift, position, employment_status, monthly_salary, join_date, emergency_contact, notes, created_at'
+          )
+          .order('created_at', { ascending: true });
+
+        if (!active || error || !data || data.length === 0) return;
+
+        const mapped: UserProfile[] = data.map((row) => {
+          const name = String(row.full_name || 'Karyawan');
+          const initials = name
+            .split(/\s+/)
+            .map((p: string) => p[0])
+            .join('')
+            .slice(0, 2)
+            .toUpperCase();
+          return {
+            id: String(row.id),
+            full_name: name,
+            email: String(row.email || ''),
+            role: (row.role as UserRole) || 'cashier',
+            phone_number: String(row.phone_number || '-'),
+            avatar_initials: initials || 'ST',
+            is_active: row.is_active !== false,
+            shift: row.shift ? String(row.shift) : undefined,
+            position: row.position ? String(row.position) : undefined,
+            employment_status: (row.employment_status as EmploymentStatus) || 'Tetap',
+            monthly_salary: Number(row.monthly_salary) || 0,
+            join_date: row.join_date ? String(row.join_date) : undefined,
+            emergency_contact: row.emergency_contact ? String(row.emergency_contact) : '',
+            notes: row.notes ? String(row.notes) : '',
+            created_at: String(row.created_at || new Date().toISOString()),
+          };
+        });
+
+        setEmployees(mapped);
+        persistEmployees(mapped);
+      } catch {
+        // Keep local employee state when Supabase `employees` table is not yet created
+      }
+    }
+
+    void loadRemoteEmployees();
+    const {
+      data: { subscription },
+    } = supabase.auth.onAuthStateChange((_event, session) => {
+      if (session) {
+        void loadRemoteEmployees();
+      }
+    });
+
+    return () => {
+      active = false;
+      subscription.unsubscribe();
+    };
+  }, [persistEmployees]);
+
   const syncEmployeeToSupabase = useCallback(async (employee: UserProfile) => {
     if (!supabase) return;
     try {
@@ -1376,7 +1447,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       } = await supabase.auth.getSession();
       if (!session) return;
 
-      await supabase.from('profiles').upsert(
+      await supabase.from('employees').upsert(
         {
           full_name: employee.full_name,
           email: employee.email.trim().toLowerCase(),
@@ -1394,7 +1465,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         { onConflict: 'email' }
       );
     } catch {
-      // Safe fallback when Supabase profiles schema/RLS is not yet initialized
+      // Safe fallback when Supabase `employees` table is not yet created
     }
   }, []);
 
@@ -1405,7 +1476,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         data: { session },
       } = await supabase.auth.getSession();
       if (!session) return;
-      await supabase.from('profiles').delete().ilike('email', email.trim());
+      await supabase.from('employees').delete().ilike('email', email.trim());
     } catch {
       // Safe fallback
     }

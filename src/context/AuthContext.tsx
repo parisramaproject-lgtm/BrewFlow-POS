@@ -106,38 +106,52 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     const isGoogleLogin = identity.provider === 'google';
     const normalizedEmail = normalizeEmail(identity.email);
 
-    // Step 1: Try matching in Supabase `profiles` table (by email first, then by auth user id)
+    // Step 1: Try matching in Supabase `employees` allowlist table first, then fallback to `profiles`
     if (supabase) {
       try {
-        let profileRow: Record<string, unknown> | null = null;
+        let matchedRow: Record<string, unknown> | null = null;
+        let matchedFromEmployeesTable = false;
 
         if (normalizedEmail) {
-          const { data: byEmail } = await supabase
-            .from('profiles')
+          const { data: empByEmail, error: empError } = await supabase
+            .from('employees')
             .select(
-              'id, full_name, email, role, phone_number, is_active, shift, position, created_at'
+              'id, full_name, email, role, phone_number, is_active, shift, position, employment_status, monthly_salary, join_date, emergency_contact, notes, created_at'
             )
             .ilike('email', normalizedEmail)
             .maybeSingle();
-          if (byEmail) {
-            profileRow = byEmail as Record<string, unknown>;
+
+          if (!empError && empByEmail) {
+            matchedRow = empByEmail as Record<string, unknown>;
+            matchedFromEmployeesTable = true;
           }
         }
 
-        if (!profileRow && !isGoogleLogin) {
-          const { data: byId } = await supabase
+        if (!matchedRow && normalizedEmail) {
+          const { data: profByEmail, error: profEmailErr } = await supabase
             .from('profiles')
             .select('id, full_name, email, role, phone_number, is_active, created_at')
-            .eq('id', sbUser.id)
+            .ilike('email', normalizedEmail)
             .maybeSingle();
-          if (byId) {
-            profileRow = byId as Record<string, unknown>;
+          if (!profEmailErr && profByEmail) {
+            matchedRow = profByEmail as Record<string, unknown>;
           }
         }
 
-        if (profileRow) {
-          if (profileRow.is_active === false) {
-            const name = String(profileRow.full_name || normalizedEmail || 'Karyawan');
+        if (!matchedRow && !isGoogleLogin) {
+          const { data: profById } = await supabase
+            .from('profiles')
+            .select('id, full_name, role, phone_number, created_at')
+            .eq('id', sbUser.id)
+            .maybeSingle();
+          if (profById) {
+            matchedRow = profById as Record<string, unknown>;
+          }
+        }
+
+        if (matchedRow) {
+          if (matchedRow.is_active === false) {
+            const name = String(matchedRow.full_name || normalizedEmail || 'Karyawan');
             await supabase.auth.signOut();
             setUser(null);
             setAuthMode(null);
@@ -148,7 +162,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           }
 
           const fullName = String(
-            profileRow.full_name || identity.displayName || normalizedEmail.split('@')[0] || 'Karyawan'
+            matchedRow.full_name ||
+              identity.displayName ||
+              normalizedEmail.split('@')[0] ||
+              'Karyawan'
           );
           const initials = fullName
             .split(/\s+/)
@@ -158,17 +175,36 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
             .toUpperCase();
 
           const dbEmployee: UserProfile = {
-            id: String(profileRow.id),
+            id: sbUser.id,
             full_name: fullName,
-            email: String(profileRow.email || normalizedEmail),
-            role: (profileRow.role as UserRole) || 'cashier',
-            phone_number: String(profileRow.phone_number || '-'),
+            email: String(matchedRow.email || normalizedEmail),
+            role: (matchedRow.role as UserRole) || 'cashier',
+            phone_number: String(matchedRow.phone_number || '-'),
             avatar_initials: initials || 'BF',
             is_active: true,
-            shift: typeof profileRow.shift === 'string' ? profileRow.shift : undefined,
-            position: typeof profileRow.position === 'string' ? profileRow.position : undefined,
-            created_at: String(profileRow.created_at || new Date().toISOString()),
+            shift: typeof matchedRow.shift === 'string' ? matchedRow.shift : undefined,
+            position: typeof matchedRow.position === 'string' ? matchedRow.position : undefined,
+            created_at: String(matchedRow.created_at || new Date().toISOString()),
           };
+
+          // Best-effort link to `profiles` using real auth.users UUID so orders/purchases FKs stay valid
+          if (matchedFromEmployeesTable) {
+            void (async () => {
+              try {
+                await supabase.from('profiles').upsert(
+                  {
+                    id: sbUser.id,
+                    full_name: dbEmployee.full_name,
+                    role: dbEmployee.role,
+                    phone_number: dbEmployee.phone_number,
+                  },
+                  { onConflict: 'id' }
+                );
+              } catch {
+                // Non-blocking fallback
+              }
+            })();
+          }
 
           window.localStorage.removeItem(DEMO_STORAGE_KEY);
           setAuthError(null);
@@ -177,7 +213,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           return;
         }
       } catch {
-        // If `profiles` table does not yet have extended columns, fall through to employee directory match
+        // Fall through to local employee directory check
       }
     }
 
