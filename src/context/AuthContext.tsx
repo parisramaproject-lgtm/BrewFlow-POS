@@ -27,6 +27,11 @@ import {
   canManageOpnameSchedules,
   canViewHPP,
 } from '../utils/rbac';
+import {
+  DEFAULT_OWNER_ALERT_EMAIL,
+  sendOwnerUsernameLoginAlert,
+} from '../services/loginAlertService';
+import { normalizeUsername, verifyPasswordLocal } from '../utils/usernameAuth';
 import { useStore } from './StoreContext';
 
 const LEGACY_DEMO_STORAGE_KEY = 'brewflow_demo_role_v1';
@@ -34,13 +39,14 @@ const LEGACY_DEMO_STORAGE_KEY = 'brewflow_demo_role_v1';
 interface AuthContextValue {
   user: UserProfile | null;
   authMode: 'supabase' | null;
-  authProvider: 'google' | 'email' | null;
+  authProvider: 'google' | 'email' | 'username' | null;
   authError: string | null;
   clearAuthError: () => void;
   isLoading: boolean;
   isSupabaseReady: boolean;
   signInWithGoogle: () => Promise<{ error: string | null }>;
   signInWithEmail: (email: string, password: string) => Promise<{ error: string | null }>;
+  signInWithUsername: (username: string, password: string) => Promise<{ error: string | null }>;
   logout: () => Promise<void>;
   hasRole: (roles: UserRole | UserRole[]) => boolean;
   canAccess: (page: PageId) => boolean;
@@ -76,14 +82,18 @@ const MISSING_SUPABASE_CONFIG_MESSAGE =
   'Koneksi Supabase belum terdeteksi pada build ini. Pastikan variabel VITE_SUPABASE_URL & VITE_SUPABASE_ANON_KEY (atau NEXT_PUBLIC_SUPABASE_URL & NEXT_PUBLIC_SUPABASE_ANON_KEY dari integrasi Supabase-Vercel) sudah terpasang di Vercel Environment Variables, lalu lakukan Redeploy.';
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
-  const { employees } = useStore();
+  const { employees, settings, recordUsernameLoginLog } = useStore();
   const employeesRef = useRef<UserProfile[]>(employees);
   employeesRef.current = employees;
+  const settingsRef = useRef(settings);
+  settingsRef.current = settings;
   const resolvingRef = useRef<{ userId: string; promise: Promise<void> } | null>(null);
 
   const [user, setUser] = useState<UserProfile | null>(null);
   const [authMode, setAuthMode] = useState<'supabase' | null>(null);
-  const [authProvider, setAuthProvider] = useState<'google' | 'email' | null>(null);
+  const [authProvider, setAuthProvider] = useState<'google' | 'email' | 'username' | null>(null);
+  const authProviderRef = useRef<'google' | 'email' | 'username' | null>(null);
+  authProviderRef.current = authProvider;
   const [authError, setAuthError] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState<boolean>(true);
 
@@ -380,7 +390,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     const subscription = supabase?.auth.onAuthStateChange((_event, session) => {
       if (session?.user) {
         void resolveSupabaseUser(session.user);
-      } else {
+      } else if (authProviderRef.current !== 'username') {
         setUser(null);
         setAuthMode(null);
         setAuthProvider(null);
@@ -393,15 +403,18 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     };
   }, [resolveSupabaseUser]);
 
-  // Keep active Google-authenticated user synced if Owner edits or deactivates them
+  // Keep active Google/Username-authenticated user synced if Owner edits or deactivates them
   useEffect(() => {
-    if (authProvider !== 'google' || !user) return;
+    if ((authProvider !== 'google' && authProvider !== 'username') || !user) return;
     const matched = employees.find(
-      (emp) => emp.id === user.id || normalizeEmail(emp.email) === normalizeEmail(user.email)
+      (emp) =>
+        emp.id === user.id ||
+        normalizeEmail(emp.email) === normalizeEmail(user.email) ||
+        (user.username && emp.username && normalizeUsername(emp.username) === normalizeUsername(user.username))
     );
     if (!matched) return;
     if (!matched.is_active) {
-      if (supabase) void supabase.auth.signOut();
+      if (supabase && authProvider === 'google') void supabase.auth.signOut();
       setUser(null);
       setAuthMode(null);
       setAuthProvider(null);
@@ -431,7 +444,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       const { error } = await supabase.auth.signInWithOAuth({
         provider: 'google',
         options: {
-          redirectTo: window.location.origin,
+          redirectTo: `${window.location.origin}/`,
           queryParams: {
             prompt: 'select_account',
           },
@@ -481,9 +494,135 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     [resolveSupabaseUser]
   );
 
+  const signInWithUsername = useCallback(
+    async (usernameInput: string, password: string): Promise<{ error: string | null }> => {
+      setAuthError(null);
+      const cleanUsername = normalizeUsername(usernameInput);
+      if (!cleanUsername || !password.trim()) {
+        return { error: 'Username dan kata sandi wajib diisi.' };
+      }
+
+      let authenticatedUser: UserProfile | null = null;
+      let shouldTryLocalFallback = !supabase;
+
+      // 1. Verify against Supabase server-side bcrypt RPC (`authenticate_employee_username`)
+      if (supabase) {
+        try {
+          const { data, error } = await supabase.rpc('authenticate_employee_username', {
+            p_username: cleanUsername,
+            p_password: password,
+          });
+
+          if (error) {
+            const code = String(error.code ?? '');
+            // PGRST202 / 42883 = RPC not installed yet in Supabase SQL Editor
+            if (code === 'PGRST202' || code === '42883') {
+              shouldTryLocalFallback = true;
+            } else {
+              return {
+                error: `Gagal memverifikasi username di Supabase (${error.message}). Pastikan file SQL supabase/schema_google_oauth_employees.sql terbaru sudah dijalankan.`,
+              };
+            }
+          } else if (data && typeof data === 'object') {
+            const payload = data as {
+              status?: string;
+              message?: string;
+              employee?: Record<string, unknown>;
+            };
+            if (payload.status === 'ok' && payload.employee) {
+              const row = payload.employee;
+              const fullName = String(row.full_name || cleanUsername).trim();
+              const initials = fullName
+                .split(/\s+/)
+                .map((part) => part[0])
+                .join('')
+                .slice(0, 2)
+                .toUpperCase();
+              authenticatedUser = {
+                id: String(row.id || `usr-${Date.now()}`),
+                full_name: fullName,
+                email: normalizeEmail(typeof row.email === 'string' ? row.email : ''),
+                username: normalizeUsername(
+                  typeof row.username === 'string' ? row.username : cleanUsername
+                ),
+                has_password: true,
+                role: normalizeEmployeeRole(row.role),
+                phone_number: String(row.phone_number || '-'),
+                avatar_initials: initials || 'BF',
+                is_active: true,
+                shift: typeof row.shift === 'string' ? row.shift : undefined,
+                position: typeof row.position === 'string' ? row.position : undefined,
+                created_at: String(row.created_at || new Date().toISOString()),
+              };
+            } else if (payload.status === 'inactive') {
+              return {
+                error:
+                  payload.message ||
+                  `Akun "@${cleanUsername}" sedang berstatus Nonaktif. Hubungi Owner.`,
+              };
+            } else {
+              // Check local fallback in case Owner just added username locally before syncing SQL
+              shouldTryLocalFallback = true;
+            }
+          }
+        } catch {
+          shouldTryLocalFallback = true;
+        }
+      }
+
+      // 2. Local PBKDF2 hash verification fallback (never plaintext)
+      if (!authenticatedUser && shouldTryLocalFallback) {
+        const localEmp = employeesRef.current.find(
+          (emp) => emp.username && normalizeUsername(emp.username) === cleanUsername
+        );
+        if (localEmp && localEmp.password_hash) {
+          const valid = await verifyPasswordLocal(password, localEmp.password_hash);
+          if (valid) {
+            if (!localEmp.is_active) {
+              return {
+                error: `Akun karyawan "${localEmp.full_name}" (@${cleanUsername}) sedang berstatus Nonaktif. Hubungi Owner.`,
+              };
+            }
+            authenticatedUser = {
+              ...localEmp,
+              username: cleanUsername,
+            };
+          }
+        }
+      }
+
+      if (!authenticatedUser) {
+        return {
+          error:
+            'Username atau kata sandi tidak sesuai. Pastikan Owner sudah mengatur username & kata sandi akun ini.',
+        };
+      }
+
+      setAuthError(null);
+      setUser(authenticatedUser);
+      setAuthMode('supabase');
+      setAuthProvider('username');
+
+      // Send Owner login confirmation email alert (default: parisramaproject@gmail.com)
+      void sendOwnerUsernameLoginAlert({
+        username: authenticatedUser.username || cleanUsername,
+        employeeName: authenticatedUser.full_name,
+        employeeEmail: authenticatedUser.email,
+        role: authenticatedUser.role,
+        shopName: settingsRef.current.shopName,
+        ownerEmail: settingsRef.current.ownerLoginAlertEmail || DEFAULT_OWNER_ALERT_EMAIL,
+      }).then((auditLog) => {
+        recordUsernameLoginLog(auditLog);
+      });
+
+      return { error: null };
+    },
+    [recordUsernameLoginLog]
+  );
+
   const logout = useCallback(async () => {
     setAuthError(null);
-    if (supabase) {
+    if (supabase && authProviderRef.current !== 'username') {
       await supabase.auth.signOut();
     }
     setUser(null);
@@ -518,6 +657,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       isSupabaseReady: isSupabaseConfigured,
       signInWithGoogle,
       signInWithEmail,
+      signInWithUsername,
       logout,
       hasRole,
       canAccess,
@@ -536,6 +676,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       isLoading,
       signInWithGoogle,
       signInWithEmail,
+      signInWithUsername,
       logout,
       hasRole,
       canAccess,

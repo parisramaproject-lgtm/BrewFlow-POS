@@ -42,6 +42,9 @@ export interface UserProfile {
   id: string;
   full_name: string;
   email: string;
+  username?: string;
+  has_password?: boolean;
+  password_hash?: string;
   role: UserRole;
   phone_number: string;
   avatar_initials: string;
@@ -55,6 +58,18 @@ export interface UserProfile {
   emergency_contact?: string;
   notes?: string;
   created_at: string;
+}
+
+export interface UsernameLoginAuditLog {
+  id: string;
+  username: string;
+  employee_name: string;
+  role: UserRole;
+  owner_email: string;
+  email_status: 'sent' | 'queued' | 'failed';
+  email_error?: string;
+  device_info: string;
+  logged_in_at: string;
 }
 
 export interface Category {
@@ -268,6 +283,8 @@ export interface StoreSettings {
   whatsappAutoReceipt: boolean;
   whatsappAutoOpnameReminder: boolean;
   whatsappAutoLowStock: boolean;
+  // Owner Login Confirmation Email Alert
+  ownerLoginAlertEmail: string;
 }
 
 export type MembershipPromoType = 'new_member' | 'free_product' | 'discount' | 'double_points';

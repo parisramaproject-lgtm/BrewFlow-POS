@@ -187,6 +187,11 @@ export function TopHeader({
                   Google
                 </span>
               )}
+              {authProvider === 'username' && user.username && (
+                <span className="font-mono text-[10px] font-medium leading-none text-[#6B7280]">
+                  @{user.username}
+                </span>
+              )}
             </div>
           </div>
         </div>

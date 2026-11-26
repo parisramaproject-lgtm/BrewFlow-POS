@@ -13,11 +13,11 @@ import type {
 export const INITIAL_EMPLOYEES: UserProfile[] = [
   {
     id: 'emp-01',
-    full_name: 'Budi Santoso',
-    email: 'generalaffairhrandelajaya@gmail.com',
+    full_name: 'Owner BrewFlow',
+    email: 'parisramaproject@gmail.com',
     role: 'owner',
     phone_number: '0812-8800-1101',
-    avatar_initials: 'BS',
+    avatar_initials: 'OB',
     is_active: true,
     shift: 'Full Access',
     position: 'Owner & Founder',

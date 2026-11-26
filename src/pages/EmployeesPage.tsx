@@ -2,8 +2,12 @@ import React, { useMemo, useState } from 'react';
 import {
   Check,
   CheckCircle2,
+  Eye,
+  EyeOff,
   Info,
+  KeyRound,
   Lock,
+  Mail,
   Pencil,
   Plus,
   Trash2,
@@ -14,10 +18,12 @@ import {
 import { AccessDenied } from '../components/common/AccessDenied';
 import { useAuth } from '../context/AuthContext';
 import { useStore } from '../context/StoreContext';
+import { DEFAULT_OWNER_ALERT_EMAIL } from '../services/loginAlertService';
 import type { EmploymentStatus, PageId, UserProfile, UserRole } from '../types';
-import { formatRupiah } from '../utils/format';
+import { formatDateTime, formatRupiah } from '../utils/format';
 import { normalizeEmail } from '../utils/googleAuth';
 import { getRoleDisplayLabel } from '../utils/rbac';
+import { normalizeUsername, validatePassword, validateUsername } from '../utils/usernameAuth';
 
 interface EmployeesPageProps {
   onNavigate: (page: PageId) => void;
@@ -51,14 +57,24 @@ const SHIFT_PRESETS = [
 
 export function EmployeesPage({ onNavigate }: EmployeesPageProps) {
   const { canSeeEmployees } = useAuth();
-  const { employees, addEmployee, updateEmployee, deleteEmployee, updateEmployeeRole } =
-    useStore();
+  const {
+    employees,
+    settings,
+    usernameLoginLogs,
+    addEmployee,
+    updateEmployee,
+    setEmployeeCredentials,
+    deleteEmployee,
+    updateEmployeeRole,
+  } = useStore();
 
   // Add employee form state
   const [showAddForm, setShowAddForm] = useState(false);
   const [fullName, setFullName] = useState('');
   const [position, setPosition] = useState('Barista & Kasir');
   const [email, setEmail] = useState('');
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
   const [phone, setPhone] = useState('');
   const [role, setRole] = useState<UserRole>('cashier');
   const [shift, setShift] = useState('Shift Pagi (07:00 - 15:00)');
@@ -75,9 +91,14 @@ export function EmployeesPage({ onNavigate }: EmployeesPageProps) {
   } | null>(null);
   const [draftValue, setDraftValue] = useState<string>('');
 
-  // Full detail modal for operational notes & quick edit
+  // Full detail modal for operational notes & username credentials
   const [detailEmployee, setDetailEmployee] = useState<UserProfile | null>(null);
   const [modalDraft, setModalDraft] = useState<Partial<UserProfile>>({});
+  const [modalUsername, setModalUsername] = useState('');
+  const [modalPassword, setModalPassword] = useState('');
+  const [showModalPassword, setShowModalPassword] = useState(false);
+  const [modalError, setModalError] = useState<string | null>(null);
+  const [savingModal, setSavingModal] = useState(false);
   const [toastMsg, setToastMsg] = useState<string | null>(null);
 
   const stats = useMemo(() => {
@@ -114,7 +135,7 @@ export function EmployeesPage({ onNavigate }: EmployeesPageProps) {
     window.setTimeout(() => setToastMsg(null), 4000);
   };
 
-  const handleSubmitAdd = (e: React.FormEvent) => {
+  const handleSubmitAdd = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!fullName.trim() || !email.trim()) {
       setErrorMsg('Nama lengkap dan email karyawan wajib diisi.');
@@ -123,14 +144,43 @@ export function EmployeesPage({ onNavigate }: EmployeesPageProps) {
     const normalizedEmail = normalizeEmail(email);
     if (employees.some((emp) => normalizeEmail(emp.email) === normalizedEmail)) {
       setErrorMsg(
-        `Email "${normalizedEmail}" sudah digunakan oleh karyawan lain. Setiap karyawan harus memiliki email unik untuk Login Google.`
+        `Email "${normalizedEmail}" sudah digunakan oleh karyawan lain. Setiap karyawan harus memiliki email unik.`
       );
       return;
     }
-    addEmployee({
+
+    let normalizedUser: string | undefined;
+    if (username.trim()) {
+      const userCheck = validateUsername(username);
+      if (!userCheck.valid) {
+        setErrorMsg(userCheck.error || 'Format username tidak valid.');
+        return;
+      }
+      normalizedUser = userCheck.normalized;
+      if (
+        employees.some(
+          (emp) => emp.username && normalizeUsername(emp.username) === normalizedUser
+        )
+      ) {
+        setErrorMsg(`Username "@${normalizedUser}" sudah dipakai karyawan lain.`);
+        return;
+      }
+      const passCheck = validatePassword(password);
+      if (!passCheck.valid) {
+        setErrorMsg(passCheck.error || 'Kata sandi minimal 6 karakter.');
+        return;
+      }
+    } else if (password.trim()) {
+      setErrorMsg('Isi Username terlebih dahulu jika ingin menetapkan kata sandi login.');
+      return;
+    }
+
+    await addEmployee({
       full_name: fullName,
       position,
       email,
+      username: normalizedUser,
+      password: password.trim() || undefined,
       phone_number: phone || '-',
       role,
       shift,
@@ -142,6 +192,8 @@ export function EmployeesPage({ onNavigate }: EmployeesPageProps) {
     setFullName('');
     setPosition('Barista & Kasir');
     setEmail('');
+    setUsername('');
+    setPassword('');
     setPhone('');
     setRole('cashier');
     setShift('Shift Pagi (07:00 - 15:00)');
@@ -150,7 +202,11 @@ export function EmployeesPage({ onNavigate }: EmployeesPageProps) {
     setEmergencyContact('');
     setErrorMsg(null);
     setShowAddForm(false);
-    notify('Akun karyawan baru berhasil ditambahkan & siap untuk Login Google.');
+    notify(
+      normalizedUser
+        ? `Akun karyawan & login username "@${normalizedUser}" berhasil ditambahkan.`
+        : 'Akun karyawan baru berhasil ditambahkan.'
+    );
   };
 
   const startInlineEdit = (emp: UserProfile, field: EditableCellField) => {
@@ -217,6 +273,10 @@ export function EmployeesPage({ onNavigate }: EmployeesPageProps) {
 
   const openDetailModal = (emp: UserProfile) => {
     setDetailEmployee(emp);
+    setModalError(null);
+    setModalUsername(emp.username ?? '');
+    setModalPassword('');
+    setShowModalPassword(false);
     setModalDraft({
       full_name: emp.full_name,
       position: emp.position ?? '',
@@ -232,14 +292,41 @@ export function EmployeesPage({ onNavigate }: EmployeesPageProps) {
     });
   };
 
-  const handleSaveDetailModal = (e: React.FormEvent) => {
+  const handleSaveDetailModal = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!detailEmployee) return;
+    if (!detailEmployee || savingModal) return;
+    setModalError(null);
+    setSavingModal(true);
+
     updateEmployee(detailEmployee.id, {
       ...modalDraft,
       monthly_salary: Math.max(0, Number(modalDraft.monthly_salary) || 0),
     });
-    notify(`Profil operasional "${modalDraft.full_name || detailEmployee.full_name}" disimpan.`);
+
+    const trimmedModalUser = modalUsername.trim();
+    const trimmedModalPass = modalPassword.trim();
+    const credentialsChanged =
+      trimmedModalUser !== (detailEmployee.username ?? '') || trimmedModalPass.length > 0;
+
+    if (credentialsChanged) {
+      const credResult = await setEmployeeCredentials(
+        detailEmployee.id,
+        trimmedModalUser,
+        trimmedModalPass || undefined
+      );
+      if (!credResult.ok) {
+        setModalError(credResult.error || 'Gagal menyimpan username & kata sandi.');
+        setSavingModal(false);
+        return;
+      }
+    }
+
+    setSavingModal(false);
+    notify(
+      credentialsChanged && trimmedModalUser
+        ? `Profil & kredensial login "@${normalizeUsername(trimmedModalUser)}" disimpan.`
+        : `Profil operasional "${modalDraft.full_name || detailEmployee.full_name}" disimpan.`
+    );
     setDetailEmployee(null);
   };
 
@@ -409,7 +496,23 @@ export function EmployeesPage({ onNavigate }: EmployeesPageProps) {
               value={emergencyContact}
               onChange={(e) => setEmergencyContact(e.target.value)}
               placeholder="Kontak Darurat (Nama · No. HP)"
-              className="h-10 sm:col-span-2 lg:col-span-3 rounded-xl border border-[#E5E7EB] px-3 text-xs text-[#1A2E26] focus:border-[#109A58] focus:outline-none"
+              className="h-10 rounded-xl border border-[#E5E7EB] px-3 text-xs text-[#1A2E26] focus:border-[#109A58] focus:outline-none"
+            />
+            <input
+              type="text"
+              autoCapitalize="none"
+              autoCorrect="off"
+              value={username}
+              onChange={(e) => setUsername(e.target.value)}
+              placeholder="Username Login (opsional, cth: kasir.dimas)"
+              className="h-10 rounded-xl border border-[#E5E7EB] px-3 font-mono text-xs text-[#1A2E26] focus:border-[#109A58] focus:outline-none"
+            />
+            <input
+              type="password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              placeholder="Password Login Username (min. 6 karakter)"
+              className="h-10 rounded-xl border border-[#E5E7EB] px-3 text-xs text-[#1A2E26] focus:border-[#109A58] focus:outline-none"
             />
           </div>
           <div className="flex justify-end gap-2">
@@ -461,7 +564,7 @@ export function EmployeesPage({ onNavigate }: EmployeesPageProps) {
             <thead>
               <tr className="border-b border-[#E5E7EB] bg-[#F4F6F5]/60 text-xs font-semibold text-[#6B7280]">
                 <th className="px-3.5 py-3">Karyawan &amp; Jabatan</th>
-                <th className="px-3 py-3">Email Login Google &amp; WA</th>
+                <th className="px-3 py-3">Email, Username &amp; WA</th>
                 <th className="px-3 py-3">Shift Kerja</th>
                 <th className="px-3 py-3">Status &amp; Tgl Gabung</th>
                 <th className="px-3 py-3 text-right">Gaji / Bulan</th>
@@ -591,6 +694,20 @@ export function EmployeesPage({ onNavigate }: EmployeesPageProps) {
                             {emp.phone_number}
                           </div>
                         )}
+
+                        <button
+                          type="button"
+                          onClick={() => openDetailModal(emp)}
+                          title="Klik untuk atur Username & Kata Sandi login"
+                          className="mt-0.5 inline-flex w-fit items-center gap-1 rounded px-1 py-0.5 text-[11px] font-medium text-[#109A58] hover:bg-[#E6F5EE]"
+                        >
+                          <KeyRound className="h-3 w-3 shrink-0" />
+                          {emp.username ? (
+                            <span className="font-mono">@{emp.username}</span>
+                          ) : (
+                            <span className="text-[#6B7280]">Atur username login</span>
+                          )}
+                        </button>
                       </div>
                     </td>
 
@@ -783,6 +900,84 @@ export function EmployeesPage({ onNavigate }: EmployeesPageProps) {
         </div>
       </div>
 
+      {/* Owner Username Login Confirmation Email Audit Card */}
+      <div className="rounded-2xl border border-[#E5E7EB] bg-[#FFFFFF] p-5 space-y-4">
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div className="flex items-start gap-2.5">
+            <div className="mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-[#E6F5EE] text-[#109A58]">
+              <Mail className="h-4 w-4" />
+            </div>
+            <div>
+              <h2 className="text-sm font-semibold text-[#1A2E26]">
+                Konfirmasi Email Login Username (Khusus Owner)
+              </h2>
+              <p className="mt-0.5 text-xs text-[#6B7280]">
+                Setiap login tanpa Google OAuth (menggunakan Username &amp; Kata Sandi) akan
+                mengirim email konfirmasi otomatis ke{' '}
+                <strong className="text-[#1A2E26]">
+                  {settings.ownerLoginAlertEmail || DEFAULT_OWNER_ALERT_EMAIL}
+                </strong>
+                .
+              </p>
+            </div>
+          </div>
+          <span className="rounded-full bg-[#E6F5EE] px-3 py-1 text-[11px] font-semibold text-[#109A58] tabular-nums">
+            {usernameLoginLogs.length} riwayat login
+          </span>
+        </div>
+
+        {usernameLoginLogs.length === 0 ? (
+          <p className="rounded-xl border border-dashed border-[#E5E7EB] bg-[#F4F6F5]/50 px-4 py-4 text-xs text-[#6B7280]">
+            Belum ada aktivitas login menggunakan username. Klik ikon pensil /{' '}
+            <strong>Atur username login</strong> pada baris karyawan di atas untuk menetapkan
+            username &amp; kata sandi.
+          </p>
+        ) : (
+          <div className="divide-y divide-[#E5E7EB] overflow-hidden rounded-xl border border-[#E5E7EB]">
+            {usernameLoginLogs.slice(0, 8).map((entry) => (
+              <div
+                key={entry.id}
+                className="flex flex-wrap items-center justify-between gap-2 px-4 py-2.5 text-xs"
+              >
+                <div className="min-w-0">
+                  <p className="font-semibold text-[#1A2E26]">
+                    {entry.employee_name}{' '}
+                    <span className="font-mono font-normal text-[#109A58]">
+                      (@{entry.username})
+                    </span>{' '}
+                    <span className="font-normal text-[#6B7280]">
+                      · {getRoleDisplayLabel(entry.role)}
+                    </span>
+                  </p>
+                  <p className="mt-0.5 text-[11px] text-[#6B7280]">
+                    Ke: {entry.owner_email} · {entry.device_info} ·{' '}
+                    <span className="tabular-nums">{formatDateTime(entry.logged_in_at)}</span>
+                  </p>
+                  {entry.email_error && (
+                    <p className="mt-0.5 text-[11px] text-[#B91C1C]">{entry.email_error}</p>
+                  )}
+                </div>
+                <span
+                  className={`rounded-md px-2 py-0.5 text-[10px] font-semibold ${
+                    entry.email_status === 'sent'
+                      ? 'bg-[#E6F5EE] text-[#109A58]'
+                      : entry.email_status === 'queued'
+                        ? 'bg-[#FFFBEB] text-[#B45309]'
+                        : 'bg-[#FEF2F2] text-[#EF4444]'
+                  }`}
+                >
+                  {entry.email_status === 'sent'
+                    ? 'Email Terkirim'
+                    : entry.email_status === 'queued'
+                      ? 'Menunggu Edge Function'
+                      : 'Gagal Kirim Email'}
+                </span>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
       {/* Full Employee Operational Detail Edit Modal */}
       {detailEmployee && (
         <div
@@ -795,10 +990,10 @@ export function EmployeesPage({ onNavigate }: EmployeesPageProps) {
             <div className="flex items-center justify-between border-b border-[#E5E7EB] px-6 py-4">
               <div>
                 <h2 className="text-base font-semibold text-[#1A2E26]">
-                  Edit Profil Operasional Karyawan
+                  Edit Profil &amp; Kredensial Karyawan
                 </h2>
                 <p className="mt-0.5 text-xs text-[#6B7280]">
-                  Lengkapi kontak darurat, catatan shift, gaji, dan informasi operasional lainnya.
+                  Atur username &amp; kata sandi login, kontak darurat, shift, dan gaji bulanan.
                 </p>
               </div>
               <button
@@ -815,6 +1010,81 @@ export function EmployeesPage({ onNavigate }: EmployeesPageProps) {
               onSubmit={handleSaveDetailModal}
               className="max-h-[80vh] overflow-y-auto space-y-4 p-6"
             >
+              {modalError && (
+                <p className="rounded-xl border border-[#FECACA] bg-[#FEF2F2] px-3.5 py-2.5 text-xs font-medium text-[#B91C1C]">
+                  {modalError}
+                </p>
+              )}
+
+              {/* Owner-Managed Username & Password Section */}
+              <div className="rounded-xl border border-[#109A58]/25 bg-[#E6F5EE]/40 p-4 space-y-3">
+                <div className="flex items-center gap-2 text-xs font-semibold text-[#1A2E26]">
+                  <KeyRound className="h-4 w-4 text-[#109A58]" />
+                  <span>Login Username &amp; Kata Sandi (Tanpa Google OAuth)</span>
+                </div>
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                  <div>
+                    <label
+                      htmlFor="mod-emp-username"
+                      className="block text-xs font-semibold text-[#1A2E26]"
+                    >
+                      Username
+                    </label>
+                    <input
+                      id="mod-emp-username"
+                      type="text"
+                      autoCapitalize="none"
+                      autoCorrect="off"
+                      value={modalUsername}
+                      onChange={(e) => setModalUsername(e.target.value)}
+                      placeholder="contoh: kasir.dimas"
+                      className="mt-1 h-10 w-full rounded-xl border border-[#E5E7EB] bg-white px-3 font-mono text-xs text-[#1A2E26] focus:border-[#109A58] focus:outline-none"
+                    />
+                  </div>
+                  <div>
+                    <label
+                      htmlFor="mod-emp-password"
+                      className="block text-xs font-semibold text-[#1A2E26]"
+                    >
+                      {detailEmployee.has_password ? 'Kata Sandi Baru (Opsional)' : 'Kata Sandi'}
+                    </label>
+                    <div className="relative mt-1">
+                      <input
+                        id="mod-emp-password"
+                        type={showModalPassword ? 'text' : 'password'}
+                        value={modalPassword}
+                        onChange={(e) => setModalPassword(e.target.value)}
+                        placeholder={
+                          detailEmployee.has_password
+                            ? 'Kosongkan jika tidak diubah'
+                            : 'Minimal 6 karakter'
+                        }
+                        className="h-10 w-full rounded-xl border border-[#E5E7EB] bg-white pl-3 pr-9 text-xs text-[#1A2E26] focus:border-[#109A58] focus:outline-none"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => setShowModalPassword((prev) => !prev)}
+                        aria-label={
+                          showModalPassword ? 'Sembunyikan kata sandi' : 'Tampilkan kata sandi'
+                        }
+                        className="absolute right-2.5 top-1/2 -translate-y-1/2 text-[#6B7280] hover:text-[#1A2E26]"
+                      >
+                        {showModalPassword ? (
+                          <EyeOff className="h-4 w-4" />
+                        ) : (
+                          <Eye className="h-4 w-4" />
+                        )}
+                      </button>
+                    </div>
+                  </div>
+                </div>
+                <p className="text-[11px] leading-relaxed text-[#4B5563]">
+                  Kata sandi dienkripsi dengan hash satu arah. Setiap login menggunakan username ini
+                  otomatis mengirim email konfirmasi ke{' '}
+                  <strong>{settings.ownerLoginAlertEmail || DEFAULT_OWNER_ALERT_EMAIL}</strong>.
+                </p>
+              </div>
+
               <div className="grid grid-cols-1 gap-3.5 sm:grid-cols-2">
                 <div>
                   <label htmlFor="mod-emp-name" className="block text-xs font-semibold text-[#1A2E26]">
@@ -966,9 +1236,10 @@ export function EmployeesPage({ onNavigate }: EmployeesPageProps) {
                 </button>
                 <button
                   type="submit"
-                  className="h-10 rounded-full bg-[#109A58] px-6 text-xs font-semibold text-white hover:bg-[#0D8A4E]"
+                  disabled={savingModal}
+                  className="h-10 rounded-full bg-[#109A58] px-6 text-xs font-semibold text-white hover:bg-[#0D8A4E] disabled:opacity-60"
                 >
-                  Simpan Perubahan
+                  {savingModal ? 'Menyimpan...' : 'Simpan Perubahan'}
                 </button>
               </div>
             </form>

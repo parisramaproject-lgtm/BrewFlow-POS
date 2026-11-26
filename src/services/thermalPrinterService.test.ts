@@ -37,6 +37,7 @@ const SAMPLE_SETTINGS: StoreSettings = {
   whatsappAutoReceipt: true,
   whatsappAutoOpnameReminder: true,
   whatsappAutoLowStock: true,
+  ownerLoginAlertEmail: 'parisramaproject@gmail.com',
 };
 
 const SAMPLE_ORDER: OrderRecord = {

@@ -43,9 +43,12 @@ import type {
   StoreVideoItem,
   UserProfile,
   UserRole,
+  UsernameLoginAuditLog,
   WhatsAppEventType,
   WhatsAppLogEntry,
 } from '../types';
+import { DEFAULT_OWNER_ALERT_EMAIL } from '../services/loginAlertService';
+import { hashPasswordLocal, normalizeUsername, validatePassword, validateUsername } from '../utils/usernameAuth';
 import { getDefaultExpenseCategoryForInventory } from '../utils/expenseCategories';
 import {
   DEFAULT_MEMBERSHIP_PROGRAM,
@@ -93,6 +96,7 @@ const SETTINGS_STORAGE_KEY = 'brewflow_store_settings_v1';
 const MEMBERSHIP_PROGRAM_STORAGE_KEY = 'brewflow_membership_program_v1';
 const STORE_VIDEOS_STORAGE_KEY = 'brewflow_tv_videos_v1';
 const EMPLOYEES_STORAGE_KEY = 'brewflow_employees_v1';
+const USERNAME_LOGIN_LOGS_STORAGE_KEY = 'brewflow_username_login_logs_v1';
 
 interface CreateOrderInput {
   items: CartItem[];
@@ -167,6 +171,7 @@ interface StoreContextValue {
   dueOpnameSchedules: StockOpnameSchedule[];
   opnameLogs: StockOpnameLog[];
   whatsappLogs: WhatsAppLogEntry[];
+  usernameLoginLogs: UsernameLoginAuditLog[];
   employees: UserProfile[];
   settings: StoreSettings;
   notifications: AppNotification[];
@@ -263,6 +268,8 @@ interface StoreContextValue {
   addEmployee: (input: {
     full_name: string;
     email: string;
+    username?: string;
+    password?: string;
     role: UserRole;
     phone_number: string;
     shift: string;
@@ -272,8 +279,14 @@ interface StoreContextValue {
     join_date?: string;
     emergency_contact?: string;
     notes?: string;
-  }) => void;
+  }) => Promise<void>;
   updateEmployee: (employeeId: string, patch: Partial<UserProfile>) => void;
+  setEmployeeCredentials: (
+    employeeId: string,
+    username: string,
+    password?: string
+  ) => Promise<{ ok: boolean; error?: string }>;
+  recordUsernameLoginLog: (entry: UsernameLoginAuditLog) => void;
   deleteEmployee: (employeeId: string) => void;
   updateEmployeeRole: (employeeId: string, role: UserRole) => void;
   updateSettings: (
@@ -319,6 +332,8 @@ export const INITIAL_SETTINGS: StoreSettings = {
   whatsappAutoReceipt: true,
   whatsappAutoOpnameReminder: true,
   whatsappAutoLowStock: true,
+  // Owner Login Confirmation Email Alert
+  ownerLoginAlertEmail: DEFAULT_OWNER_ALERT_EMAIL,
 };
 
 function loadInitialSettings(): StoreSettings {
@@ -377,6 +392,17 @@ function loadInitialEmployees(): UserProfile[] {
   }
 }
 
+function loadInitialUsernameLoginLogs(): UsernameLoginAuditLog[] {
+  try {
+    const raw = window.localStorage.getItem(USERNAME_LOGIN_LOGS_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw) as UsernameLoginAuditLog[];
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
 export function StoreProvider({ children }: { children: React.ReactNode }) {
   const [categories] = useState<Category[]>(INITIAL_CATEGORIES);
   const [menus, setMenus] = useState<MenuItem[]>(INITIAL_MENUS);
@@ -393,6 +419,9 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     useState<StockOpnameSchedule[]>(INITIAL_OPNAME_SCHEDULES);
   const [opnameLogs, setOpnameLogs] = useState<StockOpnameLog[]>(INITIAL_OPNAME_LOGS);
   const [whatsappLogs, setWhatsappLogs] = useState<WhatsAppLogEntry[]>([]);
+  const [usernameLoginLogs, setUsernameLoginLogs] = useState<UsernameLoginAuditLog[]>(
+    loadInitialUsernameLoginLogs
+  );
   const [employees, setEmployees] = useState<UserProfile[]>(loadInitialEmployees);
   const [settings, setSettings] = useState<StoreSettings>(loadInitialSettings);
   const [watcherNow, setWatcherNow] = useState<Date>(() => new Date());
@@ -1400,6 +1429,8 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
             id: String(row.id),
             full_name: name,
             email: String(row.email || ''),
+            username: row.username ? normalizeUsername(String(row.username)) : undefined,
+            has_password: Boolean(row.has_password || row.password_hash),
             role: (row.role as UserRole) || 'cashier',
             phone_number: String(row.phone_number || '-'),
             avatar_initials: initials || 'ST',
@@ -1415,8 +1446,20 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
           };
         });
 
-        setEmployees(mapped);
-        persistEmployees(mapped);
+        setEmployees((prev) => {
+          const merged = mapped.map((remote) => {
+            const localMatch = prev.find(
+              (item) => item.email.trim().toLowerCase() === remote.email.trim().toLowerCase()
+            );
+            return {
+              ...remote,
+              password_hash: localMatch?.password_hash,
+              has_password: remote.has_password || Boolean(localMatch?.password_hash),
+            };
+          });
+          persistEmployees(merged);
+          return merged;
+        });
       } catch {
         // Keep local employee state when Supabase `employees` table is not yet created
       }
@@ -1449,6 +1492,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         {
           full_name: employee.full_name,
           email: employee.email.trim().toLowerCase(),
+          username: employee.username ? normalizeUsername(employee.username) : null,
           role: employee.role,
           phone_number: employee.phone_number,
           is_active: employee.is_active,
@@ -1480,10 +1524,24 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     }
   }, []);
 
+  const recordUsernameLoginLog = useCallback((entry: UsernameLoginAuditLog) => {
+    setUsernameLoginLogs((prev) => {
+      const next = [entry, ...prev].slice(0, 50);
+      try {
+        window.localStorage.setItem(USERNAME_LOGIN_LOGS_STORAGE_KEY, JSON.stringify(next));
+      } catch {
+        // Ignore storage quota restrictions
+      }
+      return next;
+    });
+  }, []);
+
   const addEmployee = useCallback(
-    (input: {
+    async (input: {
       full_name: string;
       email: string;
+      username?: string;
+      password?: string;
       role: UserRole;
       phone_number: string;
       shift: string;
@@ -1501,10 +1559,17 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         .join('')
         .slice(0, 2)
         .toUpperCase();
+      const normalizedUser = input.username ? normalizeUsername(input.username) : undefined;
+      const trimmedPass = input.password?.trim() || '';
+      const passwordHash = trimmedPass ? await hashPasswordLocal(trimmedPass) : undefined;
+
       const created: UserProfile = {
         id: `emp-${Date.now()}`,
         full_name: input.full_name.trim(),
         email: input.email.trim(),
+        username: normalizedUser || undefined,
+        has_password: Boolean(passwordHash),
+        password_hash: passwordHash,
         role: input.role,
         phone_number: input.phone_number.trim(),
         avatar_initials: initials || 'ST',
@@ -1523,9 +1588,105 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         persistEmployees(next);
         return next;
       });
-      void syncEmployeeToSupabase(created);
+      await syncEmployeeToSupabase(created);
+      if (supabase && normalizedUser && trimmedPass) {
+        try {
+          await supabase.rpc('set_employee_username_credentials', {
+            p_email: created.email.trim().toLowerCase(),
+            p_username: normalizedUser,
+            p_password: trimmedPass,
+          });
+        } catch {
+          // Safe fallback if RPC is not yet installed
+        }
+      }
     },
     [persistEmployees, syncEmployeeToSupabase]
+  );
+
+  const setEmployeeCredentials = useCallback(
+    async (
+      employeeId: string,
+      usernameInput: string,
+      passwordInput?: string
+    ): Promise<{ ok: boolean; error?: string }> => {
+      const target = employees.find((emp) => emp.id === employeeId);
+      if (!target) {
+        return { ok: false, error: 'Data karyawan tidak ditemukan.' };
+      }
+
+      const trimmedUsername = usernameInput.trim();
+      let normalizedUser: string | undefined;
+      if (trimmedUsername) {
+        const checkUser = validateUsername(trimmedUsername);
+        if (!checkUser.valid) {
+          return { ok: false, error: checkUser.error };
+        }
+        normalizedUser = checkUser.normalized;
+        const duplicate = employees.some(
+          (other) =>
+            other.id !== employeeId &&
+            other.username &&
+            normalizeUsername(other.username) === normalizedUser
+        );
+        if (duplicate) {
+          return {
+            ok: false,
+            error: `Username "@${normalizedUser}" sudah dipakai karyawan lain.`,
+          };
+        }
+      }
+
+      const trimmedPass = (passwordInput ?? '').trim();
+      if (trimmedPass) {
+        const checkPass = validatePassword(trimmedPass);
+        if (!checkPass.valid) {
+          return { ok: false, error: checkPass.error };
+        }
+      } else if (normalizedUser && !target.has_password && !target.password_hash) {
+        return {
+          ok: false,
+          error: 'Atur kata sandi (minimal 6 karakter) saat pertama kali mengaktifkan username login.',
+        };
+      }
+
+      const nextHash = trimmedPass ? await hashPasswordLocal(trimmedPass) : target.password_hash;
+
+      setEmployees((prev) => {
+        const next = prev.map((emp) => {
+          if (emp.id !== employeeId) return emp;
+          return {
+            ...emp,
+            username: normalizedUser,
+            password_hash: normalizedUser ? nextHash : undefined,
+            has_password: Boolean(normalizedUser && (nextHash || emp.has_password)),
+          };
+        });
+        persistEmployees(next);
+        return next;
+      });
+
+      if (supabase) {
+        try {
+          const { data, error } = await supabase.rpc('set_employee_username_credentials', {
+            p_email: target.email.trim().toLowerCase(),
+            p_username: normalizedUser ?? '',
+            p_password: trimmedPass || null,
+          });
+          if (!error && data && typeof data === 'object' && (data as { ok?: boolean }).ok === false) {
+            return {
+              ok: false,
+              error: String((data as { error?: string }).error || 'Gagal menyimpan kredensial ke Supabase.'),
+            };
+          }
+        } catch {
+          // Local PBKDF2 fallback remains updated
+        }
+      }
+
+      return { ok: true };
+    },
+    [employees, persistEmployees]
   );
 
   const updateEmployee = useCallback(
@@ -1638,6 +1799,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       dueOpnameSchedules,
       opnameLogs,
       whatsappLogs,
+      usernameLoginLogs,
       employees,
       settings,
       notifications,
@@ -1679,6 +1841,8 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       deleteOpnameSchedule,
       addEmployee,
       updateEmployee,
+      setEmployeeCredentials,
+      recordUsernameLoginLog,
       deleteEmployee,
       updateEmployeeRole,
       updateSettings,
@@ -1697,6 +1861,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       dueOpnameSchedules,
       opnameLogs,
       whatsappLogs,
+      usernameLoginLogs,
       employees,
       settings,
       notifications,
@@ -1738,6 +1903,8 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       deleteOpnameSchedule,
       addEmployee,
       updateEmployee,
+      setEmployeeCredentials,
+      recordUsernameLoginLog,
       deleteEmployee,
       updateEmployeeRole,
       updateSettings,
