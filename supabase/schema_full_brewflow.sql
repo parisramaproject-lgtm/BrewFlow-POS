@@ -420,7 +420,7 @@ CREATE TABLE IF NOT EXISTS public.stock_opname_details (
   unit text DEFAULT 'pcs',
   system_stock numeric(14,2) NOT NULL DEFAULT 0,
   actual_stock numeric(14,2) NOT NULL DEFAULT 0,
-  variance numeric(14,2) NOT NULL DEFAULT 0,
+  variance numeric(14,2) GENERATED ALWAYS AS (actual_stock - system_stock) STORED,
   unit_price numeric(14,2) NOT NULL DEFAULT 0,
   reason text
 );

@@ -272,14 +272,20 @@ export async function hydrateAllTablesFromSupabase(
         const logId = String(row.opname_log_id);
         const inv = row.inventory_item_id ? inventoryMap.get(String(row.inventory_item_id)) : undefined;
         const list = detailsByLog.get(logId) ?? [];
+        const systemStock = Number(row.system_stock) || 0;
+        const actualStock = Number(row.actual_stock) || 0;
+        const computedVariance = Number((actualStock - systemStock).toFixed(2));
         list.push({
           inventory_item_id: String(row.inventory_item_id || ''),
           item_name: String(row.item_name || inv?.name || 'Item'),
           sku: String(row.sku || inv?.sku || ''),
           unit: String(row.unit || inv?.unit || 'pcs'),
-          system_stock: Number(row.system_stock) || 0,
-          actual_stock: Number(row.actual_stock) || 0,
-          variance: Number(row.variance) || 0,
+          system_stock: systemStock,
+          actual_stock: actualStock,
+          variance:
+            row.variance !== null && row.variance !== undefined && Number(row.variance) !== 0
+              ? Number(row.variance)
+              : computedVariance,
           unit_price: Number(row.unit_price) || inv?.last_purchase_price || 0,
           reason: row.reason ? String(row.reason) : undefined,
         });

@@ -159,7 +159,15 @@ export async function persistOrderToSupabase(params: {
       notes: item.notes ?? null,
     }));
 
-    const { error: itemsError } = await supabase.from('order_items').insert(itemRows);
+    let { error: itemsError } = await supabase.from('order_items').insert(itemRows);
+    if (
+      itemsError &&
+      (itemsError.code === '428C9' || itemsError.message.toLowerCase().includes('non-default'))
+    ) {
+      const retryRows = itemRows.map(({ subtotal: _omit, ...rest }) => rest);
+      const retryRes = await supabase.from('order_items').insert(retryRows);
+      itemsError = retryRes.error;
+    }
     if (itemsError) {
       return {
         mode: 'supabase',

@@ -650,6 +650,7 @@ export async function persistStockOpnameToSupabase(params: {
       }));
 
       // 2. Insert per-item variance rows into `stock_opname_details`
+      // Omit `variance` because PostgreSQL defines it as GENERATED ALWAYS AS (actual_stock - system_stock) STORED
       const { error: detailsErr } = await supabase.from('stock_opname_details').insert(
         resolvedDetails.map((d) => ({
           opname_log_id: insertedLog.id,
@@ -659,7 +660,6 @@ export async function persistStockOpnameToSupabase(params: {
           unit: d.unit,
           system_stock: d.system_stock,
           actual_stock: d.actual_stock,
-          variance: d.variance,
           unit_price: d.unit_price,
           reason: d.reason ?? null,
         }))
