@@ -10,6 +10,7 @@ import {
   Trash2,
   X,
 } from 'lucide-react';
+import { PeriodicExcelExport } from '../components/common/PeriodicExcelExport';
 import { useAuth } from '../context/AuthContext';
 import { useStore } from '../context/StoreContext';
 import type {
@@ -18,6 +19,7 @@ import type {
   PurchaseItemRecord,
   PurchaseRecord,
 } from '../types';
+import { buildPurchasingExcelData } from '../utils/excelExport';
 import {
   EXPENSE_CATEGORIES,
   getExpenseCategory,
@@ -45,7 +47,7 @@ const PAYMENT_METHOD_LABELS: Record<ExpensePaymentMethod, string> = {
 
 export function PurchasingPage() {
   const { user, authMode } = useAuth();
-  const { inventory, purchases, createPurchase } = useStore();
+  const { inventory, purchases, settings, createPurchase } = useStore();
   const liveSupabaseEnabled = authMode === 'supabase';
 
   const inventoryById = useMemo(
@@ -308,14 +310,31 @@ export function PurchasingPage() {
 
   return (
     <div className="mx-auto max-w-6xl space-y-6 p-4 lg:p-6">
-      <div>
-        <h1 className="text-xl font-semibold text-[#1A2E26]">
-          Pembelian &amp; Pengeluaran Operasional
-        </h1>
-        <p className="mt-0.5 text-sm text-[#6B7280]">
-          Catat pembelian bahan baku, kemasan, aset, hingga seluruh biaya operasional kedai (gaji,
-          sewa, utilitas, perawatan mesin, promo, dan lainnya).
-        </p>
+      <div className="flex flex-wrap items-center justify-between gap-4">
+        <div>
+          <h1 className="text-xl font-semibold text-[#1A2E26]">
+            Pembelian &amp; Pengeluaran Operasional
+          </h1>
+          <p className="mt-0.5 text-sm text-[#6B7280]">
+            Catat pembelian bahan baku, kemasan, aset, hingga seluruh biaya operasional kedai (gaji,
+            sewa, utilitas, perawatan mesin, promo, dan lainnya).
+          </p>
+        </div>
+
+        <PeriodicExcelExport
+          moduleTitle="Pembelian & Pengeluaran"
+          description="Tarik rekap pengeluaran per kategori, daftar invoice, dan rincian item pembelian per periode."
+          testId="export-purchasing-excel"
+          buildExport={({ startDate, endDate }) =>
+            buildPurchasingExcelData({
+              purchases,
+              startDate,
+              endDate,
+              categoryFilter: historyCategoryFilter,
+              shopName: settings.shopName,
+            })
+          }
+        />
       </div>
 
       {/* Expense Summary Strip */}

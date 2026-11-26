@@ -10,11 +10,13 @@ import {
   X,
 } from 'lucide-react';
 import { AccessDenied } from '../components/common/AccessDenied';
+import { PeriodicExcelExport } from '../components/common/PeriodicExcelExport';
 import { ProductVisual } from '../components/common/ProductVisual';
 import { MenuFormModal } from '../components/menu/MenuFormModal';
 import { useAuth } from '../context/AuthContext';
 import { useStore, type MenuItemInput } from '../context/StoreContext';
 import type { MenuItem } from '../types';
+import { buildMenuHppExcelData } from '../utils/excelExport';
 import { formatPercent, formatRupiah } from '../utils/format';
 import { calculateMenuHpp } from '../utils/posCalculations';
 
@@ -28,6 +30,8 @@ export function MenuHPPPage({ searchQuery }: MenuHPPPageProps) {
     categories,
     menus,
     inventory,
+    orders,
+    settings,
     addMenuItem,
     updateMenuItem,
     deleteMenuItem,
@@ -226,6 +230,28 @@ export function MenuHPPPage({ searchQuery }: MenuHPPPageProps) {
               </button>
             </div>
           )}
+
+          <PeriodicExcelExport
+            moduleTitle={isOwnerHppAuthorized ? 'Menu & HPP' : 'Daftar Menu'}
+            description={
+              isOwnerHppAuthorized
+                ? 'Tarik katalog menu, performa penjualan per periode, HPP, margin, dan resep BOM.'
+                : 'Tarik daftar menu, harga jual, dan ringkasan penjualan menu per periode.'
+            }
+            testId="export-menu-hpp-excel"
+            buildExport={({ startDate, endDate }) =>
+              buildMenuHppExcelData({
+                menus,
+                categories,
+                inventory,
+                orders,
+                startDate,
+                endDate,
+                includeHpp: isOwnerHppAuthorized,
+                shopName: settings.shopName,
+              })
+            }
+          />
 
           {effectiveTab === 'menus' && (
             <button

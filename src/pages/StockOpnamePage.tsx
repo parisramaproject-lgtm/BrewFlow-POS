@@ -11,9 +11,11 @@ import {
   Send,
   X,
 } from 'lucide-react';
+import { PeriodicExcelExport } from '../components/common/PeriodicExcelExport';
 import { useAuth } from '../context/AuthContext';
 import { useStore } from '../context/StoreContext';
 import type { StockOpnameLog } from '../types';
+import { buildStockOpnameExcelData } from '../utils/excelExport';
 import { formatDateTime, formatRupiah } from '../utils/format';
 import { getCategoryTargetLabel, getFrequencyDescription } from '../utils/opnameScheduler';
 import { calculateOpnameVariance } from '../utils/posCalculations';
@@ -171,12 +173,25 @@ export function StockOpnamePage() {
         </div>
 
         <div className="flex flex-wrap items-center gap-2.5">
+          <PeriodicExcelExport
+            moduleTitle="Stock Opname"
+            description="Tarik riwayat sesi stock opname, perbandingan stok sistem vs fisik, dan nilai selisih per periode."
+            testId="export-opname-excel"
+            buildExport={({ startDate, endDate }) =>
+              buildStockOpnameExcelData({
+                opnameLogs,
+                startDate,
+                endDate,
+                shopName: settings.shopName,
+              })
+            }
+          />
           {liveSupabaseEnabled && (
             <button
               type="button"
               onClick={handleRefreshFromSupabase}
               disabled={refreshingDb}
-              className="inline-flex items-center gap-1.5 rounded-full border border-[#E5E7EB] bg-[#FFFFFF] px-3.5 py-1.5 text-xs font-semibold text-[#1A2E26] transition-colors hover:border-[#109A58] hover:text-[#109A58] disabled:opacity-50"
+              className="inline-flex h-10 items-center gap-1.5 rounded-xl border border-[#E5E7EB] bg-[#FFFFFF] px-3.5 text-xs font-semibold text-[#1A2E26] transition-colors hover:border-[#109A58] hover:text-[#109A58] disabled:opacity-50"
             >
               <RefreshCw className={`h-3.5 w-3.5 ${refreshingDb ? 'animate-spin' : ''}`} />
               <span>{refreshingDb ? 'Memuat...' : 'Sinkronkan Database'}</span>

@@ -1,9 +1,11 @@
 import { useMemo, useState } from 'react';
 import { Printer, ReceiptText, X } from 'lucide-react';
+import { PeriodicExcelExport } from '../components/common/PeriodicExcelExport';
 import { PrintableReceipt } from '../components/common/PrintableReceipt';
 import { useStore } from '../context/StoreContext';
 import { printOrderReceipt } from '../services/thermalPrinterService';
 import type { OrderRecord, OrderStatus } from '../types';
+import { buildOrdersExcelData } from '../utils/excelExport';
 import { formatDateTime, formatRupiah } from '../utils/format';
 
 interface OrdersPageProps {
@@ -46,25 +48,42 @@ export function OrdersPage({ searchQuery }: OrdersPageProps) {
           </p>
         </div>
 
-        <div className="inline-flex rounded-xl border border-[#E5E7EB] bg-[#FFFFFF] p-1">
-          {[
-            { id: 'all' as const, label: 'Semua' },
-            { id: 'completed' as const, label: 'Selesai' },
-            { id: 'draft' as const, label: 'Draft' },
-          ].map((tab) => (
-            <button
-              key={tab.id}
-              type="button"
-              onClick={() => setStatusFilter(tab.id)}
-              className={`rounded-lg px-3.5 py-1.5 text-xs font-semibold transition-colors whitespace-nowrap ${
-                statusFilter === tab.id
-                  ? 'bg-[#E6F5EE] text-[#109A58]'
-                  : 'text-[#6B7280] hover:text-[#1A2E26]'
-              }`}
-            >
-              {tab.label}
-            </button>
-          ))}
+        <div className="flex flex-wrap items-center gap-2.5">
+          <div className="inline-flex rounded-xl border border-[#E5E7EB] bg-[#FFFFFF] p-1">
+            {[
+              { id: 'all' as const, label: 'Semua' },
+              { id: 'completed' as const, label: 'Selesai' },
+              { id: 'draft' as const, label: 'Draft' },
+            ].map((tab) => (
+              <button
+                key={tab.id}
+                type="button"
+                onClick={() => setStatusFilter(tab.id)}
+                className={`rounded-lg px-3.5 py-1.5 text-xs font-semibold transition-colors whitespace-nowrap ${
+                  statusFilter === tab.id
+                    ? 'bg-[#E6F5EE] text-[#109A58]'
+                    : 'text-[#6B7280] hover:text-[#1A2E26]'
+                }`}
+              >
+                {tab.label}
+              </button>
+            ))}
+          </div>
+
+          <PeriodicExcelExport
+            moduleTitle="Pesanan"
+            description="Tarik ringkasan penjualan, daftar transaksi, dan detail item per periode."
+            testId="export-orders-excel"
+            buildExport={({ startDate, endDate }) =>
+              buildOrdersExcelData({
+                orders,
+                startDate,
+                endDate,
+                statusFilter,
+                shopName: settings.shopName,
+              })
+            }
+          />
         </div>
       </div>
 

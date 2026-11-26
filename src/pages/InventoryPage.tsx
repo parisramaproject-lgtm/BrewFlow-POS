@@ -10,11 +10,13 @@ import {
   Wrench,
   X,
 } from 'lucide-react';
+import { PeriodicExcelExport } from '../components/common/PeriodicExcelExport';
 import { InventoryItemModal } from '../components/inventory/InventoryItemModal';
 import { useAuth } from '../context/AuthContext';
 import { useStore, type InventoryItemInput } from '../context/StoreContext';
 import { getInventoryStockStatus } from '../services/operationsService';
 import type { AssetCondition, InventoryItem, ItemCategoryType } from '../types';
+import { buildInventoryExcelData } from '../utils/excelExport';
 import {
   getDefaultExpenseCategoryForInventory,
   getExpenseCategoryLabel,
@@ -39,6 +41,9 @@ export function InventoryPage({ searchQuery }: InventoryPageProps) {
   const {
     inventory,
     menus,
+    purchases,
+    opnameLogs,
+    settings,
     addInventoryItem,
     updateInventoryItem,
     deleteInventoryItem,
@@ -199,16 +204,34 @@ export function InventoryPage({ searchQuery }: InventoryPageProps) {
           </p>
         </div>
 
-        {canManageInventory && (
-          <button
-            type="button"
-            onClick={handleOpenAdd}
-            className="inline-flex h-10 items-center gap-1.5 rounded-full bg-[#109A58] px-5 text-xs font-semibold text-white transition-colors hover:bg-[#0D8A4E] whitespace-nowrap"
-          >
-            <Plus className="h-4 w-4" />
-            <span>Tambah Item Inventori</span>
-          </button>
-        )}
+        <div className="flex flex-wrap items-center gap-2.5">
+          <PeriodicExcelExport
+            moduleTitle="Inventori"
+            description="Tarik master stok, valuasi aset/bahan, serta riwayat mutasi pembelian & opname per periode."
+            testId="export-inventory-excel"
+            buildExport={({ startDate, endDate }) =>
+              buildInventoryExcelData({
+                inventory,
+                purchases,
+                opnameLogs,
+                startDate,
+                endDate,
+                shopName: settings.shopName,
+              })
+            }
+          />
+
+          {canManageInventory && (
+            <button
+              type="button"
+              onClick={handleOpenAdd}
+              className="inline-flex h-10 items-center gap-1.5 rounded-full bg-[#109A58] px-5 text-xs font-semibold text-white transition-colors hover:bg-[#0D8A4E] whitespace-nowrap"
+            >
+              <Plus className="h-4 w-4" />
+              <span>Tambah Item Inventori</span>
+            </button>
+          )}
+        </div>
       </div>
 
       {feedbackBanner && (
