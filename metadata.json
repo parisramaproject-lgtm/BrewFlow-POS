@@ -1,0 +1,6 @@
+{
+  "name": "BrewFlow POS",
+  "description": "Sistem Point of Sale (POS) dan manajemen operasional Coffee Shop dengan RBAC multi-role, kalkulator HPP, inventori, stock opname terjadwal, dan membership.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}

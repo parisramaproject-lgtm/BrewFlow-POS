@@ -1,0 +1,65 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Plus Jakarta Sans", ui-sans-serif, system-ui, -apple-system, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+
+  --color-canvas: #F4F6F5;
+  --color-surface: #FFFFFF;
+  --color-brand: #109A58;
+  --color-brand-hover: #0D8A4E;
+  --color-brand-tint: #E6F5EE;
+  --color-ink: #1A2E26;
+  --color-ink-muted: #6B7280;
+  --color-line: #E5E7EB;
+  --color-danger: #EF4444;
+  --color-warning: #F59E0B;
+}
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+    font-family: var(--font-sans);
+    background-color: #F4F6F5;
+    color: #1A2E26;
+  }
+
+  button:not(:disabled),
+  a[href],
+  select:not(:disabled) {
+    cursor: pointer;
+  }
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+@media print {
+  @page {
+    margin: 4mm;
+  }
+
+  body * {
+    visibility: hidden !important;
+  }
+
+  #brewflow-print-area,
+  #brewflow-print-area * {
+    visibility: visible !important;
+  }
+
+  #brewflow-print-area {
+    position: fixed !important;
+    inset: 0 auto auto 0 !important;
+    margin: 0 auto !important;
+    background: #ffffff !important;
+    color: #000000 !important;
+    box-shadow: none !important;
+    border: none !important;
+    z-index: 99999 !important;
+  }
+}
+
