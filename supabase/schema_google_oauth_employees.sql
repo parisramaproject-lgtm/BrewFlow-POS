@@ -40,6 +40,11 @@ CREATE TRIGGER trg_normalize_employee_email
   FOR EACH ROW
   EXECUTE FUNCTION public.normalize_employee_email();
 
+-- Bersihkan spasi/huruf kapital pada data email yang sudah terlanjur dimasukkan manual
+UPDATE public.employees
+SET email = lower(trim(email))
+WHERE email <> lower(trim(email));
+
 -- 2. Fungsi helper RLS (SECURITY DEFINER agar tidak terjadi infinite recursion)
 CREATE OR REPLACE FUNCTION public.is_active_owner()
 RETURNS boolean
@@ -51,11 +56,53 @@ AS $$
   SELECT EXISTS (
     SELECT 1
     FROM public.employees e
-    WHERE lower(e.email) = lower(coalesce(auth.jwt() ->> 'email', ''))
-      AND e.role = 'owner'
+    WHERE lower(trim(e.email)) = lower(trim(coalesce(auth.jwt() ->> 'email', '')))
+      AND lower(trim(e.role)) = 'owner'
       AND e.is_active = true
   );
 $$;
+
+-- 2b. RPC SECURITY DEFINER untuk verifikasi login karyawan (kebal terhadap kendala RLS / kolom opsional)
+CREATE OR REPLACE FUNCTION public.get_my_employee_profile()
+RETURNS jsonb
+LANGUAGE plpgsql
+STABLE
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_email text;
+  v_result jsonb;
+BEGIN
+  v_email := lower(trim(coalesce(
+    auth.jwt() ->> 'email',
+    (SELECT u.email FROM auth.users u WHERE u.id = auth.uid())
+  )));
+
+  IF v_email IS NOT NULL AND v_email <> '' THEN
+    SELECT to_jsonb(e)
+    INTO v_result
+    FROM public.employees e
+    WHERE lower(trim(e.email)) = v_email
+       OR e.auth_user_id = auth.uid()
+    LIMIT 1;
+  END IF;
+
+  IF v_result IS NULL AND auth.uid() IS NOT NULL AND to_regclass('public.profiles') IS NOT NULL THEN
+    SELECT to_jsonb(p)
+    INTO v_result
+    FROM public.profiles p
+    WHERE p.id = auth.uid()
+    LIMIT 1;
+  END IF;
+
+  RETURN v_result;
+END;
+$$;
+
+GRANT USAGE ON SCHEMA public TO authenticated;
+GRANT SELECT, INSERT, UPDATE, DELETE ON public.employees TO authenticated;
+GRANT EXECUTE ON FUNCTION public.get_my_employee_profile() TO authenticated;
 
 -- 3. Aktifkan Row Level Security (RLS) pada tabel employees
 ALTER TABLE public.employees ENABLE ROW LEVEL SECURITY;
@@ -67,7 +114,8 @@ CREATE POLICY "Employees read own or owner reads all"
   FOR SELECT
   TO authenticated
   USING (
-    lower(email) = lower(coalesce(auth.jwt() ->> 'email', ''))
+    lower(trim(email)) = lower(trim(coalesce(auth.jwt() ->> 'email', '')))
+    OR auth_user_id = auth.uid()
     OR public.is_active_owner()
   );
 

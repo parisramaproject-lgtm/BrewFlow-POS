@@ -1,4 +1,4 @@
-import type { UserProfile } from '../types';
+import type { UserProfile, UserRole } from '../types';
 
 export interface GoogleAccountIdentity {
   uid: string;
@@ -33,6 +33,64 @@ export type EmployeeEmailMatchResult =
  */
 export function normalizeEmail(email: string | null | undefined): string {
   return (email ?? '').trim().toLowerCase();
+}
+
+/**
+ * Normalizes a database role value (case-insensitive, supports Indonesian aliases).
+ */
+export function normalizeEmployeeRole(raw: unknown): UserRole {
+  const value = String(raw ?? '')
+    .trim()
+    .toLowerCase();
+  if (value === 'owner' || value === 'pemilik' || value === 'admin') return 'owner';
+  if (value === 'manager' || value === 'manajer') return 'manager';
+  return 'cashier';
+}
+
+/**
+ * Determines whether a database employee/profile row is active.
+ * Missing or null `is_active` defaults to true for compatibility with minimal schemas.
+ */
+export function isEmployeeRowActive(row: Record<string, unknown>): boolean {
+  const val = row.is_active;
+  if (val === false) return false;
+  if (typeof val === 'string' && val.trim().toLowerCase() === 'false') return false;
+  if (val === 0) return false;
+  return true;
+}
+
+/**
+ * Finds a matching database row by normalized email (handling leading/trailing spaces
+ * and uppercase letters in DB) or by Supabase auth user ID.
+ */
+export function findMatchingDatabaseRow(
+  rows: Array<Record<string, unknown>>,
+  normalizedEmail: string,
+  authUserId?: string | null
+): Record<string, unknown> | null {
+  if (!Array.isArray(rows) || rows.length === 0) return null;
+
+  if (normalizedEmail) {
+    const byEmail = rows.find((row) => {
+      const candidate =
+        typeof row.email === 'string'
+          ? row.email
+          : typeof row.user_email === 'string'
+            ? row.user_email
+            : '';
+      return normalizeEmail(candidate) === normalizedEmail;
+    });
+    if (byEmail) return byEmail;
+  }
+
+  if (authUserId) {
+    const byAuthId = rows.find(
+      (row) => row.auth_user_id === authUserId || row.id === authUserId
+    );
+    if (byAuthId) return byAuthId;
+  }
+
+  return null;
 }
 
 /**
@@ -72,10 +130,14 @@ export function extractSupabaseUserIdentity(sbUser: {
         ? meta.picture
         : null;
   const provider = typeof appMeta.provider === 'string' ? appMeta.provider : null;
+  const resolvedEmail =
+    (typeof sbUser.email === 'string' && sbUser.email.trim()) ||
+    (typeof meta.email === 'string' && meta.email.trim()) ||
+    null;
 
   return {
     uid: sbUser.id,
-    email: sbUser.email ?? null,
+    email: resolvedEmail,
     displayName,
     photoURL,
     provider,

@@ -12,10 +12,13 @@ import { isSupabaseConfigured, supabase } from '../lib/supabase';
 import type { PageId, UserProfile, UserRole } from '../types';
 import {
   extractSupabaseUserIdentity,
+  findMatchingDatabaseRow,
   getSupabaseGoogleAuthErrorMessage,
+  isEmployeeRowActive,
   matchEmployeeByEmail,
   mergeGoogleProfileIntoEmployee,
   normalizeEmail,
+  normalizeEmployeeRole,
 } from '../utils/googleAuth';
 import {
   canAccessPage as checkCanAccessPage,
@@ -76,6 +79,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const { employees } = useStore();
   const employeesRef = useRef<UserProfile[]>(employees);
   employeesRef.current = employees;
+  const resolvingRef = useRef<{ userId: string; promise: Promise<void> } | null>(null);
 
   const [user, setUser] = useState<UserProfile | null>(null);
   const [authMode, setAuthMode] = useState<'supabase' | null>(null);
@@ -87,61 +91,116 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   /**
    * Resolves a Supabase authenticated user (Google OAuth or Email/Password) against:
-   * 1. Live Supabase `employees` table (case-insensitive email match)
-   * 2. Fallback to `profiles` table
-   * 3. Fallback to hydrated employee directory in StoreContext
+   * 1. SECURITY DEFINER RPC `get_my_employee_profile` (if installed)
+   * 2. Live Supabase `employees` table (case-insensitive & trim-safe email or auth_user_id)
+   * 3. Live Supabase `profiles` table (by auth user id or email, resilient to minimal schemas)
+   * 4. Fallback to hydrated employee directory in StoreContext
    *
-   * Strictly rejects unregistered or inactive Google accounts and signs them out immediately.
+   * Strictly rejects unregistered or inactive Google accounts and signs them out immediately,
+   * while surfacing actionable RLS/permission diagnostics if the database query itself was blocked.
    */
-  const resolveSupabaseUser = useCallback(async (sbUser: SupabaseUser) => {
+  const resolveSupabaseUserInner = useCallback(async (sbUser: SupabaseUser) => {
     const identity = extractSupabaseUserIdentity(sbUser);
     const isGoogleLogin = identity.provider === 'google';
     const normalizedEmail = normalizeEmail(identity.email);
+    let dbAccessError: string | null = null;
 
     if (supabase) {
       try {
         let matchedRow: Record<string, unknown> | null = null;
         let matchedFromEmployeesTable = false;
 
-        if (normalizedEmail) {
-          const { data: empByEmail, error: empError } = await supabase
-            .from('employees')
-            .select(
-              'id, full_name, email, role, phone_number, is_active, shift, position, employment_status, monthly_salary, join_date, emergency_contact, notes, created_at'
-            )
-            .ilike('email', normalizedEmail)
-            .maybeSingle();
-
-          if (!empError && empByEmail) {
-            matchedRow = empByEmail as Record<string, unknown>;
-            matchedFromEmployeesTable = true;
+        // 1. Try SECURITY DEFINER RPC if deployed (immune to client-side RLS edge cases)
+        try {
+          const { data: rpcData, error: rpcError } = await supabase.rpc('get_my_employee_profile');
+          if (!rpcError && rpcData && typeof rpcData === 'object') {
+            const candidate = Array.isArray(rpcData) ? rpcData[0] : rpcData;
+            if (candidate && typeof candidate === 'object') {
+              matchedRow = candidate as Record<string, unknown>;
+              matchedFromEmployeesTable = true;
+            }
           }
+        } catch {
+          // RPC not installed yet — proceed with direct table queries
         }
 
+        // 2. Query `employees` with select('*') so optional/missing columns never cause a query error
         if (!matchedRow && normalizedEmail) {
-          const { data: profByEmail, error: profEmailErr } = await supabase
-            .from('profiles')
-            .select('id, full_name, email, role, phone_number, is_active, created_at')
+          const { data: empExactRows, error: empExactErr } = await supabase
+            .from('employees')
+            .select('*')
             .ilike('email', normalizedEmail)
-            .maybeSingle();
-          if (!profEmailErr && profByEmail) {
-            matchedRow = profByEmail as Record<string, unknown>;
+            .limit(5);
+
+          if (empExactErr) {
+            const code = String(empExactErr.code ?? '');
+            if (code !== '42P01' && code !== 'PGRST205') {
+              dbAccessError = empExactErr.message;
+            }
+          } else if (empExactRows && empExactRows.length > 0) {
+            matchedRow = findMatchingDatabaseRow(
+              empExactRows as Array<Record<string, unknown>>,
+              normalizedEmail,
+              sbUser.id
+            );
+            if (matchedRow) matchedFromEmployeesTable = true;
           }
         }
 
-        if (!matchedRow && !isGoogleLogin) {
-          const { data: profById } = await supabase
+        // 2b. Fallback scan of visible `employees` rows (handles accidental leading/trailing spaces in DB email or auth_user_id match)
+        if (!matchedRow) {
+          const { data: empListRows, error: empListErr } = await supabase
+            .from('employees')
+            .select('*')
+            .limit(200);
+
+          if (!empListErr && empListRows && empListRows.length > 0) {
+            matchedRow = findMatchingDatabaseRow(
+              empListRows as Array<Record<string, unknown>>,
+              normalizedEmail,
+              sbUser.id
+            );
+            if (matchedRow) matchedFromEmployeesTable = true;
+          } else if (empListErr && !dbAccessError) {
+            const code = String(empListErr.code ?? '');
+            if (code !== '42P01' && code !== 'PGRST205') {
+              dbAccessError = empListErr.message;
+            }
+          }
+        }
+
+        // 3. Fallback to `profiles` table by auth user ID (works for both Google OAuth and Email logins)
+        if (!matchedRow) {
+          const { data: profByIdRows, error: profByIdErr } = await supabase
             .from('profiles')
-            .select('id, full_name, role, phone_number, created_at')
+            .select('*')
             .eq('id', sbUser.id)
-            .maybeSingle();
-          if (profById) {
-            matchedRow = profById as Record<string, unknown>;
+            .limit(1);
+
+          if (!profByIdErr && profByIdRows && profByIdRows.length > 0) {
+            matchedRow = profByIdRows[0] as Record<string, unknown>;
+          }
+        }
+
+        // 3b. Fallback to `profiles` table by email (if `email` column exists in `profiles`)
+        if (!matchedRow && normalizedEmail) {
+          const { data: profByEmailRows, error: profEmailErr } = await supabase
+            .from('profiles')
+            .select('*')
+            .ilike('email', normalizedEmail)
+            .limit(5);
+
+          if (!profEmailErr && profByEmailRows && profByEmailRows.length > 0) {
+            matchedRow = findMatchingDatabaseRow(
+              profByEmailRows as Array<Record<string, unknown>>,
+              normalizedEmail,
+              sbUser.id
+            );
           }
         }
 
         if (matchedRow) {
-          if (matchedRow.is_active === false) {
+          if (!isEmployeeRowActive(matchedRow)) {
             const name = String(matchedRow.full_name || normalizedEmail || 'Karyawan');
             await supabase.auth.signOut();
             setUser(null);
@@ -155,10 +214,11 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
           const fullName = String(
             matchedRow.full_name ||
+              matchedRow.name ||
               identity.displayName ||
               normalizedEmail.split('@')[0] ||
               'Karyawan'
-          );
+          ).trim();
           const initials = fullName
             .split(/\s+/)
             .map((part) => part[0])
@@ -169,8 +229,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           const dbEmployee: UserProfile = {
             id: sbUser.id,
             full_name: fullName,
-            email: String(matchedRow.email || normalizedEmail),
-            role: (matchedRow.role as UserRole) || 'cashier',
+            email: normalizeEmail(
+              typeof matchedRow.email === 'string' ? matchedRow.email : normalizedEmail
+            ),
+            role: normalizeEmployeeRole(matchedRow.role),
             phone_number: String(matchedRow.phone_number || '-'),
             avatar_initials: initials || 'BF',
             is_active: true,
@@ -203,8 +265,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           setAuthProvider(isGoogleLogin ? 'google' : 'email');
           return;
         }
-      } catch {
-        // Fall through to hydrated employee directory check
+      } catch (err) {
+        if (!dbAccessError && err instanceof Error) {
+          dbAccessError = err.message;
+        }
       }
     }
 
@@ -232,7 +296,15 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       setUser(null);
       setAuthMode(null);
       setAuthProvider(null);
-      setAuthError(localMatch.message);
+      if (dbAccessError) {
+        setAuthError(
+          `Gagal membaca tabel karyawan di Supabase untuk "${normalizedEmail}" (${dbAccessError}). Pastikan file SQL supabase/schema_google_oauth_employees.sql sudah dijalankan di Supabase SQL Editor agar policy RLS mengizinkan verifikasi email.`
+        );
+      } else {
+        setAuthError(
+          `Email "${normalizedEmail}" belum terbaca di tabel employees Supabase. Pastikan email terdaftar aktif di tabel public.employees (bukan hanya di Authentication → Users) dan policy RLS dari supabase/schema_google_oauth_employees.sql sudah dijalankan.`
+        );
+      }
       return;
     }
 
@@ -252,6 +324,22 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     setAuthMode('supabase');
     setAuthProvider('email');
   }, []);
+
+  const resolveSupabaseUser = useCallback(
+    async (sbUser: SupabaseUser) => {
+      if (resolvingRef.current && resolvingRef.current.userId === sbUser.id) {
+        return resolvingRef.current.promise;
+      }
+      const promise = resolveSupabaseUserInner(sbUser).finally(() => {
+        if (resolvingRef.current?.userId === sbUser.id) {
+          resolvingRef.current = null;
+        }
+      });
+      resolvingRef.current = { userId: sbUser.id, promise };
+      return promise;
+    },
+    [resolveSupabaseUserInner]
+  );
 
   useEffect(() => {
     let active = true;

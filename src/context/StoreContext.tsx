@@ -1383,9 +1383,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
 
         const { data, error } = await supabase
           .from('employees')
-          .select(
-            'id, full_name, email, role, phone_number, is_active, shift, position, employment_status, monthly_salary, join_date, emergency_contact, notes, created_at'
-          )
+          .select('*')
           .order('created_at', { ascending: true });
 
         if (!active || error || !data || data.length === 0) return;

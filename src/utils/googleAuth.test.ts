@@ -3,11 +3,14 @@ import assert from 'node:assert/strict';
 import type { UserProfile } from '../types';
 import {
   extractSupabaseUserIdentity,
+  findMatchingDatabaseRow,
   getSupabaseGoogleAuthErrorMessage,
+  isEmployeeRowActive,
   isSafeAvatarUrl,
   matchEmployeeByEmail,
   mergeGoogleProfileIntoEmployee,
   normalizeEmail,
+  normalizeEmployeeRole,
 } from './googleAuth';
 
 const SAMPLE_EMPLOYEES: UserProfile[] = [
@@ -128,3 +131,26 @@ test('getSupabaseGoogleAuthErrorMessage maps Supabase OAuth errors cleanly', () 
     /Redirect URLs/i
   );
 });
+
+test('findMatchingDatabaseRow matches DB email with whitespace/casing or auth user ID', () => {
+  const rows = [
+    { id: 'uuid-1', email: '  IpanMaulana033@gmail.com ', role: 'Owner' },
+    { id: 'sb-auth-uid-2', full_name: 'Profil Tanpa Email', role: 'manager' },
+  ];
+  const byEmail = findMatchingDatabaseRow(rows, 'ipanmaulana033@gmail.com', 'other-uid');
+  assert.equal(byEmail?.id, 'uuid-1');
+
+  const byUid = findMatchingDatabaseRow(rows, 'unknown@gmail.com', 'sb-auth-uid-2');
+  assert.equal(byUid?.id, 'sb-auth-uid-2');
+});
+
+test('normalizeEmployeeRole and isEmployeeRowActive handle minimal schemas cleanly', () => {
+  assert.equal(normalizeEmployeeRole(' Owner '), 'owner');
+  assert.equal(normalizeEmployeeRole('Manajer'), 'manager');
+  assert.equal(normalizeEmployeeRole('Kasir'), 'cashier');
+  assert.equal(isEmployeeRowActive({}), true);
+  assert.equal(isEmployeeRowActive({ is_active: true }), true);
+  assert.equal(isEmployeeRowActive({ is_active: false }), false);
+  assert.equal(isEmployeeRowActive({ is_active: 'false' }), false);
+});
+
