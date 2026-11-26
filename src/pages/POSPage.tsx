@@ -44,7 +44,16 @@ const ORDER_TYPES: Array<{ id: OrderType; label: string }> = [
 
 export function POSPage({ searchQuery }: POSPageProps) {
   const { user, authMode } = useAuth();
-  const { categories, menus, customers, orders, settings, createOrder, addCustomer } = useStore();
+  const {
+    categories,
+    menus,
+    customers,
+    orders,
+    settings,
+    membershipProgram,
+    createOrder,
+    addCustomer,
+  } = useStore();
   const liveSupabaseEnabled = authMode === 'supabase';
 
   const [selectedCategory, setSelectedCategory] = useState<string>('all');
@@ -85,8 +94,17 @@ export function POSPage({ searchQuery }: POSPageProps) {
       calculateCartSummary(cart, selectedCustomer?.tier ?? null, {
         taxEnabled: settings.taxEnabled,
         taxPercent: settings.taxPercent,
+        tierRules: membershipProgram.tiers,
+        pointEarningStepRupiah: membershipProgram.limits.point_earning_step_rupiah,
       }),
-    [cart, selectedCustomer, settings.taxEnabled, settings.taxPercent]
+    [
+      cart,
+      selectedCustomer,
+      settings.taxEnabled,
+      settings.taxPercent,
+      membershipProgram.tiers,
+      membershipProgram.limits.point_earning_step_rupiah,
+    ]
   );
 
   const nextOrderNumber = useMemo(

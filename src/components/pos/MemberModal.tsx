@@ -1,5 +1,6 @@
 import React, { useMemo, useState } from 'react';
 import { Award, Search, UserPlus, Users, X } from 'lucide-react';
+import { useStore } from '../../context/StoreContext';
 import type { Customer } from '../../types';
 import { getMemberDiscountRate } from '../../utils/posCalculations';
 
@@ -24,6 +25,7 @@ export function MemberModal({
   onSelectCustomer,
   onCreateCustomer,
 }: MemberModalProps) {
+  const { membershipProgram } = useStore();
   const [activeTab, setActiveTab] = useState<'select' | 'register'>('select');
   const [search, setSearch] = useState('');
   const [name, setName] = useState('');
@@ -158,7 +160,9 @@ export function MemberModal({
               ) : (
                 filteredCustomers.map((customer) => {
                   const isSelected = customer.id === selectedCustomerId;
-                  const discPct = Math.round(getMemberDiscountRate(customer.tier) * 100);
+                  const discPct = Math.round(
+                    getMemberDiscountRate(customer.tier, membershipProgram.tiers) * 100
+                  );
                   return (
                     <button
                       key={customer.id}

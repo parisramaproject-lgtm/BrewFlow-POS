@@ -21,6 +21,11 @@ import type {
   ExpensePaymentMethod,
   InventoryItem,
   ItemCategoryType,
+  MemberRedemptionLog,
+  MemberTier,
+  MembershipProgramConfig,
+  MembershipPromoProgram,
+  MembershipTierRule,
   MenuItem,
   OpnameFrequency,
   OrderRecord,
@@ -29,18 +34,28 @@ import type {
   PaymentMethod,
   PurchaseItemRecord,
   PurchaseRecord,
+  RedeemableRewardItem,
+  RedemptionLimitConfig,
   StockOpnameDetailItem,
   StockOpnameLog,
   StockOpnameSchedule,
   StoreSettings,
+  StoreVideoItem,
   UserProfile,
   UserRole,
   WhatsAppEventType,
   WhatsAppLogEntry,
 } from '../types';
 import { getDefaultExpenseCategoryForInventory } from '../utils/expenseCategories';
+import {
+  DEFAULT_MEMBERSHIP_PROGRAM,
+  isNewMemberPromoEligible,
+  validatePromoClaim,
+  validateRewardRedemption,
+} from '../utils/membershipProgram';
 import { calculateCartSummary, calculateOpnameVariance } from '../utils/posCalculations';
 import { isOpnameScheduleDue } from '../utils/opnameScheduler';
+import { INITIAL_STORE_VIDEOS } from '../utils/tvDisplay';
 import {
   computeRecipeStockDeductions,
   computeUpdatedMember,
@@ -74,6 +89,8 @@ import {
 export type { StoreSettings };
 
 const SETTINGS_STORAGE_KEY = 'brewflow_store_settings_v1';
+const MEMBERSHIP_PROGRAM_STORAGE_KEY = 'brewflow_membership_program_v1';
+const STORE_VIDEOS_STORAGE_KEY = 'brewflow_tv_videos_v1';
 
 interface CreateOrderInput {
   items: CartItem[];
@@ -140,6 +157,9 @@ interface StoreContextValue {
   inventory: InventoryItem[];
   orders: OrderRecord[];
   customers: Customer[];
+  membershipProgram: MembershipProgramConfig;
+  redemptionLogs: MemberRedemptionLog[];
+  storeVideos: StoreVideoItem[];
   purchases: PurchaseRecord[];
   opnameSchedules: StockOpnameSchedule[];
   dueOpnameSchedules: StockOpnameSchedule[];
@@ -161,6 +181,29 @@ interface StoreContextValue {
     enableSupabaseSync?: boolean;
   }) => Promise<Customer>;
   adjustCustomerPoints: (customerId: string, delta: number) => void;
+  updateMembershipLimits: (patch: Partial<RedemptionLimitConfig>) => void;
+  updateMembershipTier: (
+    tier: MemberTier,
+    patch: Partial<Omit<MembershipTierRule, 'tier'>>
+  ) => void;
+  addRedeemableReward: (input: Omit<RedeemableRewardItem, 'id' | 'redeemed_count'>) => void;
+  updateRedeemableReward: (rewardId: string, patch: Partial<RedeemableRewardItem>) => void;
+  deleteRedeemableReward: (rewardId: string) => void;
+  addMembershipPromo: (input: Omit<MembershipPromoProgram, 'id' | 'claimed_count'>) => void;
+  updateMembershipPromo: (promoId: string, patch: Partial<MembershipPromoProgram>) => void;
+  deleteMembershipPromo: (promoId: string) => void;
+  redeemMemberReward: (
+    customerId: string,
+    rewardId: string
+  ) => { ok: boolean; message: string };
+  claimMemberPromo: (
+    customerId: string,
+    promoId: string
+  ) => { ok: boolean; message: string };
+  addStoreVideo: (input: Omit<StoreVideoItem, 'id' | 'created_at'>) => StoreVideoItem;
+  deleteStoreVideo: (videoId: string) => void;
+  toggleStoreVideo: (videoId: string) => void;
+  moveStoreVideo: (videoId: string, direction: 'up' | 'down') => void;
   addMenuItem: (input: MenuItemInput) => Promise<MenuItem>;
   updateMenuItem: (menuId: string, patch: Partial<MenuItemInput>) => Promise<void>;
   deleteMenuItem: (menuId: string, enableSupabaseSync?: boolean) => Promise<void>;
@@ -287,12 +330,50 @@ function loadInitialSettings(): StoreSettings {
   }
 }
 
+function loadInitialMembershipProgram(): MembershipProgramConfig {
+  try {
+    const raw = window.localStorage.getItem(MEMBERSHIP_PROGRAM_STORAGE_KEY);
+    if (!raw) return DEFAULT_MEMBERSHIP_PROGRAM;
+    const parsed = JSON.parse(raw) as Partial<MembershipProgramConfig>;
+    return {
+      limits: { ...DEFAULT_MEMBERSHIP_PROGRAM.limits, ...(parsed.limits ?? {}) },
+      tiers:
+        Array.isArray(parsed.tiers) && parsed.tiers.length > 0
+          ? parsed.tiers
+          : DEFAULT_MEMBERSHIP_PROGRAM.tiers,
+      rewards: Array.isArray(parsed.rewards) ? parsed.rewards : DEFAULT_MEMBERSHIP_PROGRAM.rewards,
+      promos: Array.isArray(parsed.promos) ? parsed.promos : DEFAULT_MEMBERSHIP_PROGRAM.promos,
+    };
+  } catch {
+    return DEFAULT_MEMBERSHIP_PROGRAM;
+  }
+}
+
+function loadInitialStoreVideos(): StoreVideoItem[] {
+  try {
+    const raw = window.localStorage.getItem(STORE_VIDEOS_STORAGE_KEY);
+    if (!raw) return INITIAL_STORE_VIDEOS;
+    const parsed = JSON.parse(raw) as StoreVideoItem[];
+    if (!Array.isArray(parsed)) return INITIAL_STORE_VIDEOS;
+    // Strip stale blob: URLs from previous browser sessions
+    const valid = parsed.filter((v) => v && v.url && !v.url.startsWith('blob:'));
+    return valid.length > 0 ? valid : INITIAL_STORE_VIDEOS;
+  } catch {
+    return INITIAL_STORE_VIDEOS;
+  }
+}
+
 export function StoreProvider({ children }: { children: React.ReactNode }) {
   const [categories] = useState<Category[]>(INITIAL_CATEGORIES);
   const [menus, setMenus] = useState<MenuItem[]>(INITIAL_MENUS);
   const [inventory, setInventory] = useState<InventoryItem[]>(INITIAL_INVENTORY);
   const [orders, setOrders] = useState<OrderRecord[]>(INITIAL_ORDERS);
   const [customers, setCustomers] = useState<Customer[]>(INITIAL_CUSTOMERS);
+  const [membershipProgram, setMembershipProgram] = useState<MembershipProgramConfig>(
+    loadInitialMembershipProgram
+  );
+  const [redemptionLogs, setRedemptionLogs] = useState<MemberRedemptionLog[]>([]);
+  const [storeVideos, setStoreVideos] = useState<StoreVideoItem[]>(loadInitialStoreVideos);
   const [purchases, setPurchases] = useState<PurchaseRecord[]>(INITIAL_PURCHASES);
   const [opnameSchedules, setOpnameSchedules] =
     useState<StockOpnameSchedule[]>(INITIAL_OPNAME_SCHEDULES);
@@ -375,6 +456,8 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       const summary = calculateCartSummary(input.items, input.customer?.tier ?? null, {
         taxEnabled: settings.taxEnabled,
         taxPercent: settings.taxPercent,
+        tierRules: membershipProgram.tiers,
+        pointEarningStepRupiah: membershipProgram.limits.point_earning_step_rupiah,
       });
       const sequence = String(orders.length + 2).padStart(3, '0');
       const newOrder: OrderRecord = {
@@ -439,7 +522,8 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
           updatedCustomer = computeUpdatedMember(
             input.customer,
             summary.totalAmount,
-            summary.pointsEarned
+            summary.pointsEarned,
+            membershipProgram.tiers
           );
           const customerId = input.customer.id;
           const nextCustomer = updatedCustomer;
@@ -499,6 +583,8 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     [
       orders.length,
       inventory,
+      membershipProgram.tiers,
+      membershipProgram.limits.point_earning_step_rupiah,
       settings.taxEnabled,
       settings.taxPercent,
       settings.whatsappAutoReceipt,
@@ -513,6 +599,23 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     setOrders((prev) => prev.filter((o) => !(o.id === orderId && o.status === 'draft')));
   }, []);
 
+  const persistProgram = useCallback((next: MembershipProgramConfig) => {
+    try {
+      window.localStorage.setItem(MEMBERSHIP_PROGRAM_STORAGE_KEY, JSON.stringify(next));
+    } catch {
+      // Ignore storage quota errors
+    }
+  }, []);
+
+  const persistVideos = useCallback((next: StoreVideoItem[]) => {
+    try {
+      const storable = next.filter((v) => !v.url.startsWith('blob:'));
+      window.localStorage.setItem(STORE_VIDEOS_STORAGE_KEY, JSON.stringify(storable));
+    } catch {
+      // Ignore storage quota errors
+    }
+  }, []);
+
   const addCustomer = useCallback(
     async (input: {
       name: string;
@@ -520,21 +623,41 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       email: string;
       enableSupabaseSync?: boolean;
     }): Promise<Customer> => {
+      const promoEligible = isNewMemberPromoEligible(membershipProgram.limits);
+      const welcomePoints = promoEligible
+        ? Math.max(0, membershipProgram.limits.new_member_welcome_points)
+        : 0;
+
       const created: Customer = {
         id: `cust-${Date.now()}`,
         name: input.name.trim(),
         phone_number: input.phone_number.trim(),
         email: input.email.trim(),
-        points: 20,
+        points: welcomePoints,
         tier: 'Silver',
         total_spent: 0,
         created_at: new Date().toISOString(),
       };
       setCustomers((prev) => [created, ...prev]);
+
+      if (promoEligible) {
+        setMembershipProgram((prev) => {
+          const next: MembershipProgramConfig = {
+            ...prev,
+            limits: {
+              ...prev.limits,
+              new_member_claimed_count: prev.limits.new_member_claimed_count + 1,
+            },
+          };
+          persistProgram(next);
+          return next;
+        });
+      }
+
       await persistCustomerToSupabase(created, input.enableSupabaseSync ?? false);
       return created;
     },
-    []
+    [membershipProgram.limits, persistProgram]
   );
 
   const adjustCustomerPoints = useCallback((customerId: string, delta: number) => {
@@ -544,6 +667,296 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       )
     );
   }, []);
+
+  const updateMembershipLimits = useCallback(
+    (patch: Partial<RedemptionLimitConfig>) => {
+      setMembershipProgram((prev) => {
+        const next: MembershipProgramConfig = {
+          ...prev,
+          limits: { ...prev.limits, ...patch },
+        };
+        persistProgram(next);
+        return next;
+      });
+    },
+    [persistProgram]
+  );
+
+  const updateMembershipTier = useCallback(
+    (tier: MemberTier, patch: Partial<Omit<MembershipTierRule, 'tier'>>) => {
+      setMembershipProgram((prev) => {
+        const next: MembershipProgramConfig = {
+          ...prev,
+          tiers: prev.tiers.map((rule) => (rule.tier === tier ? { ...rule, ...patch } : rule)),
+        };
+        persistProgram(next);
+        return next;
+      });
+    },
+    [persistProgram]
+  );
+
+  const addRedeemableReward = useCallback(
+    (input: Omit<RedeemableRewardItem, 'id' | 'redeemed_count'>) => {
+      const created: RedeemableRewardItem = {
+        ...input,
+        id: `rew-${Date.now()}`,
+        redeemed_count: 0,
+      };
+      setMembershipProgram((prev) => {
+        const next: MembershipProgramConfig = {
+          ...prev,
+          rewards: [created, ...prev.rewards],
+        };
+        persistProgram(next);
+        return next;
+      });
+    },
+    [persistProgram]
+  );
+
+  const updateRedeemableReward = useCallback(
+    (rewardId: string, patch: Partial<RedeemableRewardItem>) => {
+      setMembershipProgram((prev) => {
+        const next: MembershipProgramConfig = {
+          ...prev,
+          rewards: prev.rewards.map((r) => (r.id === rewardId ? { ...r, ...patch } : r)),
+        };
+        persistProgram(next);
+        return next;
+      });
+    },
+    [persistProgram]
+  );
+
+  const deleteRedeemableReward = useCallback(
+    (rewardId: string) => {
+      setMembershipProgram((prev) => {
+        const next: MembershipProgramConfig = {
+          ...prev,
+          rewards: prev.rewards.filter((r) => r.id !== rewardId),
+        };
+        persistProgram(next);
+        return next;
+      });
+    },
+    [persistProgram]
+  );
+
+  const addMembershipPromo = useCallback(
+    (input: Omit<MembershipPromoProgram, 'id' | 'claimed_count'>) => {
+      const created: MembershipPromoProgram = {
+        ...input,
+        id: `promo-${Date.now()}`,
+        claimed_count: 0,
+      };
+      setMembershipProgram((prev) => {
+        const next: MembershipProgramConfig = {
+          ...prev,
+          promos: [created, ...prev.promos],
+        };
+        persistProgram(next);
+        return next;
+      });
+    },
+    [persistProgram]
+  );
+
+  const updateMembershipPromo = useCallback(
+    (promoId: string, patch: Partial<MembershipPromoProgram>) => {
+      setMembershipProgram((prev) => {
+        const next: MembershipProgramConfig = {
+          ...prev,
+          promos: prev.promos.map((p) => (p.id === promoId ? { ...p, ...patch } : p)),
+        };
+        persistProgram(next);
+        return next;
+      });
+    },
+    [persistProgram]
+  );
+
+  const deleteMembershipPromo = useCallback(
+    (promoId: string) => {
+      setMembershipProgram((prev) => {
+        const next: MembershipProgramConfig = {
+          ...prev,
+          promos: prev.promos.filter((p) => p.id !== promoId),
+        };
+        persistProgram(next);
+        return next;
+      });
+    },
+    [persistProgram]
+  );
+
+  const redeemMemberReward = useCallback(
+    (customerId: string, rewardId: string): { ok: boolean; message: string } => {
+      const customer = customers.find((c) => c.id === customerId);
+      const reward = membershipProgram.rewards.find((r) => r.id === rewardId);
+      if (!customer || !reward) {
+        return { ok: false, message: 'Data member atau produk penukaran tidak ditemukan.' };
+      }
+
+      const check = validateRewardRedemption({
+        customer,
+        reward,
+        limits: membershipProgram.limits,
+        logs: redemptionLogs,
+      });
+      if (!check.ok) {
+        return { ok: false, message: check.reason };
+      }
+
+      const cost = Math.max(reward.points_required, membershipProgram.limits.min_points_to_redeem);
+      setCustomers((prev) =>
+        prev.map((c) => (c.id === customerId ? { ...c, points: Math.max(0, c.points - cost) } : c))
+      );
+      setMembershipProgram((prev) => {
+        const next: MembershipProgramConfig = {
+          ...prev,
+          rewards: prev.rewards.map((r) =>
+            r.id === rewardId ? { ...r, redeemed_count: r.redeemed_count + 1 } : r
+          ),
+        };
+        persistProgram(next);
+        return next;
+      });
+      setRedemptionLogs((prev) => [
+        {
+          id: `rdm-${Date.now()}`,
+          customer_id: customer.id,
+          customer_name: customer.name,
+          reward_id: reward.id,
+          label: `Tukar Poin: Gratis ${reward.menu_name}`,
+          points_spent: cost,
+          redeemed_at: new Date().toISOString(),
+        },
+        ...prev,
+      ]);
+
+      return {
+        ok: true,
+        message: `${customer.name} berhasil menukarkan ${cost} poin untuk Gratis ${reward.menu_name}.`,
+      };
+    },
+    [customers, membershipProgram, redemptionLogs, persistProgram]
+  );
+
+  const claimMemberPromo = useCallback(
+    (customerId: string, promoId: string): { ok: boolean; message: string } => {
+      const customer = customers.find((c) => c.id === customerId);
+      const promo = membershipProgram.promos.find((p) => p.id === promoId);
+      if (!customer || !promo) {
+        return { ok: false, message: 'Data member atau promo tidak ditemukan.' };
+      }
+
+      const check = validatePromoClaim({
+        customer,
+        promo,
+        logs: redemptionLogs,
+      });
+      if (!check.ok) {
+        return { ok: false, message: check.reason };
+      }
+
+      const bonusPts = promo.bonus_points ?? 0;
+      if (bonusPts > 0) {
+        setCustomers((prev) =>
+          prev.map((c) => (c.id === customerId ? { ...c, points: c.points + bonusPts } : c))
+        );
+      }
+
+      setMembershipProgram((prev) => {
+        const next: MembershipProgramConfig = {
+          ...prev,
+          promos: prev.promos.map((p) =>
+            p.id === promoId ? { ...p, claimed_count: p.claimed_count + 1 } : p
+          ),
+        };
+        persistProgram(next);
+        return next;
+      });
+
+      setRedemptionLogs((prev) => [
+        {
+          id: `clm-${Date.now()}`,
+          customer_id: customer.id,
+          customer_name: customer.name,
+          promo_id: promo.id,
+          label: `Klaim Promo: ${promo.title}`,
+          points_spent: 0,
+          redeemed_at: new Date().toISOString(),
+        },
+        ...prev,
+      ]);
+
+      return {
+        ok: true,
+        message: `${customer.name} berhasil mengikuti promo "${promo.title}"${bonusPts > 0 ? ` (+${bonusPts} poin)` : ''}.`,
+      };
+    },
+    [customers, membershipProgram, redemptionLogs, persistProgram]
+  );
+
+  const addStoreVideo = useCallback(
+    (input: Omit<StoreVideoItem, 'id' | 'created_at'>): StoreVideoItem => {
+      const created: StoreVideoItem = {
+        ...input,
+        id: `vid-${Date.now()}`,
+        created_at: new Date().toISOString(),
+      };
+      setStoreVideos((prev) => {
+        const next = [created, ...prev];
+        persistVideos(next);
+        return next;
+      });
+      return created;
+    },
+    [persistVideos]
+  );
+
+  const deleteStoreVideo = useCallback(
+    (videoId: string) => {
+      setStoreVideos((prev) => {
+        const target = prev.find((v) => v.id === videoId);
+        if (target?.url.startsWith('blob:')) {
+          URL.revokeObjectURL(target.url);
+        }
+        const next = prev.filter((v) => v.id !== videoId);
+        persistVideos(next);
+        return next;
+      });
+    },
+    [persistVideos]
+  );
+
+  const toggleStoreVideo = useCallback(
+    (videoId: string) => {
+      setStoreVideos((prev) => {
+        const next = prev.map((v) => (v.id === videoId ? { ...v, is_active: !v.is_active } : v));
+        persistVideos(next);
+        return next;
+      });
+    },
+    [persistVideos]
+  );
+
+  const moveStoreVideo = useCallback(
+    (videoId: string, direction: 'up' | 'down') => {
+      setStoreVideos((prev) => {
+        const idx = prev.findIndex((v) => v.id === videoId);
+        if (idx < 0) return prev;
+        const swapIdx = direction === 'up' ? idx - 1 : idx + 1;
+        if (swapIdx < 0 || swapIdx >= prev.length) return prev;
+        const next = [...prev];
+        [next[idx], next[swapIdx]] = [next[swapIdx], next[idx]];
+        persistVideos(next);
+        return next;
+      });
+    },
+    [persistVideos]
+  );
 
   const addMenuItem = useCallback(async (input: MenuItemInput): Promise<MenuItem> => {
     const created: MenuItem = {
@@ -1040,6 +1453,9 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       inventory,
       orders,
       customers,
+      membershipProgram,
+      redemptionLogs,
+      storeVideos,
       purchases,
       opnameSchedules,
       dueOpnameSchedules,
@@ -1056,6 +1472,20 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       deleteDraftOrder,
       addCustomer,
       adjustCustomerPoints,
+      updateMembershipLimits,
+      updateMembershipTier,
+      addRedeemableReward,
+      updateRedeemableReward,
+      deleteRedeemableReward,
+      addMembershipPromo,
+      updateMembershipPromo,
+      deleteMembershipPromo,
+      redeemMemberReward,
+      claimMemberPromo,
+      addStoreVideo,
+      deleteStoreVideo,
+      toggleStoreVideo,
+      moveStoreVideo,
       addMenuItem,
       updateMenuItem,
       deleteMenuItem,
@@ -1082,6 +1512,9 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       inventory,
       orders,
       customers,
+      membershipProgram,
+      redemptionLogs,
+      storeVideos,
       purchases,
       opnameSchedules,
       dueOpnameSchedules,
@@ -1098,6 +1531,20 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       deleteDraftOrder,
       addCustomer,
       adjustCustomerPoints,
+      updateMembershipLimits,
+      updateMembershipTier,
+      addRedeemableReward,
+      updateRedeemableReward,
+      deleteRedeemableReward,
+      addMembershipPromo,
+      updateMembershipPromo,
+      deleteMembershipPromo,
+      redeemMemberReward,
+      claimMemberPromo,
+      addStoreVideo,
+      deleteStoreVideo,
+      toggleStoreVideo,
+      moveStoreVideo,
       addMenuItem,
       updateMenuItem,
       deleteMenuItem,

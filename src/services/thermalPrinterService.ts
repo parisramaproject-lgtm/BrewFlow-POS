@@ -203,6 +203,39 @@ export function isWebSerialSupported(): boolean {
   return typeof navigator !== 'undefined' && 'serial' in navigator;
 }
 
+export function isRunningInIframe(): boolean {
+  if (typeof window === 'undefined') return false;
+  try {
+    return window.self !== window.top;
+  } catch {
+    return true;
+  }
+}
+
+export function formatHardwareConnectionError(
+  err: unknown,
+  channel: 'bluetooth' | 'usb_serial'
+): string {
+  const raw = err instanceof Error ? err.message : '';
+  const name = err instanceof Error ? err.name : '';
+  const channelLabel = channel === 'bluetooth' ? 'Web Bluetooth' : 'Web Serial (USB)';
+
+  if (name === 'NotFoundError') {
+    return channel === 'bluetooth'
+      ? 'Pencarian perangkat Bluetooth dibatalkan oleh pengguna.'
+      : 'Pemilihan port USB/Serial dibatalkan oleh pengguna.';
+  }
+
+  if (
+    name === 'SecurityError' ||
+    /permissions policy|disallowed by permissions policy|failed to execute/i.test(raw)
+  ) {
+    return `Akses ${channelLabel} diblokir oleh kebijakan keamanan browser (Permissions-Policy) karena aplikasi sedang dibuka di dalam mode Preview / iframe. Solusi: (1) Buka URL aplikasi langsung di tab penuh Chrome/Edge (HTTPS), atau (2) Gunakan mode "Browser / Driver OS" atau "Jaringan WiFi / LAN".`;
+  }
+
+  return raw || `Gagal menghubungkan printer melalui ${channelLabel}.`;
+}
+
 export function getActiveHardwareStatus(): {
   bluetoothConnected: boolean;
   bluetoothName: string | null;
@@ -285,12 +318,7 @@ export async function connectBluetoothThermalPrinter(): Promise<PrinterActionRes
     return {
       ok: false,
       channel: 'bluetooth',
-      message:
-        err instanceof Error && err.name === 'NotFoundError'
-          ? 'Pencarian perangkat Bluetooth dibatalkan.'
-          : err instanceof Error
-            ? err.message
-            : 'Gagal menghubungkan printer Bluetooth.',
+      message: formatHardwareConnectionError(err, 'bluetooth'),
     };
   }
 }
@@ -333,8 +361,7 @@ export async function connectSerialThermalPrinter(baudRate = 9600): Promise<Prin
     return {
       ok: false,
       channel: 'usb_serial',
-      message:
-        err instanceof Error ? err.message : 'Koneksi printer USB/Serial dibatalkan atau gagal.',
+      message: formatHardwareConnectionError(err, 'usb_serial'),
     };
   }
 }

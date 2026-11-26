@@ -1,5 +1,6 @@
 import React, { useRef, useState } from 'react';
 import {
+  AlertTriangle,
   Bluetooth,
   CalendarClock,
   CheckCircle2,
@@ -25,6 +26,7 @@ import {
   connectSerialThermalPrinter,
   disconnectBluetoothThermalPrinter,
   getActiveHardwareStatus,
+  isRunningInIframe,
   isWebBluetoothSupported,
   isWebSerialSupported,
   printOrderReceipt,
@@ -74,51 +76,55 @@ export function SettingsPage() {
   );
 
   // Store, Tax & Receipt Form Draft State
-  const [shopName, setShopName] = useState(settings.shopName);
-  const [address, setAddress] = useState(settings.address);
-  const [phone, setPhone] = useState(settings.phone);
+  const [shopName, setShopName] = useState(settings.shopName ?? '');
+  const [address, setAddress] = useState(settings.address ?? '');
+  const [phone, setPhone] = useState(settings.phone ?? '');
   const [customerServiceContact, setCustomerServiceContact] = useState(
-    settings.customerServiceContact
+    settings.customerServiceContact ?? ''
   );
-  const [shopLogoUrl, setShopLogoUrl] = useState<string | null>(settings.shopLogoUrl);
-  const [taxEnabled, setTaxEnabled] = useState(settings.taxEnabled);
-  const [taxPercent, setTaxPercent] = useState(String(settings.taxPercent));
-  const [taxLabel, setTaxLabel] = useState(settings.taxLabel);
+  const [shopLogoUrl, setShopLogoUrl] = useState<string | null>(settings.shopLogoUrl ?? null);
+  const [taxEnabled, setTaxEnabled] = useState(Boolean(settings.taxEnabled));
+  const [taxPercent, setTaxPercent] = useState(String(settings.taxPercent ?? 10));
+  const [taxLabel, setTaxLabel] = useState(settings.taxLabel ?? 'PB1 / Pajak Restoran');
   const [receiptPaperWidth, setReceiptPaperWidth] = useState<'58mm' | '80mm'>(
-    settings.receiptPaperWidth
+    settings.receiptPaperWidth ?? '58mm'
   );
-  const [receiptHeaderText, setReceiptHeaderText] = useState(settings.receiptHeaderText);
-  const [receiptFooterText, setReceiptFooterText] = useState(settings.receiptFooterText);
-  const [receiptShowLogo, setReceiptShowLogo] = useState(settings.receiptShowLogo);
+  const [receiptHeaderText, setReceiptHeaderText] = useState(settings.receiptHeaderText ?? '');
+  const [receiptFooterText, setReceiptFooterText] = useState(settings.receiptFooterText ?? '');
+  const [receiptShowLogo, setReceiptShowLogo] = useState(Boolean(settings.receiptShowLogo));
   const [receiptShowCashierAndTable, setReceiptShowCashierAndTable] = useState(
-    settings.receiptShowCashierAndTable
+    Boolean(settings.receiptShowCashierAndTable)
   );
   const [receiptShowMemberInfo, setReceiptShowMemberInfo] = useState(
-    settings.receiptShowMemberInfo
+    Boolean(settings.receiptShowMemberInfo)
   );
   const [receiptShowCustomerService, setReceiptShowCustomerService] = useState(
-    settings.receiptShowCustomerService
+    Boolean(settings.receiptShowCustomerService)
   );
   const [logoError, setLogoError] = useState<string | null>(null);
 
   // Thermal Printer Hardware Sync State (Owner & Manager)
   const [printerConnectionType, setPrinterConnectionType] =
-    useState<ThermalPrinterConnectionType>(settings.printerConnectionType);
-  const [printerDeviceName, setPrinterDeviceName] = useState(settings.printerDeviceName);
-  const [printerNetworkIp, setPrinterNetworkIp] = useState(settings.printerNetworkIp);
-  const [printerNetworkPort, setPrinterNetworkPort] = useState(String(settings.printerNetworkPort));
-  const [printerNetworkBridgeUrl, setPrinterNetworkBridgeUrl] = useState(
-    settings.printerNetworkBridgeUrl
+    useState<ThermalPrinterConnectionType>(settings.printerConnectionType ?? 'browser');
+  const [printerDeviceName, setPrinterDeviceName] = useState(settings.printerDeviceName ?? '');
+  const [printerNetworkIp, setPrinterNetworkIp] = useState(
+    settings.printerNetworkIp ?? '192.168.1.100'
   );
-  const [printerBaudRate, setPrinterBaudRate] = useState(String(settings.printerBaudRate));
-  const [printerAutoCut, setPrinterAutoCut] = useState(settings.printerAutoCut);
+  const [printerNetworkPort, setPrinterNetworkPort] = useState(
+    String(settings.printerNetworkPort ?? 9100)
+  );
+  const [printerNetworkBridgeUrl, setPrinterNetworkBridgeUrl] = useState(
+    settings.printerNetworkBridgeUrl ?? 'http://localhost:8765/print'
+  );
+  const [printerBaudRate, setPrinterBaudRate] = useState(String(settings.printerBaudRate ?? 9600));
+  const [printerAutoCut, setPrinterAutoCut] = useState(Boolean(settings.printerAutoCut));
   const [printerOpenCashDrawer, setPrinterOpenCashDrawer] = useState(
-    settings.printerOpenCashDrawer
+    Boolean(settings.printerOpenCashDrawer)
   );
   const [printerAutoPrintAfterPayment, setPrinterAutoPrintAfterPayment] = useState(
-    settings.printerAutoPrintAfterPayment
+    Boolean(settings.printerAutoPrintAfterPayment)
   );
-  const [printerCopies, setPrinterCopies] = useState(String(settings.printerCopies));
+  const [printerCopies, setPrinterCopies] = useState(String(settings.printerCopies ?? 1));
   const [printerStatusMsg, setPrinterStatusMsg] = useState<{
     ok: boolean;
     text: string;
@@ -137,11 +143,11 @@ export function SettingsPage() {
 
   // WhatsApp form (Owner-only)
   const [waProvider, setWaProvider] = useState<'fonnte' | 'wablas'>(
-    settings.whatsappGatewayProvider
+    settings.whatsappGatewayProvider ?? 'fonnte'
   );
-  const [waUrl, setWaUrl] = useState(settings.whatsappGatewayUrl);
-  const [waOwner, setWaOwner] = useState(settings.whatsappOwnerPhone);
-  const [waManager, setWaManager] = useState(settings.whatsappManagerPhone);
+  const [waUrl, setWaUrl] = useState(settings.whatsappGatewayUrl ?? 'https://api.fonnte.com/send');
+  const [waOwner, setWaOwner] = useState(settings.whatsappOwnerPhone ?? '');
+  const [waManager, setWaManager] = useState(settings.whatsappManagerPhone ?? '');
   const [sendingTestWa, setSendingTestWa] = useState(false);
 
   const [savedToast, setSavedToast] = useState<string | null>(null);
@@ -939,6 +945,49 @@ export function SettingsPage() {
                   );
                 })}
               </div>
+
+              {/* Iframe Permissions-Policy Warning for Web Bluetooth & Web Serial */}
+              {isRunningInIframe() &&
+                (printerConnectionType === 'bluetooth' ||
+                  printerConnectionType === 'usb_serial') && (
+                  <div
+                    data-testid="printer-iframe-notice"
+                    className="rounded-2xl border border-[#F59E0B]/40 bg-[#FFFBEB] p-4 text-xs text-[#92400E]"
+                  >
+                    <div className="flex items-start gap-2.5">
+                      <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-[#D97706]" />
+                      <div className="space-y-1.5">
+                        <p className="font-semibold text-[#78350F]">
+                          Catatan Keamanan Browser (Mode Preview / Iframe)
+                        </p>
+                        <p className="leading-relaxed">
+                          Chrome &amp; Edge memblokir akses langsung{' '}
+                          <strong>Web Bluetooth / Web Serial</strong> di dalam frame preview
+                          (muncul error <em>&ldquo;Failed to execute requestDevice/requestPort&rdquo;</em>
+                          ). Untuk pairing Bluetooth/USB langsung, buka URL aplikasi ini di{' '}
+                          <strong>tab browser penuh (HTTPS)</strong>, atau gunakan mode alternatif
+                          di bawah:
+                        </p>
+                        <div className="flex flex-wrap gap-2 pt-1">
+                          <button
+                            type="button"
+                            onClick={() => setPrinterConnectionType('browser')}
+                            className="rounded-full bg-[#109A58] px-3 py-1 text-[11px] font-semibold text-white hover:bg-[#0D8A4E]"
+                          >
+                            Beralih ke Driver OS / Browser
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setPrinterConnectionType('network')}
+                            className="rounded-full border border-[#D97706]/40 bg-white px-3 py-1 text-[11px] font-semibold text-[#92400E] hover:bg-[#FEF3C7]"
+                          >
+                            Gunakan WiFi / LAN (Port 9100)
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                )}
 
               {/* Channel-Specific Configuration */}
               {printerConnectionType === 'bluetooth' && (

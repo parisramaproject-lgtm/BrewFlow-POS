@@ -9,6 +9,7 @@ export type PageId =
   | 'purchasing'
   | 'stock-opname'
   | 'membership'
+  | 'tv-display'
   | 'employees'
   | 'settings';
 
@@ -267,5 +268,91 @@ export interface StoreSettings {
   whatsappAutoOpnameReminder: boolean;
   whatsappAutoLowStock: boolean;
 }
+
+export type MembershipPromoType = 'new_member' | 'free_product' | 'discount' | 'double_points';
+
+export interface MembershipTierRule {
+  tier: MemberTier;
+  min_total_spent: number;
+  discount_percent: number;
+  points_multiplier: number;
+  welcome_benefit: string;
+}
+
+export interface RedeemableRewardItem {
+  id: string;
+  menu_id: string;
+  menu_name: string;
+  points_required: number;
+  max_redemptions_per_member: number;
+  total_quota: number;
+  redeemed_count: number;
+  is_active: boolean;
+}
+
+export interface MembershipPromoProgram {
+  id: string;
+  title: string;
+  description: string;
+  promo_type: MembershipPromoType;
+  start_date: string;
+  end_date: string;
+  max_redemptions_per_member: number;
+  max_customer_quota: number;
+  claimed_count: number;
+  bonus_points?: number;
+  discount_percent?: number;
+  reward_menu_id?: string | null;
+  reward_menu_name?: string | null;
+  eligible_tiers: MemberTier[];
+  is_active: boolean;
+}
+
+export interface RedemptionLimitConfig {
+  min_points_to_redeem: number;
+  max_free_products_per_day: number;
+  max_free_products_per_month: number;
+  point_earning_step_rupiah: number;
+  new_member_welcome_points: number;
+  new_member_promo_enabled: boolean;
+  new_member_promo_title: string;
+  new_member_promo_start_date: string;
+  new_member_promo_end_date: string;
+  new_member_max_quota: number;
+  new_member_claimed_count: number;
+  new_member_free_menu_id: string | null;
+}
+
+export interface MembershipProgramConfig {
+  limits: RedemptionLimitConfig;
+  tiers: MembershipTierRule[];
+  rewards: RedeemableRewardItem[];
+  promos: MembershipPromoProgram[];
+}
+
+export interface MemberRedemptionLog {
+  id: string;
+  customer_id: string;
+  customer_name: string;
+  reward_id?: string;
+  promo_id?: string;
+  label: string;
+  points_spent: number;
+  redeemed_at: string;
+}
+
+export interface StoreVideoItem {
+  id: string;
+  title: string;
+  subtitle?: string;
+  source_type: 'mp4' | 'youtube' | 'upload';
+  url: string;
+  embed_url?: string;
+  is_active: boolean;
+  show_promo_ticker: boolean;
+  created_by_name: string;
+  created_at: string;
+}
+
 
 

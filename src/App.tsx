@@ -15,6 +15,7 @@ import { POSPage } from './pages/POSPage';
 import { PurchasingPage } from './pages/PurchasingPage';
 import { SettingsPage } from './pages/SettingsPage';
 import { StockOpnamePage } from './pages/StockOpnamePage';
+import { TVDisplayPage } from './pages/TVDisplayPage';
 import type { PageId } from './types';
 import { getDefaultPageForRole } from './utils/rbac';
 
@@ -73,6 +74,8 @@ function AuthenticatedApp() {
         return <StockOpnamePage />;
       case 'membership':
         return <CustomersPage searchQuery={searchQuery} />;
+      case 'tv-display':
+        return <TVDisplayPage />;
       case 'employees':
         return <EmployeesPage onNavigate={handleSelectPage} />;
       case 'settings':

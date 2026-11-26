@@ -1,9 +1,22 @@
-import type { CartItem, InventoryItem, MemberTier, MenuRecipeItem } from '../types';
+import type {
+  CartItem,
+  InventoryItem,
+  MemberTier,
+  MembershipTierRule,
+  MenuRecipeItem,
+} from '../types';
 
 export const TAX_RATE = 0.1;
 
-export function getMemberDiscountRate(tier: MemberTier | null): number {
+export function getMemberDiscountRate(
+  tier: MemberTier | null,
+  tierRules?: MembershipTierRule[]
+): number {
   if (!tier) return 0;
+  if (tierRules && tierRules.length > 0) {
+    const matched = tierRules.find((r) => r.tier === tier);
+    if (matched) return Math.max(0, Math.min(1, matched.discount_percent / 100));
+  }
   switch (tier) {
     case 'Platinum':
       return 0.15;
@@ -17,6 +30,8 @@ export function getMemberDiscountRate(tier: MemberTier | null): number {
 export interface TaxConfig {
   taxEnabled: boolean;
   taxPercent: number;
+  tierRules?: MembershipTierRule[];
+  pointEarningStepRupiah?: number;
 }
 
 export interface CartSummary {
@@ -39,13 +54,19 @@ export function calculateCartSummary(
 ): CartSummary {
   const itemCount = items.reduce((sum, item) => sum + item.quantity, 0);
   const subtotal = items.reduce((sum, item) => sum + item.menu.selling_price * item.quantity, 0);
-  const discountRate = getMemberDiscountRate(memberTier);
+  const discountRate = getMemberDiscountRate(memberTier, taxConfig.tierRules);
   const discountAmount = Math.round(subtotal * discountRate);
   const taxableAmount = Math.max(0, subtotal - discountAmount);
   const effectiveTaxPercent = taxConfig.taxEnabled ? Math.max(0, taxConfig.taxPercent) : 0;
   const taxAmount = Math.round(taxableAmount * (effectiveTaxPercent / 100));
   const totalAmount = taxableAmount + taxAmount;
-  const pointsEarned = memberTier ? Math.floor(totalAmount / 10000) : 0;
+
+  const stepRupiah = Math.max(1000, taxConfig.pointEarningStepRupiah ?? 10000);
+  const tierMultiplier =
+    memberTier && taxConfig.tierRules
+      ? Math.max(0.5, taxConfig.tierRules.find((r) => r.tier === memberTier)?.points_multiplier ?? 1)
+      : 1;
+  const pointsEarned = memberTier ? Math.floor((totalAmount / stepRupiah) * tierMultiplier) : 0;
 
   return {
     itemCount,

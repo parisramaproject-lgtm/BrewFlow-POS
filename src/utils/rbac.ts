@@ -53,6 +53,11 @@ export const NAV_ITEMS: NavItemConfig[] = [
     allowedRoles: ['owner', 'manager', 'cashier'],
   },
   {
+    id: 'tv-display',
+    label: 'Display TV Store',
+    allowedRoles: ['owner', 'manager', 'cashier'],
+  },
+  {
     id: 'employees',
     label: 'Karyawan',
     allowedRoles: ['owner'],
@@ -91,6 +96,10 @@ export function canManageOpnameSchedules(role: UserRole): boolean {
 }
 
 export function canManageWhatsAppSettings(role: UserRole): boolean {
+  return role === 'owner';
+}
+
+export function canManageMembershipProgram(role: UserRole): boolean {
   return role === 'owner';
 }
 

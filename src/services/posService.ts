@@ -1,5 +1,13 @@
 import { isSupabaseConfigured, supabase } from '../lib/supabase';
-import type { CartItem, Customer, InventoryItem, MemberTier, OrderRecord } from '../types';
+import type {
+  CartItem,
+  Customer,
+  InventoryItem,
+  MemberTier,
+  MembershipTierRule,
+  OrderRecord,
+} from '../types';
+import { computeTierBySpend } from '../utils/membershipProgram';
 
 export interface StockDeductionSummary {
   inventoryItemId: string;
@@ -61,12 +69,12 @@ export function computeRecipeStockDeductions(
 export function computeUpdatedMember(
   customer: Customer,
   orderTotalAmount: number,
-  pointsEarned: number
+  pointsEarned: number,
+  tierRules?: MembershipTierRule[]
 ): Customer {
   const nextSpent = customer.total_spent + orderTotalAmount;
   const nextPoints = customer.points + pointsEarned;
-  const nextTier: MemberTier =
-    nextSpent >= 8000000 ? 'Platinum' : nextSpent >= 3000000 ? 'Gold' : 'Silver';
+  const nextTier: MemberTier = computeTierBySpend(nextSpent, tierRules);
 
   return {
     ...customer,

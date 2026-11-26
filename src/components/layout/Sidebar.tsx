@@ -5,6 +5,7 @@ import {
   Coffee,
   LayoutDashboard,
   LogOut,
+  MonitorPlay,
   ReceiptText,
   Settings,
   ShoppingBag,
@@ -34,6 +35,7 @@ const PAGE_ICONS: Record<PageId, React.ComponentType<{ className?: string }>> = 
   purchasing: ShoppingBag,
   'stock-opname': ClipboardCheck,
   membership: Users,
+  'tv-display': MonitorPlay,
   employees: UserCheck,
   settings: Settings,
 };
