@@ -88,7 +88,16 @@ import {
   buildPosReceiptPayload,
   dispatchWhatsAppNotification,
 } from '../services/whatsappService';
-import { supabase } from '../lib/supabase';
+import { getAppSessionToken, supabase } from '../lib/supabase';
+import {
+  deleteOrderFromSupabase,
+  deleteStoreVideoFromSupabase,
+  hydrateAllTablesFromSupabase,
+  persistMemberRedemptionToSupabase,
+  persistMembershipProgramToSupabase,
+  updateCustomerPointsInSupabase,
+  upsertStoreVideoToSupabase,
+} from '../services/supabaseHydrationService';
 
 export type { StoreSettings };
 
@@ -177,6 +186,7 @@ interface StoreContextValue {
   notifications: AppNotification[];
   hasDueOpname: boolean;
   lowStockItems: InventoryItem[];
+  refreshAllFromSupabase: () => Promise<void>;
   refreshOpnameWatcher: (enableSupabaseSync?: boolean) => Promise<void>;
   sendWhatsAppMessage: (input: SendWhatsAppActionInput) => Promise<WhatsAppLogEntry>;
   createOrder: (input: CreateOrderInput) => Promise<CreateOrderResult>;
@@ -404,7 +414,7 @@ function loadInitialUsernameLoginLogs(): UsernameLoginAuditLog[] {
 }
 
 export function StoreProvider({ children }: { children: React.ReactNode }) {
-  const [categories] = useState<Category[]>(INITIAL_CATEGORIES);
+  const [categories, setCategories] = useState<Category[]>(INITIAL_CATEGORIES);
   const [menus, setMenus] = useState<MenuItem[]>(INITIAL_MENUS);
   const [inventory, setInventory] = useState<InventoryItem[]>(INITIAL_INVENTORY);
   const [orders, setOrders] = useState<OrderRecord[]>(INITIAL_ORDERS);
@@ -582,6 +592,19 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         enableSupabaseSync: input.enableSupabaseSync ?? false,
       });
 
+      const finalOrder: OrderRecord =
+        syncStatus.synced && syncStatus.id ? { ...newOrder, id: syncStatus.id } : newOrder;
+
+      if (syncStatus.synced && syncStatus.id) {
+        setOrders((prev) =>
+          prev.map((o) => (o.id === newOrder.id ? { ...o, id: syncStatus.id! } : o))
+        );
+      }
+
+      if (input.replacesDraftId && (input.enableSupabaseSync ?? false)) {
+        void deleteOrderFromSupabase(input.replacesDraftId);
+      }
+
       let whatsappReceiptLog: WhatsAppLogEntry | null = null;
       if (input.status === 'completed') {
         // Auto-send digital WhatsApp receipt & points to member customer
@@ -616,7 +639,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       }
 
       return {
-        order: newOrder,
+        order: finalOrder,
         pointsEarned: summary.pointsEarned,
         deductions,
         syncStatus,
@@ -640,6 +663,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
 
   const deleteDraftOrder = useCallback((orderId: string) => {
     setOrders((prev) => prev.filter((o) => !(o.id === orderId && o.status === 'draft')));
+    void deleteOrderFromSupabase(orderId);
   }, []);
 
   const persistProgram = useCallback((next: MembershipProgramConfig) => {
@@ -648,6 +672,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     } catch {
       // Ignore storage quota errors
     }
+    void persistMembershipProgramToSupabase(next);
   }, []);
 
   const persistVideos = useCallback((next: StoreVideoItem[]) => {
@@ -697,18 +722,29 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         });
       }
 
-      await persistCustomerToSupabase(created, input.enableSupabaseSync ?? false);
+      const sync = await persistCustomerToSupabase(created, input.enableSupabaseSync ?? false);
+      if (sync.synced && sync.id) {
+        const persisted = { ...created, id: sync.id };
+        setCustomers((prev) => prev.map((c) => (c.id === created.id ? persisted : c)));
+        return persisted;
+      }
       return created;
     },
     [membershipProgram.limits, persistProgram]
   );
 
   const adjustCustomerPoints = useCallback((customerId: string, delta: number) => {
+    let updatedTarget: Customer | null = null;
     setCustomers((prev) =>
-      prev.map((c) =>
-        c.id === customerId ? { ...c, points: Math.max(0, c.points + delta) } : c
-      )
+      prev.map((c) => {
+        if (c.id !== customerId) return c;
+        updatedTarget = { ...c, points: Math.max(0, c.points + delta) };
+        return updatedTarget;
+      })
     );
+    if (updatedTarget) {
+      void updateCustomerPointsInSupabase(updatedTarget);
+    }
   }, []);
 
   const updateMembershipLimits = useCallback(
@@ -852,8 +888,12 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       }
 
       const cost = Math.max(reward.points_required, membershipProgram.limits.min_points_to_redeem);
+      const updatedCustomer: Customer = {
+        ...customer,
+        points: Math.max(0, customer.points - cost),
+      };
       setCustomers((prev) =>
-        prev.map((c) => (c.id === customerId ? { ...c, points: Math.max(0, c.points - cost) } : c))
+        prev.map((c) => (c.id === customerId ? updatedCustomer : c))
       );
       setMembershipProgram((prev) => {
         const next: MembershipProgramConfig = {
@@ -865,18 +905,17 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         persistProgram(next);
         return next;
       });
-      setRedemptionLogs((prev) => [
-        {
-          id: `rdm-${Date.now()}`,
-          customer_id: customer.id,
-          customer_name: customer.name,
-          reward_id: reward.id,
-          label: `Tukar Poin: Gratis ${reward.menu_name}`,
-          points_spent: cost,
-          redeemed_at: new Date().toISOString(),
-        },
-        ...prev,
-      ]);
+      const logEntry: MemberRedemptionLog = {
+        id: `rdm-${Date.now()}`,
+        customer_id: customer.id,
+        customer_name: customer.name,
+        reward_id: reward.id,
+        label: `Tukar Poin: Gratis ${reward.menu_name}`,
+        points_spent: cost,
+        redeemed_at: new Date().toISOString(),
+      };
+      setRedemptionLogs((prev) => [logEntry, ...prev]);
+      void persistMemberRedemptionToSupabase(logEntry, updatedCustomer);
 
       return {
         ok: true,
@@ -904,9 +943,11 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       }
 
       const bonusPts = promo.bonus_points ?? 0;
-      if (bonusPts > 0) {
+      const updatedCustomer: Customer | undefined =
+        bonusPts > 0 ? { ...customer, points: customer.points + bonusPts } : undefined;
+      if (updatedCustomer) {
         setCustomers((prev) =>
-          prev.map((c) => (c.id === customerId ? { ...c, points: c.points + bonusPts } : c))
+          prev.map((c) => (c.id === customerId ? updatedCustomer : c))
         );
       }
 
@@ -921,18 +962,17 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         return next;
       });
 
-      setRedemptionLogs((prev) => [
-        {
-          id: `clm-${Date.now()}`,
-          customer_id: customer.id,
-          customer_name: customer.name,
-          promo_id: promo.id,
-          label: `Klaim Promo: ${promo.title}`,
-          points_spent: 0,
-          redeemed_at: new Date().toISOString(),
-        },
-        ...prev,
-      ]);
+      const logEntry: MemberRedemptionLog = {
+        id: `clm-${Date.now()}`,
+        customer_id: customer.id,
+        customer_name: customer.name,
+        promo_id: promo.id,
+        label: `Klaim Promo: ${promo.title}`,
+        points_spent: 0,
+        redeemed_at: new Date().toISOString(),
+      };
+      setRedemptionLogs((prev) => [logEntry, ...prev]);
+      void persistMemberRedemptionToSupabase(logEntry, updatedCustomer);
 
       return {
         ok: true,
@@ -954,6 +994,15 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         persistVideos(next);
         return next;
       });
+      void upsertStoreVideoToSupabase(created, 0).then((sync) => {
+        if (sync.synced && sync.id) {
+          setStoreVideos((prev) => {
+            const next = prev.map((v) => (v.id === created.id ? { ...v, id: sync.id! } : v));
+            persistVideos(next);
+            return next;
+          });
+        }
+      });
       return created;
     },
     [persistVideos]
@@ -970,23 +1019,35 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         persistVideos(next);
         return next;
       });
+      void deleteStoreVideoFromSupabase(videoId);
     },
     [persistVideos]
   );
 
   const toggleStoreVideo = useCallback(
     (videoId: string) => {
+      let toggled: StoreVideoItem | null = null;
+      let toggledIdx = 0;
       setStoreVideos((prev) => {
-        const next = prev.map((v) => (v.id === videoId ? { ...v, is_active: !v.is_active } : v));
+        const next = prev.map((v, idx) => {
+          if (v.id !== videoId) return v;
+          toggled = { ...v, is_active: !v.is_active };
+          toggledIdx = idx;
+          return toggled;
+        });
         persistVideos(next);
         return next;
       });
+      if (toggled) {
+        void upsertStoreVideoToSupabase(toggled, toggledIdx);
+      }
     },
     [persistVideos]
   );
 
   const moveStoreVideo = useCallback(
     (videoId: string, direction: 'up' | 'down') => {
+      let reordered: StoreVideoItem[] = [];
       setStoreVideos((prev) => {
         const idx = prev.findIndex((v) => v.id === videoId);
         if (idx < 0) return prev;
@@ -994,9 +1055,15 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         if (swapIdx < 0 || swapIdx >= prev.length) return prev;
         const next = [...prev];
         [next[idx], next[swapIdx]] = [next[swapIdx], next[idx]];
+        reordered = next;
         persistVideos(next);
         return next;
       });
+      if (reordered.length > 0) {
+        reordered.forEach((v, idx) => {
+          void upsertStoreVideoToSupabase(v, idx);
+        });
+      }
     },
     [persistVideos]
   );
@@ -1014,7 +1081,12 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       recipes: [],
     };
     setMenus((prev) => [created, ...prev]);
-    await upsertMenuItemToSupabase(created, true, input.enableSupabaseSync ?? false);
+    const sync = await upsertMenuItemToSupabase(created, true, input.enableSupabaseSync ?? false);
+    if (sync.synced && sync.id) {
+      const persisted = { ...created, id: sync.id };
+      setMenus((prev) => prev.map((m) => (m.id === created.id ? persisted : m)));
+      return persisted;
+    }
     return created;
   }, []);
 
@@ -1103,7 +1175,16 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         updated_at: new Date().toISOString(),
       };
       setInventory((prev) => [created, ...prev]);
-      await upsertInventoryItemToSupabase(created, true, input.enableSupabaseSync ?? false);
+      const sync = await upsertInventoryItemToSupabase(
+        created,
+        true,
+        input.enableSupabaseSync ?? false
+      );
+      if (sync.synced && sync.id) {
+        const persisted = { ...created, id: sync.id };
+        setInventory((prev) => prev.map((inv) => (inv.id === created.id ? persisted : inv)));
+        return persisted;
+      }
       return created;
     },
     []
@@ -1149,7 +1230,16 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         })
       );
       if (updatedItem) {
-        await upsertInventoryItemToSupabase(updatedItem, false, patch.enableSupabaseSync ?? false);
+        const sync = await upsertInventoryItemToSupabase(
+          updatedItem,
+          false,
+          patch.enableSupabaseSync ?? false
+        );
+        if (sync.synced && sync.id && sync.id !== itemId) {
+          setInventory((prev) =>
+            prev.map((inv) => (inv.id === itemId ? { ...inv, id: sync.id! } : inv))
+          );
+        }
       }
     },
     []
@@ -1157,12 +1247,13 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
 
   const deleteInventoryItem = useCallback(
     async (itemId: string, enableSupabaseSync = false): Promise<{ affectedMenuCount: number }> => {
+      const targetSku = inventory.find((i) => i.id === itemId)?.sku;
       const result = removeInventoryAndPruneRecipes(inventory, menus, itemId);
       setInventory(result.inventory);
       if (result.affectedMenuCount > 0) {
         setMenus(result.menus);
       }
-      await deleteInventoryItemFromSupabase(itemId, enableSupabaseSync);
+      await deleteInventoryItemFromSupabase(itemId, enableSupabaseSync, targetSku);
       return { affectedMenuCount: result.affectedMenuCount };
     },
     [inventory, menus]
@@ -1236,7 +1327,15 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         enableSupabaseSync: input.enableSupabaseSync ?? false,
       });
 
-      return { purchase: record, syncStatus };
+      const finalPurchase =
+        syncStatus.synced && syncStatus.id ? { ...record, id: syncStatus.id } : record;
+      if (syncStatus.synced && syncStatus.id) {
+        setPurchases((prev) =>
+          prev.map((p) => (p.id === record.id ? { ...p, id: syncStatus.id! } : p))
+        );
+      }
+
+      return { purchase: finalPurchase, syncStatus };
     },
     [inventory]
   );
@@ -1332,6 +1431,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
 
       const finalLog: StockOpnameLog = {
         ...baseLog,
+        id: syncStatus.synced && syncStatus.id ? syncStatus.id : baseLog.id,
         whatsapp_sent: whatsappLog?.status === 'sent',
       };
       setOpnameLogs((prev) => [finalLog, ...prev]);
@@ -1364,7 +1464,16 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       };
       setOpnameSchedules((prev) => [created, ...prev]);
       setWatcherNow(new Date());
-      await upsertOpnameScheduleToSupabase(created, true, input.enableSupabaseSync ?? false);
+      const sync = await upsertOpnameScheduleToSupabase(
+        created,
+        true,
+        input.enableSupabaseSync ?? false
+      );
+      if (sync.synced && sync.id) {
+        const persisted = { ...created, id: sync.id };
+        setOpnameSchedules((prev) => prev.map((s) => (s.id === created.id ? persisted : s)));
+        return persisted;
+      }
       return created;
     },
     []
@@ -1397,27 +1506,60 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     }
   }, []);
 
-  // Hydrate employee directory from Supabase `employees` table when an authenticated session is active
-  useEffect(() => {
+  // Hydrate ALL operational tables + employees from Supabase when either Supabase Auth OR Username session is active
+  const refreshAllFromSupabase = useCallback(async () => {
     if (!supabase) return;
-    let active = true;
+    try {
+      const {
+        data: { session },
+      } = await supabase.auth.getSession();
+      if (!session && !getAppSessionToken()) return;
 
-    async function loadRemoteEmployees() {
-      if (!supabase) return;
-      try {
-        const {
-          data: { session },
-        } = await supabase.auth.getSession();
-        if (!session) return;
+      const [hydrated, empRes] = await Promise.all([
+        hydrateAllTablesFromSupabase(INITIAL_SETTINGS),
+        supabase.from('employees').select('*').order('created_at', { ascending: true }),
+      ]);
 
-        const { data, error } = await supabase
-          .from('employees')
-          .select('*')
-          .order('created_at', { ascending: true });
+      if (hydrated) {
+        if (hydrated.categories) setCategories(hydrated.categories);
+        if (hydrated.inventory) setInventory(hydrated.inventory);
+        if (hydrated.menus) setMenus(hydrated.menus);
+        if (hydrated.customers) setCustomers(hydrated.customers);
+        if (hydrated.orders) setOrders(hydrated.orders);
+        if (hydrated.purchases) setPurchases(hydrated.purchases);
+        if (hydrated.opnameSchedules) setOpnameSchedules(hydrated.opnameSchedules);
+        if (hydrated.opnameLogs) setOpnameLogs(hydrated.opnameLogs);
+        if (hydrated.settings) {
+          setSettings((prev) => {
+            const merged = { ...prev, ...hydrated.settings };
+            try {
+              window.localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(merged));
+            } catch {
+              // Ignore storage quota errors
+            }
+            return merged;
+          });
+        }
+        if (hydrated.membershipProgram) {
+          setMembershipProgram(hydrated.membershipProgram);
+          try {
+            window.localStorage.setItem(
+              MEMBERSHIP_PROGRAM_STORAGE_KEY,
+              JSON.stringify(hydrated.membershipProgram)
+            );
+          } catch {
+            // Ignore storage quota errors
+          }
+        }
+        if (hydrated.redemptionLogs) setRedemptionLogs(hydrated.redemptionLogs);
+        if (hydrated.storeVideos) {
+          setStoreVideos(hydrated.storeVideos);
+          persistVideos(hydrated.storeVideos);
+        }
+      }
 
-        if (!active || error || !data || data.length === 0) return;
-
-        const mapped: UserProfile[] = data.map((row) => {
+      if (!empRes.error && empRes.data && empRes.data.length > 0) {
+        const mapped: UserProfile[] = empRes.data.map((row) => {
           const name = String(row.full_name || 'Karyawan');
           const initials = name
             .split(/\s+/)
@@ -1460,25 +1602,28 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
           persistEmployees(merged);
           return merged;
         });
-      } catch {
-        // Keep local employee state when Supabase `employees` table is not yet created
       }
+    } catch {
+      // Keep local state intact if remote tables are not yet created
     }
+  }, [persistEmployees, persistVideos]);
 
-    void loadRemoteEmployees();
+  useEffect(() => {
+    if (!supabase) return;
+    void refreshAllFromSupabase();
+
     const {
       data: { subscription },
     } = supabase.auth.onAuthStateChange((_event, session) => {
       if (session) {
-        void loadRemoteEmployees();
+        void refreshAllFromSupabase();
       }
     });
 
     return () => {
-      active = false;
       subscription.unsubscribe();
     };
-  }, [persistEmployees]);
+  }, [refreshAllFromSupabase]);
 
   const syncEmployeeToSupabase = useCallback(async (employee: UserProfile) => {
     if (!supabase) return;
@@ -1486,7 +1631,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       const {
         data: { session },
       } = await supabase.auth.getSession();
-      if (!session) return;
+      if (!session && !getAppSessionToken()) return;
 
       await supabase.from('employees').upsert(
         {
@@ -1517,7 +1662,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       const {
         data: { session },
       } = await supabase.auth.getSession();
-      if (!session) return;
+      if (!session && !getAppSessionToken()) return;
       await supabase.from('employees').delete().ilike('email', email.trim());
     } catch {
       // Safe fallback
@@ -1805,6 +1950,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       notifications,
       hasDueOpname,
       lowStockItems,
+      refreshAllFromSupabase,
       refreshOpnameWatcher,
       sendWhatsAppMessage,
       createOrder,
@@ -1867,6 +2013,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       notifications,
       hasDueOpname,
       lowStockItems,
+      refreshAllFromSupabase,
       refreshOpnameWatcher,
       sendWhatsAppMessage,
       createOrder,

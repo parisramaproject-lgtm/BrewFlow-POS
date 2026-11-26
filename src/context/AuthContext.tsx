@@ -8,7 +8,7 @@ import React, {
   useState,
 } from 'react';
 import type { User as SupabaseUser } from '@supabase/supabase-js';
-import { isSupabaseConfigured, supabase } from '../lib/supabase';
+import { isSupabaseConfigured, setAppSessionToken, supabase } from '../lib/supabase';
 import type { PageId, UserProfile, UserRole } from '../types';
 import {
   extractSupabaseUserIdentity,
@@ -82,7 +82,7 @@ const MISSING_SUPABASE_CONFIG_MESSAGE =
   'Koneksi Supabase belum terdeteksi pada build ini. Pastikan variabel VITE_SUPABASE_URL & VITE_SUPABASE_ANON_KEY (atau NEXT_PUBLIC_SUPABASE_URL & NEXT_PUBLIC_SUPABASE_ANON_KEY dari integrasi Supabase-Vercel) sudah terpasang di Vercel Environment Variables, lalu lakukan Redeploy.';
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
-  const { employees, settings, recordUsernameLoginLog } = useStore();
+  const { employees, settings, recordUsernameLoginLog, refreshAllFromSupabase } = useStore();
   const employeesRef = useRef<UserProfile[]>(employees);
   employeesRef.current = employees;
   const settingsRef = useRef(settings);
@@ -269,10 +269,12 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
             })();
           }
 
+          setAppSessionToken(null);
           setAuthError(null);
           setUser(mergeGoogleProfileIntoEmployee(dbEmployee, identity));
           setAuthMode('supabase');
           setAuthProvider(isGoogleLogin ? 'google' : 'email');
+          void refreshAllFromSupabase();
           return;
         }
       } catch (err) {
@@ -285,10 +287,12 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     const localMatch = matchEmployeeByEmail(identity.email, employeesRef.current);
 
     if (localMatch.status === 'matched') {
+      setAppSessionToken(null);
       setAuthError(null);
       setUser(mergeGoogleProfileIntoEmployee(localMatch.employee, identity));
       setAuthMode('supabase');
       setAuthProvider(isGoogleLogin ? 'google' : 'email');
+      void refreshAllFromSupabase();
       return;
     }
 
@@ -320,6 +324,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
     // Email/password Supabase user fallback when profile row is not yet created
     const fallbackName = identity.displayName || normalizedEmail.split('@')[0] || 'Pengguna';
+    setAppSessionToken(null);
     setAuthError(null);
     setUser({
       id: sbUser.id,
@@ -333,7 +338,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     });
     setAuthMode('supabase');
     setAuthProvider('email');
-  }, []);
+    void refreshAllFromSupabase();
+  }, [refreshAllFromSupabase]);
 
   const resolveSupabaseUser = useCallback(
     async (sbUser: SupabaseUser) => {
@@ -527,9 +533,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
             const payload = data as {
               status?: string;
               message?: string;
+              session_token?: string;
               employee?: Record<string, unknown>;
             };
             if (payload.status === 'ok' && payload.employee) {
+              if (typeof payload.session_token === 'string' && payload.session_token.length >= 32) {
+                setAppSessionToken(payload.session_token);
+              }
               const row = payload.employee;
               const fullName = String(row.full_name || cleanUsername).trim();
               const initials = fullName
@@ -602,6 +612,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       setUser(authenticatedUser);
       setAuthMode('supabase');
       setAuthProvider('username');
+      void refreshAllFromSupabase();
 
       // Send Owner login confirmation email alert (default: parisramaproject@gmail.com)
       void sendOwnerUsernameLoginAlert({
@@ -617,14 +628,23 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
       return { error: null };
     },
-    [recordUsernameLoginLog]
+    [recordUsernameLoginLog, refreshAllFromSupabase]
   );
 
   const logout = useCallback(async () => {
     setAuthError(null);
-    if (supabase && authProviderRef.current !== 'username') {
-      await supabase.auth.signOut();
+    if (supabase) {
+      if (authProviderRef.current === 'username') {
+        try {
+          await supabase.rpc('revoke_app_session');
+        } catch {
+          // Non-blocking session cleanup
+        }
+      } else {
+        await supabase.auth.signOut();
+      }
     }
+    setAppSessionToken(null);
     setUser(null);
     setAuthMode(null);
     setAuthProvider(null);

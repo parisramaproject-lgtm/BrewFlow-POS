@@ -1,11 +1,13 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
   AlertTriangle,
   CheckCircle2,
   ClipboardCheck,
   Clock,
+  Database,
   Eye,
   MessageSquare,
+  RefreshCw,
   Send,
   X,
 } from 'lucide-react';
@@ -25,6 +27,7 @@ export function StockOpnamePage() {
     opnameLogs,
     settings,
     submitStockOpname,
+    refreshAllFromSupabase,
   } = useStore();
   const liveSupabaseEnabled = authMode === 'supabase';
 
@@ -45,11 +48,25 @@ export function StockOpnamePage() {
   const [itemReasons, setItemReasons] = useState<Record<string, string>>({});
   const [notes, setNotes] = useState('');
   const [submitting, setSubmitting] = useState(false);
+  const [refreshingDb, setRefreshingDb] = useState(false);
   const [doneBanner, setDoneBanner] = useState<{
     message: string;
     whatsappStatus: string;
+    supabaseSynced: boolean;
+    supabaseDetail: string;
   } | null>(null);
   const [detailModalLog, setDetailModalLog] = useState<StockOpnameLog | null>(null);
+
+  // Keep selected schedule valid when remote UUID schedules hydrate from Supabase
+  useEffect(() => {
+    if (opnameSchedules.length === 0) return;
+    const exists = opnameSchedules.some((s) => s.id === selectedScheduleId);
+    if (!exists) {
+      setSelectedScheduleId(
+        dueOpnameSchedules[0]?.id ?? activeSchedules[0]?.id ?? opnameSchedules[0]?.id ?? ''
+      );
+    }
+  }, [opnameSchedules, activeSchedules, dueOpnameSchedules, selectedScheduleId]);
 
   const selectedSchedule =
     activeSchedules.find((s) => s.id === selectedScheduleId) ??
@@ -120,10 +137,26 @@ export function StockOpnamePage() {
         : `Pengiriman WhatsApp ke Owner gagal: ${result.whatsappLog.error ?? 'Periksa konfigurasi gateway.'}`
       : 'Nomor WhatsApp Owner belum dikonfigurasi.';
 
+    const supabaseSynced = result.syncStatus.synced;
+    const supabaseDetail =
+      result.syncStatus.mode === 'supabase'
+        ? supabaseSynced
+          ? 'Berhasil tersinkron ke database Supabase (inventory_items, stock_opname_logs, stock_opname_details & jadwal).'
+          : `Sinkronisasi ke Supabase GAGAL: ${result.syncStatus.error ?? 'Periksa tabel & policy RLS di supabase/schema_full_brewflow.sql.'}`
+        : 'Tersimpan di sesi lokal (koneksi Supabase belum aktif).';
+
     setDoneBanner({
       message: `Stock opname "${selectedSchedule.title}" tersimpan (${result.log.total_items_checked} item diperiksa, ${result.log.discrepancy_count} selisih). Stok inventori otomatis disesuaikan.`,
       whatsappStatus: waStatusText,
+      supabaseSynced,
+      supabaseDetail,
     });
+  };
+
+  const handleRefreshFromSupabase = async () => {
+    setRefreshingDb(true);
+    await refreshAllFromSupabase();
+    setRefreshingDb(false);
   };
 
   return (
@@ -137,26 +170,61 @@ export function StockOpnamePage() {
           </p>
         </div>
 
-        {dueOpnameSchedules.length > 0 && (
-          <div className="inline-flex items-center gap-2 rounded-full border border-[#EF4444]/30 bg-[#FEF2F2] px-4 py-1.5 text-xs font-semibold text-[#EF4444]">
-            <AlertTriangle className="h-3.5 w-3.5" />
-            <span>{dueOpnameSchedules.length} jadwal jatuh tempo hari ini</span>
-          </div>
-        )}
+        <div className="flex flex-wrap items-center gap-2.5">
+          {liveSupabaseEnabled && (
+            <button
+              type="button"
+              onClick={handleRefreshFromSupabase}
+              disabled={refreshingDb}
+              className="inline-flex items-center gap-1.5 rounded-full border border-[#E5E7EB] bg-[#FFFFFF] px-3.5 py-1.5 text-xs font-semibold text-[#1A2E26] transition-colors hover:border-[#109A58] hover:text-[#109A58] disabled:opacity-50"
+            >
+              <RefreshCw className={`h-3.5 w-3.5 ${refreshingDb ? 'animate-spin' : ''}`} />
+              <span>{refreshingDb ? 'Memuat...' : 'Sinkronkan Database'}</span>
+            </button>
+          )}
+          {dueOpnameSchedules.length > 0 && (
+            <div className="inline-flex items-center gap-2 rounded-full border border-[#EF4444]/30 bg-[#FEF2F2] px-4 py-1.5 text-xs font-semibold text-[#EF4444]">
+              <AlertTriangle className="h-3.5 w-3.5" />
+              <span>{dueOpnameSchedules.length} jadwal jatuh tempo hari ini</span>
+            </div>
+          )}
+        </div>
       </div>
 
       {doneBanner && (
         <div
           role="status"
           data-testid="opname-submit-status"
-          className="rounded-2xl border border-[#109A58]/30 bg-[#E6F5EE] px-4 py-3.5 text-xs text-[#1A2E26]"
+          className={`rounded-2xl border px-4 py-3.5 text-xs text-[#1A2E26] ${
+            doneBanner.supabaseSynced
+              ? 'border-[#109A58]/30 bg-[#E6F5EE]'
+              : 'border-[#EF4444]/40 bg-[#FEF2F2]'
+          }`}
         >
           <div className="flex items-start gap-2.5">
-            <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-[#109A58]" />
+            {doneBanner.supabaseSynced ? (
+              <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-[#109A58]" />
+            ) : (
+              <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-[#EF4444]" />
+            )}
             <div className="space-y-1">
-              <p className="font-semibold text-[#109A58]">{doneBanner.message}</p>
+              <p
+                className={`font-semibold ${
+                  doneBanner.supabaseSynced ? 'text-[#109A58]' : 'text-[#DC2626]'
+                }`}
+              >
+                {doneBanner.message}
+              </p>
+              <p
+                className={`flex items-center gap-1.5 text-[11px] font-medium ${
+                  doneBanner.supabaseSynced ? 'text-[#109A58]' : 'text-[#DC2626]'
+                }`}
+              >
+                <Database className="h-3.5 w-3.5 shrink-0" />
+                <span>{doneBanner.supabaseDetail}</span>
+              </p>
               <p className="flex items-center gap-1.5 text-[11px] text-[#1A2E26]/80">
-                <MessageSquare className="h-3.5 w-3.5 text-[#109A58]" />
+                <MessageSquare className="h-3.5 w-3.5 shrink-0 text-[#109A58]" />
                 <span>{doneBanner.whatsappStatus}</span>
               </p>
             </div>

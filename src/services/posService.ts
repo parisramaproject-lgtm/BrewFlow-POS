@@ -88,6 +88,12 @@ export interface SupabaseSyncStatus {
   mode: 'supabase' | 'local';
   synced: boolean;
   error?: string;
+  id?: string;
+}
+
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+function isUuid(value: string | null | undefined): boolean {
+  return typeof value === 'string' && UUID_REGEX.test(value.trim());
 }
 
 /**
@@ -117,8 +123,10 @@ export async function persistOrderToSupabase(params: {
       .from('orders')
       .insert({
         order_number: order.order_number,
-        cashier_id: order.cashier_id,
-        customer_id: order.customer_id,
+        cashier_id: isUuid(order.cashier_id) ? order.cashier_id : null,
+        cashier_name: order.cashier_name,
+        customer_id: isUuid(order.customer_id) ? order.customer_id : null,
+        customer_name: order.customer_name,
         order_type: order.order_type,
         table_number: order.table_number,
         subtotal: order.subtotal,
@@ -143,7 +151,8 @@ export async function persistOrderToSupabase(params: {
     // 2. Insert line items into `order_items`
     const itemRows = order.items.map((item) => ({
       order_id: insertedOrder.id,
-      menu_id: item.menu_id,
+      menu_id: isUuid(item.menu_id) ? item.menu_id : null,
+      menu_name: item.menu_name,
       quantity: item.quantity,
       unit_price: item.unit_price,
       subtotal: item.subtotal,
@@ -162,8 +171,8 @@ export async function persistOrderToSupabase(params: {
     // 3. Post-payment updates when completed
     if (order.status === 'completed') {
       // 3a. Update loyalty points & tier on `customers`
-      if (updatedCustomer) {
-        await supabase
+      if (updatedCustomer && isUuid(updatedCustomer.id)) {
+        const { error: custErr } = await supabase
           .from('customers')
           .update({
             points: updatedCustomer.points,
@@ -171,23 +180,44 @@ export async function persistOrderToSupabase(params: {
             tier: updatedCustomer.tier,
           })
           .eq('id', updatedCustomer.id);
+
+        if (custErr) {
+          return {
+            mode: 'supabase',
+            synced: false,
+            id: String(insertedOrder.id),
+            error: `Transaksi tersimpan, tetapi gagal memperbarui poin member: ${custErr.message}`,
+          };
+        }
       }
 
       // 3b. Deduct `inventory_items` stock based on `menu_recipes`
-      await Promise.all(
-        deductions.map((entry) =>
-          supabase!
-            .from('inventory_items')
-            .update({
-              current_stock: entry.remainingStock,
-              updated_at: new Date().toISOString(),
-            })
-            .eq('id', entry.inventoryItemId)
-        )
+      const stockUpdateResults = await Promise.all(
+        deductions
+          .filter((entry) => isUuid(entry.inventoryItemId))
+          .map((entry) =>
+            supabase!
+              .from('inventory_items')
+              .update({
+                current_stock: entry.remainingStock,
+                updated_at: new Date().toISOString(),
+              })
+              .eq('id', entry.inventoryItemId)
+          )
       );
+
+      const failedStock = stockUpdateResults.find((res) => res.error);
+      if (failedStock?.error) {
+        return {
+          mode: 'supabase',
+          synced: false,
+          id: String(insertedOrder.id),
+          error: `Transaksi tersimpan, tetapi pengurangan stok gagal: ${failedStock.error.message}`,
+        };
+      }
     }
 
-    return { mode: 'supabase', synced: true };
+    return { mode: 'supabase', synced: true, id: String(insertedOrder.id) };
   } catch (err) {
     return {
       mode: 'supabase',
@@ -209,20 +239,24 @@ export async function persistCustomerToSupabase(
   }
 
   try {
-    const { error } = await supabase.from('customers').insert({
-      name: customer.name,
-      phone_number: customer.phone_number,
-      email: customer.email || null,
-      points: customer.points,
-      tier: customer.tier,
-      total_spent: customer.total_spent,
-    });
+    const { data, error } = await supabase
+      .from('customers')
+      .insert({
+        name: customer.name,
+        phone_number: customer.phone_number,
+        email: customer.email || null,
+        points: customer.points,
+        tier: customer.tier,
+        total_spent: customer.total_spent,
+      })
+      .select('id')
+      .single();
 
     if (error) {
       return { mode: 'supabase', synced: false, error: error.message };
     }
 
-    return { mode: 'supabase', synced: true };
+    return { mode: 'supabase', synced: true, id: data?.id ? String(data.id) : undefined };
   } catch (err) {
     return {
       mode: 'supabase',

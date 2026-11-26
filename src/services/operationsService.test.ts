@@ -3,8 +3,11 @@ import assert from 'node:assert/strict';
 import {
   applyPurchaseToInventory,
   getInventoryStockStatus,
+  persistStockOpnameToSupabase,
   removeInventoryAndPruneRecipes,
 } from './operationsService';
+import { isUuid } from './supabaseHydrationService';
+import { getAppSessionToken, setAppSessionToken } from '../lib/supabase';
 import { calculateMenuHpp } from '../utils/posCalculations';
 import type { InventoryItem, MenuItem, PurchaseItemRecord } from '../types';
 
@@ -129,4 +132,53 @@ test('removeInventoryAndPruneRecipes deletes item and cleans recipe references',
     result.menus[0].recipes.some((r) => r.inventory_item_id === 'inv-milk'),
     false
   );
+});
+
+test('isUuid accurately distinguishes Supabase UUIDs from local seed IDs', () => {
+  assert.equal(isUuid('550e8400-e29b-41d4-a716-446655440000'), true);
+  assert.equal(isUuid('inv-1'), false);
+  assert.equal(isUuid('sch-1'), false);
+  assert.equal(isUuid(''), false);
+  assert.equal(isUuid(null), false);
+});
+
+test('appSessionToken accepts 64-hex tokens in memory, rejects malformed ones, and clears safely', () => {
+  const validHex64 = 'a'.repeat(64);
+  setAppSessionToken(`  ${validHex64}  `);
+  assert.equal(getAppSessionToken(), validHex64);
+  setAppSessionToken('too-short');
+  assert.equal(getAppSessionToken(), null);
+  setAppSessionToken(null);
+  assert.equal(getAppSessionToken(), null);
+});
+
+test('persistStockOpnameToSupabase returns local synced status when Supabase sync disabled', async () => {
+  const status = await persistStockOpnameToSupabase({
+    log: {
+      id: 'oplog-1',
+      schedule_id: 'sch-1',
+      schedule_title: 'Opname Harian',
+      performed_by_name: 'Budi',
+      notes: 'Tes',
+      total_items_checked: 1,
+      discrepancy_count: 1,
+      completed_at: '2026-11-26T10:00:00Z',
+    },
+    performedById: 'emp-1',
+    details: [
+      {
+        inventory_item_id: 'inv-coffee',
+        item_name: 'Biji Kopi House Blend',
+        sku: 'RM-001',
+        unit: 'gr',
+        system_stock: 200,
+        actual_stock: 180,
+        variance: -20,
+        unit_price: 250,
+      },
+    ],
+    enableSupabaseSync: false,
+  });
+  assert.equal(status.mode, 'local');
+  assert.equal(status.synced, true);
 });
