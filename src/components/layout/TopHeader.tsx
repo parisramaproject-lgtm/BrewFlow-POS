@@ -182,7 +182,7 @@ export function TopHeader({
               <span className="inline-block rounded bg-[#E6F5EE] px-1.5 py-0.5 text-[10px] font-semibold leading-none text-[#109A58]">
                 {roleLabel}
               </span>
-              {authMode === 'google' && (
+              {authMode === 'supabase_google' && (
                 <span className="text-[10px] font-medium leading-none text-[#6B7280]">
                   Google
                 </span>

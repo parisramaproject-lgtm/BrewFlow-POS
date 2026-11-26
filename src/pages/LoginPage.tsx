@@ -79,8 +79,14 @@ function GoogleLogoSvg() {
 }
 
 export function LoginPage() {
-  const { signInWithGoogle, signInWithEmail, demoLogin, isSupabaseReady, isGoogleReady } =
-    useAuth();
+  const {
+    signInWithGoogle,
+    signInWithEmail,
+    demoLogin,
+    isSupabaseReady,
+    authError,
+    clearAuthError,
+  } = useAuth();
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
@@ -88,19 +94,23 @@ export function LoginPage() {
   const [googleSubmitting, setGoogleSubmitting] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
+  const displayedError = errorMessage || authError;
+
   const handleGoogleSignIn = async () => {
     setErrorMessage(null);
+    clearAuthError();
     setGoogleSubmitting(true);
     const result = await signInWithGoogle();
     if (result.error) {
       setErrorMessage(result.error);
+      setGoogleSubmitting(false);
     }
-    setGoogleSubmitting(false);
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setErrorMessage(null);
+    clearAuthError();
     setSubmitting(true);
     const result = await signInWithEmail(email, password);
     if (result.error) {
@@ -112,7 +122,7 @@ export function LoginPage() {
   return (
     <div className="flex min-h-screen w-full items-center justify-center bg-[#F4F6F5] px-4 py-10 text-[#1A2E26]">
       <div className="grid w-full max-w-4xl grid-cols-1 overflow-hidden rounded-2xl border border-[#E5E7EB] bg-[#FFFFFF] md:grid-cols-12">
-        {/* Left Column: Google OAuth + Supabase Auth Login Form */}
+        {/* Left Column: Supabase Google OAuth + Email/Password Login Form */}
         <div className="flex flex-col justify-between p-8 md:col-span-7 md:p-10">
           <div>
             {/* Brand Header */}
@@ -131,34 +141,36 @@ export function LoginPage() {
                 Masuk ke Akun Anda
               </h2>
               <p className="mt-1.5 text-sm text-[#6B7280]">
-                Masuk dengan akun Google yang emailnya terdaftar di data karyawan, atau gunakan
-                login email &amp; kata sandi.
+                Masuk dengan Google OAuth (Supabase Auth) menggunakan email yang terdaftar di data
+                karyawan, atau pakai email &amp; kata sandi.
               </p>
             </div>
 
-            {errorMessage && (
+            {displayedError && (
               <div
                 role="alert"
                 data-testid="login-error-alert"
                 className="mt-5 flex items-start gap-2.5 rounded-xl border border-[#FECACA] bg-[#FEF2F2] px-4 py-3 text-sm text-[#B91C1C]"
               >
                 <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
-                <span>{errorMessage}</span>
+                <span>{displayedError}</span>
               </div>
             )}
 
-            {/* Official Google Sign-In Section */}
+            {/* Google OAuth via Supabase Auth */}
             <div className="mt-6">
               <button
                 type="button"
                 onClick={handleGoogleSignIn}
-                disabled={googleSubmitting || submitting || !isGoogleReady}
+                disabled={googleSubmitting || submitting}
                 aria-label="Masuk dengan Google"
                 className="flex h-11 w-full items-center justify-center gap-3 rounded-full border border-[#DADCE0] bg-[#FFFFFF] px-5 text-sm font-semibold text-[#1F1F1F] shadow-xs transition-colors hover:bg-[#F8FAFC] hover:border-[#C7CCD1] active:bg-[#F1F5F9] disabled:opacity-60 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#109A58]"
               >
                 <GoogleLogoSvg />
                 <span>
-                  {googleSubmitting ? 'Memverifikasi akun Google...' : 'Masuk dengan Google'}
+                  {googleSubmitting
+                    ? 'Mengarahkan ke Google OAuth...'
+                    : 'Masuk dengan Google (Supabase)'}
                 </span>
               </button>
               <p className="mt-2 text-center text-[11px] leading-relaxed text-[#6B7280]">
@@ -235,7 +247,7 @@ export function LoginPage() {
                 disabled={submitting || googleSubmitting}
                 className="mt-2 flex h-11 w-full items-center justify-center gap-2 rounded-full bg-[#109A58] px-6 text-sm font-semibold text-white transition-colors hover:bg-[#0D8A4E] disabled:opacity-60 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#109A58]"
               >
-                <span>{submitting ? 'Memverifikasi...' : 'Masuk dengan Supabase Auth'}</span>
+                <span>{submitting ? 'Memverifikasi...' : 'Masuk dengan Email & Sandi'}</span>
                 <ArrowRight className="h-4 w-4" />
               </button>
             </form>
@@ -243,12 +255,14 @@ export function LoginPage() {
 
           <div className="mt-7 border-t border-[#E5E7EB] pt-4 text-xs text-[#6B7280]">
             {isSupabaseReady ? (
-              <span>Google OAuth aktif · Terhubung ke proyek Supabase aktif.</span>
+              <span>Terhubung ke Supabase Auth (Google OAuth &amp; Email aktif).</span>
             ) : (
               <span>
-                Google OAuth aktif · Mode Demo lokal untuk data toko (isi{' '}
-                <code className="font-mono text-[#1A2E26]">VITE_SUPABASE_URL</code> di{' '}
-                <code className="font-mono text-[#1A2E26]">.env</code> untuk sinkronisasi Supabase).
+                Mode Demo aktif · Isi{' '}
+                <code className="font-mono text-[#1A2E26]">VITE_SUPABASE_URL</code> &amp;{' '}
+                <code className="font-mono text-[#1A2E26]">VITE_SUPABASE_ANON_KEY</code> di{' '}
+                <code className="font-mono text-[#1A2E26]">.env</code> / Vercel untuk mengaktifkan
+                Supabase Google OAuth.
               </span>
             )}
           </div>

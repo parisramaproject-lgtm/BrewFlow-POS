@@ -85,6 +85,7 @@ import {
   buildPosReceiptPayload,
   dispatchWhatsAppNotification,
 } from '../services/whatsappService';
+import { supabase } from '../lib/supabase';
 
 export type { StoreSettings };
 
@@ -1367,6 +1368,49 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     }
   }, []);
 
+  const syncEmployeeToSupabase = useCallback(async (employee: UserProfile) => {
+    if (!supabase) return;
+    try {
+      const {
+        data: { session },
+      } = await supabase.auth.getSession();
+      if (!session) return;
+
+      await supabase.from('profiles').upsert(
+        {
+          full_name: employee.full_name,
+          email: employee.email.trim().toLowerCase(),
+          role: employee.role,
+          phone_number: employee.phone_number,
+          is_active: employee.is_active,
+          shift: employee.shift ?? null,
+          position: employee.position ?? null,
+          employment_status: employee.employment_status ?? null,
+          monthly_salary: employee.monthly_salary ?? 0,
+          join_date: employee.join_date || null,
+          emergency_contact: employee.emergency_contact ?? '',
+          notes: employee.notes ?? '',
+        },
+        { onConflict: 'email' }
+      );
+    } catch {
+      // Safe fallback when Supabase profiles schema/RLS is not yet initialized
+    }
+  }, []);
+
+  const deleteEmployeeFromSupabase = useCallback(async (email: string) => {
+    if (!supabase || !email.trim()) return;
+    try {
+      const {
+        data: { session },
+      } = await supabase.auth.getSession();
+      if (!session) return;
+      await supabase.from('profiles').delete().ilike('email', email.trim());
+    } catch {
+      // Safe fallback
+    }
+  }, []);
+
   const addEmployee = useCallback(
     (input: {
       full_name: string;
@@ -1410,12 +1454,14 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         persistEmployees(next);
         return next;
       });
+      void syncEmployeeToSupabase(created);
     },
-    [persistEmployees]
+    [persistEmployees, syncEmployeeToSupabase]
   );
 
   const updateEmployee = useCallback(
     (employeeId: string, patch: Partial<UserProfile>) => {
+      let updatedRecord: UserProfile | null = null;
       setEmployees((prev) => {
         const next = prev.map((emp) => {
           if (emp.id !== employeeId) return emp;
@@ -1430,7 +1476,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
                   .slice(0, 2)
                   .toUpperCase() || emp.avatar_initials
               : emp.avatar_initials;
-          return {
+          updatedRecord = {
             ...emp,
             ...patch,
             full_name: nextName,
@@ -1446,34 +1492,52 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
                 : emp.emergency_contact,
             notes: patch.notes !== undefined ? patch.notes.trim() : emp.notes,
           };
+          return updatedRecord;
         });
         persistEmployees(next);
         return next;
       });
+      if (updatedRecord) {
+        void syncEmployeeToSupabase(updatedRecord);
+      }
     },
-    [persistEmployees]
+    [persistEmployees, syncEmployeeToSupabase]
   );
 
   const deleteEmployee = useCallback(
     (employeeId: string) => {
+      let removedEmail = '';
       setEmployees((prev) => {
+        const target = prev.find((emp) => emp.id === employeeId);
+        removedEmail = target?.email ?? '';
         const next = prev.filter((emp) => emp.id !== employeeId);
         persistEmployees(next);
         return next;
       });
+      if (removedEmail) {
+        void deleteEmployeeFromSupabase(removedEmail);
+      }
     },
-    [persistEmployees]
+    [persistEmployees, deleteEmployeeFromSupabase]
   );
 
   const updateEmployeeRole = useCallback(
     (employeeId: string, role: UserRole) => {
+      let updatedRecord: UserProfile | null = null;
       setEmployees((prev) => {
-        const next = prev.map((emp) => (emp.id === employeeId ? { ...emp, role } : emp));
+        const next = prev.map((emp) => {
+          if (emp.id !== employeeId) return emp;
+          updatedRecord = { ...emp, role };
+          return updatedRecord;
+        });
         persistEmployees(next);
         return next;
       });
+      if (updatedRecord) {
+        void syncEmployeeToSupabase(updatedRecord);
+      }
     },
-    [persistEmployees]
+    [persistEmployees, syncEmployeeToSupabase]
   );
 
   const updateSettings = useCallback(

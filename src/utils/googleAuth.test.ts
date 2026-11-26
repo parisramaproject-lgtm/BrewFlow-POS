@@ -2,7 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import type { UserProfile } from '../types';
 import {
-  getGoogleAuthErrorMessage,
+  extractSupabaseUserIdentity,
+  getSupabaseGoogleAuthErrorMessage,
   isSafeAvatarUrl,
   matchEmployeeByEmail,
   mergeGoogleProfileIntoEmployee,
@@ -36,6 +37,25 @@ test('normalizeEmail trims whitespace and lowercases email', () => {
   assert.equal(normalizeEmail('  Owner.BrewFlow@Gmail.COM  '), 'owner.brewflow@gmail.com');
   assert.equal(normalizeEmail(null), '');
   assert.equal(normalizeEmail(undefined), '');
+});
+
+test('extractSupabaseUserIdentity extracts Google metadata from Supabase user', () => {
+  const identity = extractSupabaseUserIdentity({
+    id: 'sb-uid-1',
+    email: 'owner.brewflow@gmail.com',
+    user_metadata: {
+      full_name: 'Budi Google',
+      avatar_url: 'https://lh3.googleusercontent.com/a/avatar.png',
+    },
+    app_metadata: {
+      provider: 'google',
+    },
+  });
+  assert.equal(identity.uid, 'sb-uid-1');
+  assert.equal(identity.email, 'owner.brewflow@gmail.com');
+  assert.equal(identity.displayName, 'Budi Google');
+  assert.equal(identity.photoURL, 'https://lh3.googleusercontent.com/a/avatar.png');
+  assert.equal(identity.provider, 'google');
 });
 
 test('matchEmployeeByEmail matches active employee case-insensitively', () => {
@@ -80,7 +100,7 @@ test('isSafeAvatarUrl accepts https URLs and rejects unsafe schemes', () => {
 
 test('mergeGoogleProfileIntoEmployee preserves authoritative employee role and attaches safe photo', () => {
   const merged = mergeGoogleProfileIntoEmployee(SAMPLE_EMPLOYEES[0], {
-    uid: 'google-uid-123',
+    uid: 'sb-uid-123',
     email: 'owner.brewflow@gmail.com',
     displayName: 'Google Display Name',
     photoURL: 'https://lh3.googleusercontent.com/a/photo',
@@ -90,15 +110,21 @@ test('mergeGoogleProfileIntoEmployee preserves authoritative employee role and a
   assert.equal(merged.photo_url, 'https://lh3.googleusercontent.com/a/photo');
 
   const mergedUnsafe = mergeGoogleProfileIntoEmployee(SAMPLE_EMPLOYEES[0], {
-    uid: 'google-uid-123',
+    uid: 'sb-uid-123',
     email: 'owner.brewflow@gmail.com',
     photoURL: 'javascript:alert(1)',
   });
   assert.equal(mergedUnsafe.photo_url, undefined);
 });
 
-test('getGoogleAuthErrorMessage maps Firebase auth popup codes cleanly', () => {
-  assert.match(getGoogleAuthErrorMessage({ code: 'auth/popup-closed-by-user' }), /ditutup/i);
-  assert.match(getGoogleAuthErrorMessage({ code: 'auth/popup-blocked' }), /diblokir/i);
-  assert.match(getGoogleAuthErrorMessage(new Error('Custom error')), /Custom error/);
+test('getSupabaseGoogleAuthErrorMessage maps Supabase OAuth errors cleanly', () => {
+  assert.match(
+    getSupabaseGoogleAuthErrorMessage({ message: 'Unsupported provider: provider is not enabled' }),
+    /Providers/i
+  );
+  assert.match(getSupabaseGoogleAuthErrorMessage('access_denied'), /dibatalkan|ditolak/i);
+  assert.match(
+    getSupabaseGoogleAuthErrorMessage(new Error('redirect_uri_mismatch')),
+    /Redirect URLs/i
+  );
 });

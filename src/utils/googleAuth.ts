@@ -5,6 +5,7 @@ export interface GoogleAccountIdentity {
   email: string | null;
   displayName?: string | null;
   photoURL?: string | null;
+  provider?: string | null;
 }
 
 export type EmployeeEmailMatchResult =
@@ -45,6 +46,40 @@ export function isSafeAvatarUrl(url: string | null | undefined): boolean {
   } catch {
     return false;
   }
+}
+
+/**
+ * Extracts normalized Google / OAuth identity metadata from a Supabase Auth user object.
+ */
+export function extractSupabaseUserIdentity(sbUser: {
+  id: string;
+  email?: string | null;
+  user_metadata?: Record<string, unknown> | null;
+  app_metadata?: Record<string, unknown> | null;
+}): GoogleAccountIdentity {
+  const meta = sbUser.user_metadata ?? {};
+  const appMeta = sbUser.app_metadata ?? {};
+  const displayName =
+    typeof meta.full_name === 'string'
+      ? meta.full_name
+      : typeof meta.name === 'string'
+        ? meta.name
+        : null;
+  const photoURL =
+    typeof meta.avatar_url === 'string'
+      ? meta.avatar_url
+      : typeof meta.picture === 'string'
+        ? meta.picture
+        : null;
+  const provider = typeof appMeta.provider === 'string' ? appMeta.provider : null;
+
+  return {
+    uid: sbUser.id,
+    email: sbUser.email ?? null,
+    displayName,
+    photoURL,
+    provider,
+  };
 }
 
 /**
@@ -108,32 +143,35 @@ export function mergeGoogleProfileIntoEmployee(
 }
 
 /**
- * Converts Firebase Auth / Google OAuth popup error codes into clear Indonesian messages.
+ * Converts Supabase Google OAuth errors into clear Indonesian user guidance.
  */
-export function getGoogleAuthErrorMessage(error: unknown): string {
-  const code =
-    typeof error === 'object' && error !== null && 'code' in error
-      ? String((error as { code?: unknown }).code ?? '')
-      : '';
+export function getSupabaseGoogleAuthErrorMessage(error: unknown): string {
+  const rawMessage =
+    typeof error === 'string'
+      ? error
+      : error instanceof Error
+        ? error.message
+        : typeof error === 'object' && error !== null && 'message' in error
+          ? String((error as { message?: unknown }).message ?? '')
+          : '';
 
-  switch (code) {
-    case 'auth/popup-closed-by-user':
-      return 'Jendela login Google ditutup sebelum proses selesai. Silakan coba lagi.';
-    case 'auth/cancelled-popup-request':
-      return 'Permintaan login Google sebelumnya dibatalkan. Silakan klik kembali tombol Masuk dengan Google.';
-    case 'auth/popup-blocked':
-      return 'Popup login Google diblokir oleh browser. Izinkan popup untuk situs ini lalu coba lagi.';
-    case 'auth/network-request-failed':
-      return 'Koneksi internet terganggu saat menghubungi layanan Google. Periksa jaringan Anda lalu coba lagi.';
-    case 'auth/unauthorized-domain': {
-      const host = typeof window !== 'undefined' ? window.location.hostname : 'domain Anda';
-      return `Domain "${host}" belum terdaftar di Firebase Console → Authentication → Settings → Authorized domains. Tambahkan domain Vercel Anda terlebih dahulu.`;
-    }
-    default: {
-      if (error instanceof Error && error.message) {
-        return error.message;
-      }
-      return 'Gagal masuk menggunakan akun Google. Silakan coba beberapa saat lagi.';
-    }
+  const lower = rawMessage.toLowerCase();
+
+  if (lower.includes('provider is not enabled') || lower.includes('unsupported provider')) {
+    return 'Provider Google belum diaktifkan di Supabase Dashboard → Authentication → Providers → Google.';
   }
+  if (lower.includes('access_denied')) {
+    return 'Login Google dibatalkan atau izin akses akun Google ditolak.';
+  }
+  if (lower.includes('redirect') && (lower.includes('mismatch') || lower.includes('not allowed'))) {
+    const origin = typeof window !== 'undefined' ? window.location.origin : 'URL Vercel Anda';
+    return `URL "${origin}" belum terdaftar di Supabase Dashboard → Authentication → URL Configuration → Redirect URLs.`;
+  }
+  if (lower.includes('network') || lower.includes('fetch')) {
+    return 'Koneksi ke server Supabase terganggu. Periksa jaringan internet Anda lalu coba lagi.';
+  }
+  if (rawMessage.trim()) {
+    return rawMessage;
+  }
+  return 'Gagal masuk menggunakan Google melalui Supabase Auth. Silakan coba lagi.';
 }
