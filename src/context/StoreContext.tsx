@@ -91,6 +91,7 @@ export type { StoreSettings };
 const SETTINGS_STORAGE_KEY = 'brewflow_store_settings_v1';
 const MEMBERSHIP_PROGRAM_STORAGE_KEY = 'brewflow_membership_program_v1';
 const STORE_VIDEOS_STORAGE_KEY = 'brewflow_tv_videos_v1';
+const EMPLOYEES_STORAGE_KEY = 'brewflow_employees_v1';
 
 interface CreateOrderInput {
   items: CartItem[];
@@ -363,6 +364,18 @@ function loadInitialStoreVideos(): StoreVideoItem[] {
   }
 }
 
+function loadInitialEmployees(): UserProfile[] {
+  try {
+    const raw = window.localStorage.getItem(EMPLOYEES_STORAGE_KEY);
+    if (!raw) return INITIAL_EMPLOYEES;
+    const parsed = JSON.parse(raw) as UserProfile[];
+    if (!Array.isArray(parsed) || parsed.length === 0) return INITIAL_EMPLOYEES;
+    return parsed;
+  } catch {
+    return INITIAL_EMPLOYEES;
+  }
+}
+
 export function StoreProvider({ children }: { children: React.ReactNode }) {
   const [categories] = useState<Category[]>(INITIAL_CATEGORIES);
   const [menus, setMenus] = useState<MenuItem[]>(INITIAL_MENUS);
@@ -379,7 +392,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     useState<StockOpnameSchedule[]>(INITIAL_OPNAME_SCHEDULES);
   const [opnameLogs, setOpnameLogs] = useState<StockOpnameLog[]>(INITIAL_OPNAME_LOGS);
   const [whatsappLogs, setWhatsappLogs] = useState<WhatsAppLogEntry[]>([]);
-  const [employees, setEmployees] = useState<UserProfile[]>(INITIAL_EMPLOYEES);
+  const [employees, setEmployees] = useState<UserProfile[]>(loadInitialEmployees);
   const [settings, setSettings] = useState<StoreSettings>(loadInitialSettings);
   const [watcherNow, setWatcherNow] = useState<Date>(() => new Date());
 
@@ -1346,6 +1359,14 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     []
   );
 
+  const persistEmployees = useCallback((next: UserProfile[]) => {
+    try {
+      window.localStorage.setItem(EMPLOYEES_STORAGE_KEY, JSON.stringify(next));
+    } catch {
+      // Ignore storage quota errors
+    }
+  }, []);
+
   const addEmployee = useCallback(
     (input: {
       full_name: string;
@@ -1384,53 +1405,76 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         notes: input.notes?.trim() || '',
         created_at: new Date().toISOString(),
       };
-      setEmployees((prev) => [...prev, created]);
+      setEmployees((prev) => {
+        const next = [...prev, created];
+        persistEmployees(next);
+        return next;
+      });
     },
-    []
+    [persistEmployees]
   );
 
-  const updateEmployee = useCallback((employeeId: string, patch: Partial<UserProfile>) => {
-    setEmployees((prev) =>
-      prev.map((emp) => {
-        if (emp.id !== employeeId) return emp;
-        const nextName =
-          patch.full_name !== undefined ? patch.full_name.trim() || emp.full_name : emp.full_name;
-        const nextInitials =
-          patch.full_name !== undefined
-            ? nextName
-                .split(/\s+/)
-                .map((p) => p[0])
-                .join('')
-                .slice(0, 2)
-                .toUpperCase() || emp.avatar_initials
-            : emp.avatar_initials;
-        return {
-          ...emp,
-          ...patch,
-          full_name: nextName,
-          avatar_initials: nextInitials,
-          email: patch.email !== undefined ? patch.email.trim() : emp.email,
-          phone_number:
-            patch.phone_number !== undefined ? patch.phone_number.trim() : emp.phone_number,
-          shift: patch.shift !== undefined ? patch.shift.trim() : emp.shift,
-          position: patch.position !== undefined ? patch.position.trim() : emp.position,
-          emergency_contact:
-            patch.emergency_contact !== undefined
-              ? patch.emergency_contact.trim()
-              : emp.emergency_contact,
-          notes: patch.notes !== undefined ? patch.notes.trim() : emp.notes,
-        };
-      })
-    );
-  }, []);
+  const updateEmployee = useCallback(
+    (employeeId: string, patch: Partial<UserProfile>) => {
+      setEmployees((prev) => {
+        const next = prev.map((emp) => {
+          if (emp.id !== employeeId) return emp;
+          const nextName =
+            patch.full_name !== undefined ? patch.full_name.trim() || emp.full_name : emp.full_name;
+          const nextInitials =
+            patch.full_name !== undefined
+              ? nextName
+                  .split(/\s+/)
+                  .map((p) => p[0])
+                  .join('')
+                  .slice(0, 2)
+                  .toUpperCase() || emp.avatar_initials
+              : emp.avatar_initials;
+          return {
+            ...emp,
+            ...patch,
+            full_name: nextName,
+            avatar_initials: nextInitials,
+            email: patch.email !== undefined ? patch.email.trim() : emp.email,
+            phone_number:
+              patch.phone_number !== undefined ? patch.phone_number.trim() : emp.phone_number,
+            shift: patch.shift !== undefined ? patch.shift.trim() : emp.shift,
+            position: patch.position !== undefined ? patch.position.trim() : emp.position,
+            emergency_contact:
+              patch.emergency_contact !== undefined
+                ? patch.emergency_contact.trim()
+                : emp.emergency_contact,
+            notes: patch.notes !== undefined ? patch.notes.trim() : emp.notes,
+          };
+        });
+        persistEmployees(next);
+        return next;
+      });
+    },
+    [persistEmployees]
+  );
 
-  const deleteEmployee = useCallback((employeeId: string) => {
-    setEmployees((prev) => prev.filter((emp) => emp.id !== employeeId));
-  }, []);
+  const deleteEmployee = useCallback(
+    (employeeId: string) => {
+      setEmployees((prev) => {
+        const next = prev.filter((emp) => emp.id !== employeeId);
+        persistEmployees(next);
+        return next;
+      });
+    },
+    [persistEmployees]
+  );
 
-  const updateEmployeeRole = useCallback((employeeId: string, role: UserRole) => {
-    setEmployees((prev) => prev.map((emp) => (emp.id === employeeId ? { ...emp, role } : emp)));
-  }, []);
+  const updateEmployeeRole = useCallback(
+    (employeeId: string, role: UserRole) => {
+      setEmployees((prev) => {
+        const next = prev.map((emp) => (emp.id === employeeId ? { ...emp, role } : emp));
+        persistEmployees(next);
+        return next;
+      });
+    },
+    [persistEmployees]
+  );
 
   const updateSettings = useCallback(
     async (patch: Partial<StoreSettings>, enableSupabaseSync = false): Promise<void> => {

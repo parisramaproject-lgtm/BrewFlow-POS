@@ -45,6 +45,7 @@ export interface UserProfile {
   role: UserRole;
   phone_number: string;
   avatar_initials: string;
+  photo_url?: string;
   is_active: boolean;
   shift?: string;
   position?: string;

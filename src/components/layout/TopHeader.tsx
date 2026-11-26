@@ -18,10 +18,15 @@ export function TopHeader({
   onOpenMobileNav,
   onNavigate,
 }: TopHeaderProps) {
-  const { user } = useAuth();
+  const { user, authMode } = useAuth();
   const { notifications } = useStore();
   const [notifOpen, setNotifOpen] = useState(false);
+  const [avatarLoadError, setAvatarLoadError] = useState(false);
   const dropdownRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    setAvatarLoadError(false);
+  }, [user?.photo_url]);
 
   useEffect(() => {
     function handleOutsideClick(event: MouseEvent) {
@@ -156,9 +161,19 @@ export function TopHeader({
 
         {/* User Profile */}
         <div className="flex items-center gap-2.5 rounded-full border border-[#E5E7EB] bg-[#FFFFFF] p-1 sm:py-1 sm:pl-1.5 sm:pr-3.5">
-          <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-[#109A58] text-xs font-bold text-white">
-            {user.avatar_initials}
-          </div>
+          {user.photo_url && !avatarLoadError ? (
+            <img
+              src={user.photo_url}
+              alt={user.full_name}
+              referrerPolicy="no-referrer"
+              onError={() => setAvatarLoadError(true)}
+              className="h-8 w-8 shrink-0 rounded-full border border-[#E5E7EB] object-cover"
+            />
+          ) : (
+            <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-[#109A58] text-xs font-bold text-white">
+              {user.avatar_initials}
+            </div>
+          )}
           <div className="hidden text-left sm:block">
             <p className="text-xs font-semibold leading-tight text-[#1A2E26] whitespace-nowrap">
               Halo, {user.full_name}
@@ -167,6 +182,11 @@ export function TopHeader({
               <span className="inline-block rounded bg-[#E6F5EE] px-1.5 py-0.5 text-[10px] font-semibold leading-none text-[#109A58]">
                 {roleLabel}
               </span>
+              {authMode === 'google' && (
+                <span className="text-[10px] font-medium leading-none text-[#6B7280]">
+                  Google
+                </span>
+              )}
             </div>
           </div>
         </div>

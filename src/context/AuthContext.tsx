@@ -1,7 +1,27 @@
-import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
+import React, {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
+import type { User as FirebaseUser } from 'firebase/auth';
+import {
+  initGoogleAuthListener,
+  isGoogleOAuthConfigured,
+  signInWithGooglePopup,
+  signOutGoogle,
+} from '../lib/googleAuth';
 import { isSupabaseConfigured, supabase } from '../lib/supabase';
 import { DEMO_USERS } from '../data/seedData';
 import type { PageId, UserProfile, UserRole } from '../types';
+import {
+  getGoogleAuthErrorMessage,
+  matchEmployeeByEmail,
+  mergeGoogleProfileIntoEmployee,
+} from '../utils/googleAuth';
 import {
   canAccessPage as checkCanAccessPage,
   canManageEmployees,
@@ -9,14 +29,17 @@ import {
   canManageOpnameSchedules,
   canViewHPP,
 } from '../utils/rbac';
+import { useStore } from './StoreContext';
 
 const DEMO_STORAGE_KEY = 'brewflow_demo_role_v1';
 
 interface AuthContextValue {
   user: UserProfile | null;
-  authMode: 'supabase' | 'demo' | null;
+  authMode: 'google' | 'supabase' | 'demo' | null;
   isLoading: boolean;
   isSupabaseReady: boolean;
+  isGoogleReady: boolean;
+  signInWithGoogle: () => Promise<{ error: string | null }>;
   signInWithEmail: (email: string, password: string) => Promise<{ error: string | null }>;
   demoLogin: (role: UserRole) => void;
   logout: () => Promise<void>;
@@ -39,8 +62,14 @@ function parseDemoRole(raw: string | null): UserRole | null {
 }
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
+  const { employees } = useStore();
+  const employeesRef = useRef<UserProfile[]>(employees);
+  employeesRef.current = employees;
+
   const [user, setUser] = useState<UserProfile | null>(null);
-  const [authMode, setAuthMode] = useState<'supabase' | 'demo' | null>(null);
+  const [authMode, setAuthMode] = useState<'google' | 'supabase' | 'demo' | null>(null);
+  const authModeRef = useRef<'google' | 'supabase' | 'demo' | null>(null);
+  authModeRef.current = authMode;
   const [isLoading, setIsLoading] = useState<boolean>(true);
 
   const loadSupabaseProfile = useCallback(async (userId: string, email: string) => {
@@ -87,8 +116,87 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     setAuthMode('supabase');
   }, []);
 
+  /**
+   * Matches an authenticated Google user's email against the active employee directory
+   * (and optionally Supabase `profiles` when connected).
+   */
+  const resolveEmployeeForGoogleUser = useCallback(
+    async (
+      fbUser: FirebaseUser
+    ): Promise<{ ok: true; profile: UserProfile } | { ok: false; error: string }> => {
+      const localMatch = matchEmployeeByEmail(fbUser.email, employeesRef.current);
+
+      if (localMatch.status === 'matched') {
+        return {
+          ok: true,
+          profile: mergeGoogleProfileIntoEmployee(localMatch.employee, {
+            uid: fbUser.uid,
+            email: fbUser.email,
+            displayName: fbUser.displayName,
+            photoURL: fbUser.photoURL,
+          }),
+        };
+      }
+
+      if (localMatch.status === 'inactive' || localMatch.status === 'invalid_email') {
+        return { ok: false, error: localMatch.message };
+      }
+
+      // Secondary check against live Supabase `profiles` table if configured
+      if (supabase && localMatch.status === 'not_found') {
+        try {
+          const { data } = await supabase
+            .from('profiles')
+            .select('id, full_name, email, role, phone_number, is_active, created_at')
+            .ilike('email', localMatch.email)
+            .maybeSingle();
+
+          if (data) {
+            if (data.is_active === false) {
+              return {
+                ok: false,
+                error: `Akun karyawan "${data.full_name}" (${localMatch.email}) sedang berstatus Nonaktif. Hubungi Owner untuk mengaktifkan kembali akses.`,
+              };
+            }
+            const initials = String(data.full_name || localMatch.email)
+              .split(/\s+/)
+              .map((part) => part[0])
+              .join('')
+              .slice(0, 2)
+              .toUpperCase();
+            const dbEmployee: UserProfile = {
+              id: data.id,
+              full_name: data.full_name || fbUser.displayName || localMatch.email.split('@')[0],
+              email: data.email || localMatch.email,
+              role: (data.role as UserRole) || 'cashier',
+              phone_number: data.phone_number || '-',
+              avatar_initials: initials || 'BF',
+              is_active: true,
+              created_at: data.created_at || new Date().toISOString(),
+            };
+            return {
+              ok: true,
+              profile: mergeGoogleProfileIntoEmployee(dbEmployee, {
+                uid: fbUser.uid,
+                email: fbUser.email,
+                displayName: fbUser.displayName,
+                photoURL: fbUser.photoURL,
+              }),
+            };
+          }
+        } catch {
+          // Fall through to standard unregistered-email rejection
+        }
+      }
+
+      return { ok: false, error: localMatch.message };
+    },
+    []
+  );
+
   useEffect(() => {
     let active = true;
+    let unsubscribeGoogle: (() => void) | undefined;
 
     async function bootstrapSession() {
       // Support ?autostart=1 (& optional ?role=owner|manager|cashier) for instant preview
@@ -115,7 +223,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         return;
       }
 
-      // Otherwise check live Supabase session if configured
+      // Check live Supabase session if configured
+      let restoredSupabase = false;
       if (supabase) {
         try {
           const {
@@ -123,13 +232,48 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           } = await supabase.auth.getSession();
           if (session?.user && active) {
             await loadSupabaseProfile(session.user.id, session.user.email ?? '');
+            restoredSupabase = true;
           }
         } catch {
           // Safe fallback to logged-out state
         }
       }
 
-      if (active) {
+      if (restoredSupabase) {
+        if (active) setIsLoading(false);
+        return;
+      }
+
+      // Otherwise subscribe to Firebase Google OAuth session state
+      if (isGoogleOAuthConfigured) {
+        unsubscribeGoogle = initGoogleAuthListener(
+          async (fbUser) => {
+            if (!active || window.localStorage.getItem(DEMO_STORAGE_KEY)) return;
+            const resolved = await resolveEmployeeForGoogleUser(fbUser);
+            if (!active) return;
+            if (resolved.ok) {
+              setUser(resolved.profile);
+              setAuthMode('google');
+            } else {
+              await signOutGoogle();
+              setUser(null);
+              setAuthMode(null);
+            }
+            setIsLoading(false);
+          },
+          () => {
+            if (!active) return;
+            if (
+              !window.localStorage.getItem(DEMO_STORAGE_KEY) &&
+              authModeRef.current === 'google'
+            ) {
+              setUser(null);
+              setAuthMode(null);
+            }
+            setIsLoading(false);
+          }
+        );
+      } else if (active) {
         setIsLoading(false);
       }
     }
@@ -139,7 +283,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     const subscription = supabase?.auth.onAuthStateChange((_event, session) => {
       if (session?.user) {
         loadSupabaseProfile(session.user.id, session.user.email ?? '');
-      } else if (!window.localStorage.getItem(DEMO_STORAGE_KEY)) {
+      } else if (
+        !window.localStorage.getItem(DEMO_STORAGE_KEY) &&
+        authModeRef.current === 'supabase'
+      ) {
         setUser(null);
         setAuthMode(null);
       }
@@ -147,9 +294,52 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
     return () => {
       active = false;
+      unsubscribeGoogle?.();
       subscription?.data.subscription.unsubscribe();
     };
-  }, [loadSupabaseProfile]);
+  }, [loadSupabaseProfile, resolveEmployeeForGoogleUser]);
+
+  // Keep active Google-authenticated user synced with live employee edits (role/name/status)
+  useEffect(() => {
+    if (authMode !== 'google' || !user) return;
+    const matched = employees.find((emp) => emp.id === user.id);
+    if (!matched || !matched.is_active) {
+      void signOutGoogle();
+      setUser(null);
+      setAuthMode(null);
+      return;
+    }
+    if (
+      matched.full_name !== user.full_name ||
+      matched.role !== user.role ||
+      matched.email !== user.email ||
+      matched.avatar_initials !== user.avatar_initials
+    ) {
+      setUser((prev) => (prev ? { ...matched, photo_url: prev.photo_url } : matched));
+    }
+  }, [employees, authMode, user]);
+
+  const signInWithGoogle = useCallback(async (): Promise<{ error: string | null }> => {
+    try {
+      const result = await signInWithGooglePopup();
+      const resolved = await resolveEmployeeForGoogleUser(result.user);
+
+      if (!resolved.ok) {
+        // Immediately revoke unauthorized Google session and clear in-memory token
+        await signOutGoogle();
+        setUser(null);
+        setAuthMode(null);
+        return { error: resolved.error };
+      }
+
+      window.localStorage.removeItem(DEMO_STORAGE_KEY);
+      setUser(resolved.profile);
+      setAuthMode('google');
+      return { error: null };
+    } catch (error) {
+      return { error: getGoogleAuthErrorMessage(error) };
+    }
+  }, [resolveEmployeeForGoogleUser]);
 
   const signInWithEmail = useCallback(
     async (email: string, password: string): Promise<{ error: string | null }> => {
@@ -161,7 +351,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       if (!supabase) {
         return {
           error:
-            'Koneksi Supabase belum dikonfigurasi (VITE_SUPABASE_URL & VITE_SUPABASE_ANON_KEY). Gunakan tombol Demo Quick Login di bawah untuk mencoba aplikasi.',
+            'Koneksi Supabase belum dikonfigurasi (VITE_SUPABASE_URL & VITE_SUPABASE_ANON_KEY). Gunakan tombol Masuk dengan Google atau Demo Quick Login di samping.',
         };
       }
 
@@ -191,6 +381,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   const logout = useCallback(async () => {
     window.localStorage.removeItem(DEMO_STORAGE_KEY);
+    if (authMode === 'google') {
+      await signOutGoogle();
+    }
     if (supabase && authMode === 'supabase') {
       await supabase.auth.signOut();
     }
@@ -220,6 +413,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       authMode,
       isLoading,
       isSupabaseReady: isSupabaseConfigured,
+      isGoogleReady: isGoogleOAuthConfigured,
+      signInWithGoogle,
       signInWithEmail,
       demoLogin,
       logout,
@@ -231,7 +426,17 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       canSeeOpnameScheduleSettings: user ? canManageOpnameSchedules(user.role) : false,
       canManageInventory: user ? canManageInventory(user.role) : false,
     }),
-    [user, authMode, isLoading, signInWithEmail, demoLogin, logout, hasRole, canAccess]
+    [
+      user,
+      authMode,
+      isLoading,
+      signInWithGoogle,
+      signInWithEmail,
+      demoLogin,
+      logout,
+      hasRole,
+      canAccess,
+    ]
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;

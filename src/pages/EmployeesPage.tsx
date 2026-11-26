@@ -16,6 +16,7 @@ import { useAuth } from '../context/AuthContext';
 import { useStore } from '../context/StoreContext';
 import type { EmploymentStatus, PageId, UserProfile, UserRole } from '../types';
 import { formatRupiah } from '../utils/format';
+import { normalizeEmail } from '../utils/googleAuth';
 import { getRoleDisplayLabel } from '../utils/rbac';
 
 interface EmployeesPageProps {
@@ -84,10 +85,18 @@ export function EmployeesPage({ onNavigate }: EmployeesPageProps) {
     const totalMonthlyPayroll = employees
       .filter((e) => e.is_active)
       .reduce((sum, e) => sum + (e.monthly_salary ?? 0), 0);
+    const activeOwnerCount = employees.filter((e) => e.role === 'owner' && e.is_active).length;
     const ownerCount = employees.filter((e) => e.role === 'owner').length;
     const managerCount = employees.filter((e) => e.role === 'manager').length;
     const cashierCount = employees.filter((e) => e.role === 'cashier').length;
-    return { activeCount, totalMonthlyPayroll, ownerCount, managerCount, cashierCount };
+    return {
+      activeCount,
+      totalMonthlyPayroll,
+      activeOwnerCount,
+      ownerCount,
+      managerCount,
+      cashierCount,
+    };
   }, [employees]);
 
   if (!canSeeEmployees) {
@@ -109,6 +118,13 @@ export function EmployeesPage({ onNavigate }: EmployeesPageProps) {
     e.preventDefault();
     if (!fullName.trim() || !email.trim()) {
       setErrorMsg('Nama lengkap dan email karyawan wajib diisi.');
+      return;
+    }
+    const normalizedEmail = normalizeEmail(email);
+    if (employees.some((emp) => normalizeEmail(emp.email) === normalizedEmail)) {
+      setErrorMsg(
+        `Email "${normalizedEmail}" sudah digunakan oleh karyawan lain. Setiap karyawan harus memiliki email unik untuk Login Google.`
+      );
       return;
     }
     addEmployee({
@@ -134,7 +150,7 @@ export function EmployeesPage({ onNavigate }: EmployeesPageProps) {
     setEmergencyContact('');
     setErrorMsg(null);
     setShowAddForm(false);
-    notify('Akun karyawan baru berhasil ditambahkan.');
+    notify('Akun karyawan baru berhasil ditambahkan & siap untuk Login Google.');
   };
 
   const startInlineEdit = (emp: UserProfile, field: EditableCellField) => {
@@ -154,9 +170,21 @@ export function EmployeesPage({ onNavigate }: EmployeesPageProps) {
       cancelInlineEdit();
       return;
     }
-    if (field === 'email' && !trimmed) {
-      cancelInlineEdit();
-      return;
+    if (field === 'email') {
+      if (!trimmed) {
+        cancelInlineEdit();
+        return;
+      }
+      const normalizedNext = normalizeEmail(trimmed);
+      if (
+        employees.some(
+          (other) => other.id !== emp.id && normalizeEmail(other.email) === normalizedNext
+        )
+      ) {
+        cancelInlineEdit();
+        notify(`Email "${normalizedNext}" sudah terdaftar pada karyawan lain.`);
+        return;
+      }
     }
 
     if (field === 'monthly_salary') {
@@ -321,7 +349,7 @@ export function EmployeesPage({ onNavigate }: EmployeesPageProps) {
               type="email"
               value={email}
               onChange={(e) => setEmail(e.target.value)}
-              placeholder="Email kerja *"
+              placeholder="Email Google karyawan * (untuk Login Google)"
               className="h-10 rounded-xl border border-[#E5E7EB] px-3 text-xs text-[#1A2E26] focus:border-[#109A58] focus:outline-none"
             />
             <input
@@ -408,20 +436,21 @@ export function EmployeesPage({ onNavigate }: EmployeesPageProps) {
         ))}
       </datalist>
 
-      {/* Double-Click Inline Edit Hint */}
+      {/* Double-Click Inline Edit & Google OAuth Hint */}
       <div className="flex items-center gap-2 rounded-xl border border-[#109A58]/20 bg-[#E6F5EE]/60 px-4 py-2.5 text-xs text-[#1A2E26]">
         <Info className="h-4 w-4 shrink-0 text-[#109A58]" />
         <span>
-          <strong>Edit Cepat:</strong> Klik dua kali (<em>double-click</em>) pada kolom Nama,
-          Jabatan, Email, No. WhatsApp, Shift, Status, atau Gaji untuk mengedit langsung. Tekan{' '}
+          <strong>Edit Cepat &amp; Login Google:</strong> Klik dua kali (<em>double-click</em>)
+          kolom Nama, Jabatan, Email, No. WA, Shift, Status, atau Gaji untuk edit langsung (
           <kbd className="rounded bg-white px-1.5 py-0.5 font-mono text-[10px] font-semibold">
             Enter
           </kbd>{' '}
-          untuk simpan atau{' '}
+          simpan,{' '}
           <kbd className="rounded bg-white px-1.5 py-0.5 font-mono text-[10px] font-semibold">
             Esc
           </kbd>{' '}
-          untuk batal.
+          batal). Alamat <strong>Email</strong> &amp; status <strong>Aktif</strong> di tabel ini
+          langsung dipakai untuk verifikasi <strong>Login Google OAuth</strong>.
         </span>
       </div>
 
@@ -432,7 +461,7 @@ export function EmployeesPage({ onNavigate }: EmployeesPageProps) {
             <thead>
               <tr className="border-b border-[#E5E7EB] bg-[#F4F6F5]/60 text-xs font-semibold text-[#6B7280]">
                 <th className="px-3.5 py-3">Karyawan &amp; Jabatan</th>
-                <th className="px-3 py-3">Kontak (Email &amp; WA)</th>
+                <th className="px-3 py-3">Email Login Google &amp; WA</th>
                 <th className="px-3 py-3">Shift Kerja</th>
                 <th className="px-3 py-3">Status &amp; Tgl Gabung</th>
                 <th className="px-3 py-3 text-right">Gaji / Bulan</th>
@@ -628,6 +657,16 @@ export function EmployeesPage({ onNavigate }: EmployeesPageProps) {
                             <button
                               type="button"
                               onClick={() => {
+                                if (
+                                  emp.role === 'owner' &&
+                                  emp.is_active &&
+                                  stats.activeOwnerCount <= 1
+                                ) {
+                                  notify(
+                                    'Minimal harus ada 1 akun Owner aktif agar akses manajemen tetap terjaga.'
+                                  );
+                                  return;
+                                }
                                 updateEmployee(emp.id, { is_active: !emp.is_active });
                                 notify(
                                   `Status akun "${emp.full_name}" diubah menjadi ${!emp.is_active ? 'Aktif' : 'Nonaktif'}.`

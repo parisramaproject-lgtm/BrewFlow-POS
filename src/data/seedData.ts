@@ -14,7 +14,7 @@ export const DEMO_USERS: Record<'owner' | 'manager' | 'cashier', UserProfile> = 
   owner: {
     id: 'demo-owner-01',
     full_name: 'Budi Santoso',
-    email: 'owner@brewflow.id',
+    email: 'generalaffairhrandelajaya@gmail.com',
     role: 'owner',
     phone_number: '0812-8800-1101',
     avatar_initials: 'BS',

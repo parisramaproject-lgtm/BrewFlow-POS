@@ -97,10 +97,10 @@ function AuthenticatedApp() {
 
 export default function App() {
   return (
-    <AuthProvider>
-      <StoreProvider>
+    <StoreProvider>
+      <AuthProvider>
         <AuthenticatedApp />
-      </StoreProvider>
-    </AuthProvider>
+      </AuthProvider>
+    </StoreProvider>
   );
 }

@@ -1,0 +1,8 @@
+.aistudio
+.playwright-cli
+.env
+.env.local
+.env.*.local
+supabase/functions
+src/**/*.test.ts
+coverage
