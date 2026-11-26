@@ -57,7 +57,6 @@ export function AppLayout({
         mobileOpen={mobileNavOpen}
         onCloseMobile={() => setMobileNavOpen(false)}
         desktopHidden={desktopSidebarHidden}
-        onHideDesktop={toggleDesktopSidebar}
       />
 
       {/* Columns 2 (+ 3 on POS): Header + Main Content Viewport */}

@@ -179,6 +179,18 @@ export function PaymentModal({
                 </span>
               </div>
 
+              {completedResult.order.voucher_code &&
+                (completedResult.order.voucher_discount_amount ?? 0) > 0 && (
+                  <div className="flex items-center justify-between">
+                    <span className="text-[#6B7280]">
+                      Voucher ({completedResult.order.voucher_code})
+                    </span>
+                    <span className="font-semibold text-[#109A58] tabular-nums">
+                      -{formatRupiah(completedResult.order.voucher_discount_amount ?? 0)}
+                    </span>
+                  </div>
+                )}
+
               {completedResult.pointsEarned > 0 && completedResult.order.customer_name && (
                 <div className="flex items-center justify-between">
                   <span className="text-[#6B7280]">
@@ -307,12 +319,30 @@ export function PaymentModal({
                 <span>Subtotal ({summary.itemCount} item)</span>
                 <span className="tabular-nums">{formatRupiah(summary.subtotal)}</span>
               </div>
-              {summary.discountAmount > 0 && (
+              {summary.memberDiscountAmount > 0 && (
                 <div className="mt-1 flex items-center justify-between text-xs font-medium text-[#EF4444]">
                   <span>Diskon Member {customer?.tier}</span>
-                  <span className="tabular-nums">-{formatRupiah(summary.discountAmount)}</span>
+                  <span className="tabular-nums">
+                    -{formatRupiah(summary.memberDiscountAmount)}
+                  </span>
                 </div>
               )}
+              {summary.voucherDiscountAmount > 0 && (
+                <div className="mt-1 flex items-center justify-between text-xs font-medium text-[#109A58]">
+                  <span>Voucher {summary.voucherCode || 'Promo'}</span>
+                  <span className="tabular-nums">
+                    -{formatRupiah(summary.voucherDiscountAmount)}
+                  </span>
+                </div>
+              )}
+              {summary.memberDiscountAmount === 0 &&
+                summary.voucherDiscountAmount === 0 &&
+                summary.discountAmount > 0 && (
+                  <div className="mt-1 flex items-center justify-between text-xs font-medium text-[#EF4444]">
+                    <span>Diskon</span>
+                    <span className="tabular-nums">-{formatRupiah(summary.discountAmount)}</span>
+                  </div>
+                )}
               <div className="mt-1 flex items-center justify-between text-xs text-[#6B7280]">
                 <span>
                   {settings.taxEnabled

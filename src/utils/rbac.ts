@@ -26,6 +26,11 @@ export const NAV_ITEMS: NavItemConfig[] = [
     allowedRoles: ['owner', 'manager', 'cashier'],
   },
   {
+    id: 'vouchers',
+    label: 'Voucher & Rush Hour',
+    allowedRoles: ['owner', 'manager', 'cashier'],
+  },
+  {
     id: 'menu-hpp',
     label: 'Menu & HPP',
     nonOwnerLabel: 'Menu',
@@ -108,6 +113,10 @@ export function canViewFinancialProfit(role: UserRole): boolean {
 }
 
 export function canManageInventory(role: UserRole): boolean {
+  return role === 'owner' || role === 'manager';
+}
+
+export function canManageVouchers(role: UserRole): boolean {
   return role === 'owner' || role === 'manager';
 }
 

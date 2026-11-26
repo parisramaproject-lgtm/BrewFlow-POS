@@ -1,6 +1,7 @@
 import React, { useMemo, useState } from 'react';
 import {
   CheckCircle2,
+  Clock,
   Coffee,
   Cookie,
   CupSoda,
@@ -10,6 +11,7 @@ import {
   Pencil,
   Plus,
   ShoppingBag,
+  Ticket,
   Trash2,
   UserPlus,
   Utensils,
@@ -20,9 +22,24 @@ import { MemberModal } from '../components/pos/MemberModal';
 import { PaymentModal } from '../components/pos/PaymentModal';
 import { useAuth } from '../context/AuthContext';
 import { useStore, type CreateOrderResult } from '../context/StoreContext';
-import type { CartItem, Category, Customer, MenuItem, OrderRecord, OrderType, PaymentMethod } from '../types';
+import type {
+  CartItem,
+  Category,
+  Customer,
+  MenuItem,
+  OrderRecord,
+  OrderType,
+  PaymentMethod,
+  VoucherRecord,
+} from '../types';
 import { formatRupiah } from '../utils/format';
 import { calculateCartSummary } from '../utils/posCalculations';
+import {
+  evaluateVoucherOnCart,
+  formatVoucherSchemeSummary,
+  getVoucherAvailability,
+  normalizeVoucherCode,
+} from '../utils/vouchers';
 
 interface POSPageProps {
   searchQuery: string;
@@ -49,6 +66,7 @@ export function POSPage({ searchQuery }: POSPageProps) {
     menus,
     customers,
     orders,
+    vouchers,
     settings,
     membershipProgram,
     createOrder,
@@ -64,6 +82,12 @@ export function POSPage({ searchQuery }: POSPageProps) {
   const [orderNote, setOrderNote] = useState<string>('');
   const [activeDraftId, setActiveDraftId] = useState<string | null>(null);
   const [editingNoteMenuId, setEditingNoteMenuId] = useState<string | null>(null);
+
+  // Rush Hour voucher redemption state
+  const [voucherInput, setVoucherInput] = useState<string>('');
+  const [appliedVoucherId, setAppliedVoucherId] = useState<string | null>(null);
+  const [voucherError, setVoucherError] = useState<string | null>(null);
+  const [voucherPickerOpen, setVoucherPickerOpen] = useState<boolean>(false);
 
   // Modals & UI feedback
   const [paymentModalOpen, setPaymentModalOpen] = useState(false);
@@ -89,6 +113,21 @@ export function POSPage({ searchQuery }: POSPageProps) {
     [orders]
   );
 
+  const activeVouchersNow = useMemo(() => {
+    const now = new Date();
+    return vouchers.filter((voucher) => getVoucherAvailability(voucher, now).active);
+  }, [vouchers]);
+
+  const appliedVoucher = useMemo(
+    () => (appliedVoucherId ? vouchers.find((v) => v.id === appliedVoucherId) ?? null : null),
+    [appliedVoucherId, vouchers]
+  );
+
+  const appliedVoucherEval = useMemo(() => {
+    if (!appliedVoucher) return null;
+    return evaluateVoucherOnCart(appliedVoucher, cart, new Date(), menus);
+  }, [appliedVoucher, cart, menus]);
+
   const summary = useMemo(
     () =>
       calculateCartSummary(cart, selectedCustomer?.tier ?? null, {
@@ -96,6 +135,9 @@ export function POSPage({ searchQuery }: POSPageProps) {
         taxPercent: settings.taxPercent,
         tierRules: membershipProgram.tiers,
         pointEarningStepRupiah: membershipProgram.limits.point_earning_step_rupiah,
+        voucherDiscountAmount: appliedVoucherEval?.valid ? appliedVoucherEval.discountAmount : 0,
+        voucherCode: appliedVoucherEval?.valid ? appliedVoucher?.code ?? null : null,
+        voucherStackableWithMember: appliedVoucher?.stackable_with_member_discount ?? true,
       }),
     [
       cart,
@@ -104,6 +146,8 @@ export function POSPage({ searchQuery }: POSPageProps) {
       settings.taxPercent,
       membershipProgram.tiers,
       membershipProgram.limits.point_earning_step_rupiah,
+      appliedVoucherEval,
+      appliedVoucher,
     ]
   );
 
@@ -150,6 +194,42 @@ export function POSPage({ searchQuery }: POSPageProps) {
     setOrderNote('');
     setActiveDraftId(null);
     setEditingNoteMenuId(null);
+    setVoucherInput('');
+    setAppliedVoucherId(null);
+    setVoucherError(null);
+    setVoucherPickerOpen(false);
+  };
+
+  const applyVoucherRecord = (voucher: VoucherRecord) => {
+    const evaluation = evaluateVoucherOnCart(voucher, cart, new Date(), menus);
+    if (!evaluation.valid) {
+      setVoucherError(evaluation.error || 'Voucher belum memenuhi syarat pesanan saat ini.');
+      return;
+    }
+    setAppliedVoucherId(voucher.id);
+    setVoucherInput(voucher.code);
+    setVoucherError(null);
+    setVoucherPickerOpen(false);
+  };
+
+  const handleApplyVoucherCode = () => {
+    const normalized = normalizeVoucherCode(voucherInput);
+    if (!normalized) {
+      setVoucherError('Masukkan kode voucher terlebih dahulu.');
+      return;
+    }
+    const found = vouchers.find((v) => normalizeVoucherCode(v.code) === normalized);
+    if (!found) {
+      setVoucherError(`Kode voucher "${normalized}" tidak ditemukan.`);
+      return;
+    }
+    applyVoucherRecord(found);
+  };
+
+  const handleRemoveVoucher = () => {
+    setAppliedVoucherId(null);
+    setVoucherInput('');
+    setVoucherError(null);
   };
 
   const handleSaveDraft = async () => {
@@ -159,6 +239,7 @@ export function POSPage({ searchQuery }: POSPageProps) {
       orderType,
       tableNumber,
       customer: selectedCustomer,
+      appliedVoucher: appliedVoucherEval?.valid ? appliedVoucher : null,
       paymentMethod: 'cash',
       notes: orderNote,
       status: 'draft',
@@ -191,6 +272,17 @@ export function POSPage({ searchQuery }: POSPageProps) {
     setSelectedCustomer(
       draft.customer_id ? customers.find((c) => c.id === draft.customer_id) ?? null : null
     );
+    if (draft.voucher_code) {
+      const matchedVoucher = vouchers.find(
+        (v) => normalizeVoucherCode(v.code) === normalizeVoucherCode(draft.voucher_code ?? '')
+      );
+      setAppliedVoucherId(matchedVoucher?.id ?? null);
+      setVoucherInput(matchedVoucher?.code ?? '');
+    } else {
+      setAppliedVoucherId(null);
+      setVoucherInput('');
+    }
+    setVoucherError(null);
     setActiveDraftId(draft.id);
     setDraftsDrawerOpen(false);
   };
@@ -204,6 +296,7 @@ export function POSPage({ searchQuery }: POSPageProps) {
       orderType,
       tableNumber,
       customer: selectedCustomer,
+      appliedVoucher: appliedVoucherEval?.valid ? appliedVoucher : null,
       paymentMethod,
       notes: orderNote,
       status: 'completed',
@@ -581,9 +674,9 @@ export function POSPage({ searchQuery }: POSPageProps) {
           )}
         </div>
 
-        {/* Order Note + Payment Summary + Bottom Actions */}
+        {/* Order Note + Voucher Rush Hour + Payment Summary + Bottom Actions */}
         <div className="border-t border-[#E5E7EB] px-4 py-3.5 xl:px-5 xl:py-4">
-          <div className="relative mb-4">
+          <div className="relative mb-3">
             <Pencil
               className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-[#6B7280]"
               aria-hidden="true"
@@ -598,6 +691,135 @@ export function POSPage({ searchQuery }: POSPageProps) {
             />
           </div>
 
+          {/* Rush Hour Voucher Control */}
+          <div className="mb-3.5">
+            {appliedVoucher ? (
+              <div
+                className={`rounded-xl border px-3 py-2 text-xs ${
+                  appliedVoucherEval?.valid
+                    ? 'border-[#109A58]/35 bg-[#E6F5EE] text-[#1A2E26]'
+                    : 'border-[#F59E0B]/40 bg-[#FFFBEB] text-[#92400E]'
+                }`}
+              >
+                <div className="flex items-start justify-between gap-2">
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-1.5">
+                      <Ticket className="h-3.5 w-3.5 shrink-0 text-[#109A58]" />
+                      <span className="truncate font-mono font-bold text-[#1A2E26]">
+                        {appliedVoucher.code}
+                      </span>
+                    </div>
+                    <p className="mt-0.5 text-[11px] leading-snug text-[#6B7280]">
+                      {appliedVoucherEval?.valid
+                        ? appliedVoucherEval.summaryLabel
+                        : appliedVoucherEval?.error || 'Belum memenuhi syarat promo'}
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={handleRemoveVoucher}
+                    aria-label="Lepas kode voucher"
+                    className="shrink-0 text-[11px] font-semibold text-[#EF4444] hover:underline"
+                  >
+                    Lepas
+                  </button>
+                </div>
+                {appliedVoucherEval?.valid &&
+                  selectedCustomer &&
+                  !appliedVoucher.stackable_with_member_discount && (
+                    <p className="mt-1 text-[10px] text-[#6B7280]">
+                      Voucher ini tidak digabung dengan diskon member.
+                    </p>
+                  )}
+              </div>
+            ) : (
+              <div>
+                <div className="flex items-center gap-1.5">
+                  <div className="relative flex-1">
+                    <Ticket
+                      className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-[#6B7280]"
+                      aria-hidden="true"
+                    />
+                    <input
+                      type="text"
+                      value={voucherInput}
+                      onChange={(e) => {
+                        setVoucherInput(e.target.value.toUpperCase());
+                        if (voucherError) setVoucherError(null);
+                      }}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') {
+                          e.preventDefault();
+                          handleApplyVoucherCode();
+                        }
+                      }}
+                      placeholder="Kode voucher / Rush Hour"
+                      aria-label="Kode voucher promo"
+                      className="h-9 w-full rounded-xl border border-[#E5E7EB] bg-[#F4F6F5] pl-8 pr-2.5 font-mono text-xs text-[#1A2E26] uppercase placeholder:font-sans placeholder:normal-case placeholder:text-[#6B7280] focus:border-[#109A58] focus:bg-[#FFFFFF] focus:outline-none"
+                    />
+                  </div>
+                  <button
+                    type="button"
+                    onClick={handleApplyVoucherCode}
+                    className="h-9 shrink-0 rounded-xl border border-[#109A58] bg-[#E6F5EE] px-3 text-xs font-semibold text-[#109A58] transition-colors hover:bg-[#109A58] hover:text-white"
+                  >
+                    Pakai
+                  </button>
+                </div>
+
+                {activeVouchersNow.length > 0 && (
+                  <div className="mt-1.5 flex items-center justify-between">
+                    <button
+                      type="button"
+                      onClick={() => setVoucherPickerOpen((prev) => !prev)}
+                      aria-expanded={voucherPickerOpen}
+                      className="inline-flex items-center gap-1 text-[11px] font-semibold text-[#109A58] hover:underline"
+                    >
+                      <Clock className="h-3 w-3" />
+                      <span>
+                        {voucherPickerOpen
+                          ? 'Sembunyikan promo aktif'
+                          : `Promo Rush Hour aktif (${activeVouchersNow.length})`}
+                      </span>
+                    </button>
+                  </div>
+                )}
+
+                {voucherPickerOpen && activeVouchersNow.length > 0 && (
+                  <div className="mt-2 max-h-36 space-y-1.5 overflow-y-auto rounded-xl border border-[#E5E7EB] bg-[#F4F6F5] p-2">
+                    {activeVouchersNow.map((voucher) => (
+                      <button
+                        key={voucher.id}
+                        type="button"
+                        onClick={() => applyVoucherRecord(voucher)}
+                        className="flex w-full items-center justify-between gap-2 rounded-lg border border-transparent bg-[#FFFFFF] px-2.5 py-2 text-left transition-colors hover:border-[#109A58]/40 hover:bg-[#E6F5EE]/40"
+                      >
+                        <div className="min-w-0">
+                          <p className="truncate font-mono text-[11px] font-bold text-[#1A2E26]">
+                            {voucher.code}
+                          </p>
+                          <p className="truncate text-[10px] text-[#6B7280]">
+                            {formatVoucherSchemeSummary(voucher)} · {voucher.start_time}–
+                            {voucher.end_time}
+                          </p>
+                        </div>
+                        <span className="shrink-0 text-[11px] font-semibold text-[#109A58]">
+                          Pakai
+                        </span>
+                      </button>
+                    ))}
+                  </div>
+                )}
+
+                {voucherError && (
+                  <p role="alert" className="mt-1.5 text-[11px] font-medium text-[#EF4444]">
+                    {voucherError}
+                  </p>
+                )}
+              </div>
+            )}
+          </div>
+
           <div className="space-y-1.5 text-sm">
             <div className="flex items-center justify-between text-[#6B7280]">
               <span>Subtotal ({summary.itemCount} item)</span>
@@ -606,11 +828,25 @@ export function POSPage({ searchQuery }: POSPageProps) {
               </span>
             </div>
 
-            {summary.discountAmount > 0 && (
+            {summary.memberDiscountAmount > 0 && (
               <div className="flex items-center justify-between text-[#EF4444]">
                 <span>Diskon Member ({Math.round(summary.discountRate * 100)}%)</span>
                 <span className="font-semibold tabular-nums">
-                  -{formatRupiah(summary.discountAmount)}
+                  -{formatRupiah(summary.memberDiscountAmount)}
+                </span>
+              </div>
+            )}
+
+            {summary.voucherDiscountAmount > 0 && (
+              <div
+                data-testid="pos-voucher-discount"
+                className="flex items-center justify-between text-[#109A58]"
+              >
+                <span className="truncate pr-2">
+                  Voucher {summary.voucherCode || 'Promo'}
+                </span>
+                <span className="shrink-0 font-semibold tabular-nums">
+                  -{formatRupiah(summary.voucherDiscountAmount)}
                 </span>
               </div>
             )}

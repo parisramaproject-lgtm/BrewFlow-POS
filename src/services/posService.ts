@@ -119,26 +119,47 @@ export async function persistOrderToSupabase(params: {
 
   try {
     // 1. Insert header row into `orders`
-    const { data: insertedOrder, error: orderError } = await supabase
+    const baseOrderPayload = {
+      order_number: order.order_number,
+      cashier_id: isUuid(order.cashier_id) ? order.cashier_id : null,
+      cashier_name: order.cashier_name,
+      customer_id: isUuid(order.customer_id) ? order.customer_id : null,
+      customer_name: order.customer_name,
+      order_type: order.order_type,
+      table_number: order.table_number,
+      subtotal: order.subtotal,
+      discount_amount: order.discount_amount,
+      tax_amount: order.tax_amount,
+      total_amount: order.total_amount,
+      payment_method: order.payment_method,
+      status: order.status,
+      notes: order.notes,
+    };
+
+    let { data: insertedOrder, error: orderError } = await supabase
       .from('orders')
       .insert({
-        order_number: order.order_number,
-        cashier_id: isUuid(order.cashier_id) ? order.cashier_id : null,
-        cashier_name: order.cashier_name,
-        customer_id: isUuid(order.customer_id) ? order.customer_id : null,
-        customer_name: order.customer_name,
-        order_type: order.order_type,
-        table_number: order.table_number,
-        subtotal: order.subtotal,
-        discount_amount: order.discount_amount,
-        tax_amount: order.tax_amount,
-        total_amount: order.total_amount,
-        payment_method: order.payment_method,
-        status: order.status,
-        notes: order.notes,
+        ...baseOrderPayload,
+        voucher_code: order.voucher_code ?? null,
+        voucher_discount_amount: order.voucher_discount_amount ?? 0,
       })
       .select('id')
       .single();
+
+    if (
+      orderError &&
+      (orderError.code === 'PGRST204' ||
+        orderError.code === '42703' ||
+        orderError.message.toLowerCase().includes('voucher_'))
+    ) {
+      const retry = await supabase
+        .from('orders')
+        .insert(baseOrderPayload)
+        .select('id')
+        .single();
+      insertedOrder = retry.data;
+      orderError = retry.error;
+    }
 
     if (orderError || !insertedOrder) {
       return {

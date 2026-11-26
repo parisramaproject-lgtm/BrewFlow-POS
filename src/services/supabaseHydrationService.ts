@@ -24,6 +24,8 @@ import type {
   StockOpnameSchedule,
   StoreSettings,
   StoreVideoItem,
+  VoucherRecord,
+  VoucherSchemeType,
 } from '../types';
 import type { SupabaseSyncStatus } from './posService';
 
@@ -46,6 +48,7 @@ export interface HydratedSupabaseData {
   membershipProgram?: MembershipProgramConfig;
   redemptionLogs?: MemberRedemptionLog[];
   storeVideos?: StoreVideoItem[];
+  vouchers?: VoucherRecord[];
 }
 
 /**
@@ -74,6 +77,7 @@ export async function hydrateAllTablesFromSupabase(
     membershipRes,
     redemptionRes,
     videoRes,
+    voucherRes,
   ] = await Promise.allSettled([
     supabase.from('categories').select('*').order('sort_order', { ascending: true }),
     supabase.from('inventory_items').select('*').order('name', { ascending: true }),
@@ -99,6 +103,7 @@ export async function hydrateAllTablesFromSupabase(
       .order('redeemed_at', { ascending: false })
       .limit(200),
     supabase.from('store_videos').select('*').order('sort_order', { ascending: true }),
+    supabase.from('vouchers').select('*').order('created_at', { ascending: false }),
   ]);
 
   const result: HydratedSupabaseData = {};
@@ -205,6 +210,8 @@ export async function hydrateAllTablesFromSupabase(
       table_number: String(row.table_number || ''),
       subtotal: Number(row.subtotal) || 0,
       discount_amount: Number(row.discount_amount) || 0,
+      voucher_code: row.voucher_code ? String(row.voucher_code) : null,
+      voucher_discount_amount: Number(row.voucher_discount_amount) || 0,
       tax_amount: Number(row.tax_amount) || 0,
       total_amount: Number(row.total_amount) || 0,
       payment_method: (row.payment_method as PaymentMethod) || 'cash',
@@ -419,6 +426,47 @@ export async function hydrateAllTablesFromSupabase(
     }));
   }
 
+  if (
+    voucherRes.status === 'fulfilled' &&
+    !voucherRes.value.error &&
+    Array.isArray(voucherRes.value.data) &&
+    voucherRes.value.data.length > 0
+  ) {
+    result.vouchers = voucherRes.value.data.map((row) => ({
+      id: String(row.id),
+      code: String(row.code || '').toUpperCase(),
+      title: String(row.title || 'Voucher Promo'),
+      description: String(row.description || ''),
+      scheme_type: (row.scheme_type as VoucherSchemeType) || 'percentage_discount',
+      discount_percent: Number(row.discount_percent) || 0,
+      max_discount_amount: Number(row.max_discount_amount) || 0,
+      discount_amount: Number(row.discount_amount) || 0,
+      special_price: Number(row.special_price) || 0,
+      buy_quantity: Number(row.buy_quantity) || 1,
+      free_quantity: Number(row.free_quantity) || 1,
+      bundle_quantity: Number(row.bundle_quantity) || 2,
+      bundle_price: Number(row.bundle_price) || 0,
+      target_menu_ids: Array.isArray(row.target_menu_ids)
+        ? row.target_menu_ids.map((id: unknown) => String(id))
+        : [],
+      min_purchase_amount: Number(row.min_purchase_amount) || 0,
+      valid_from_date: String(row.valid_from_date || '').slice(0, 10),
+      valid_until_date: String(row.valid_until_date || '').slice(0, 10),
+      start_time: String(row.start_time || '00:00').slice(0, 5),
+      end_time: String(row.end_time || '23:59').slice(0, 5),
+      active_days: Array.isArray(row.active_days)
+        ? row.active_days.map((d: unknown) => Number(d)).filter((d: number) => d >= 0 && d <= 6)
+        : [0, 1, 2, 3, 4, 5, 6],
+      max_usage_quota: Number(row.max_usage_quota) || 0,
+      used_count: Number(row.used_count) || 0,
+      stackable_with_member_discount: row.stackable_with_member_discount === true,
+      is_rush_hour: row.is_rush_hour !== false,
+      is_active: row.is_active !== false,
+      created_by_name: row.created_by_name ? String(row.created_by_name) : undefined,
+      created_at: String(row.created_at || new Date().toISOString()),
+    }));
+  }
+
   return result;
 }
 
@@ -576,3 +624,108 @@ export async function deleteOrderFromSupabase(orderId: string): Promise<Supabase
     };
   }
 }
+
+export async function upsertVoucherToSupabase(
+  voucher: VoucherRecord
+): Promise<SupabaseSyncStatus & { id?: string }> {
+  if (!isSupabaseConfigured || !supabase) {
+    return { mode: 'local', synced: true };
+  }
+  try {
+    const payload = {
+      code: voucher.code,
+      title: voucher.title,
+      description: voucher.description ?? '',
+      scheme_type: voucher.scheme_type,
+      discount_percent: voucher.discount_percent ?? 0,
+      max_discount_amount: voucher.max_discount_amount ?? 0,
+      discount_amount: voucher.discount_amount ?? 0,
+      special_price: voucher.special_price ?? 0,
+      buy_quantity: voucher.buy_quantity ?? 1,
+      free_quantity: voucher.free_quantity ?? 1,
+      bundle_quantity: voucher.bundle_quantity ?? 2,
+      bundle_price: voucher.bundle_price ?? 0,
+      target_menu_ids: voucher.target_menu_ids ?? [],
+      min_purchase_amount: voucher.min_purchase_amount ?? 0,
+      valid_from_date: voucher.valid_from_date,
+      valid_until_date: voucher.valid_until_date,
+      start_time: voucher.start_time,
+      end_time: voucher.end_time,
+      active_days: voucher.active_days ?? [0, 1, 2, 3, 4, 5, 6],
+      max_usage_quota: voucher.max_usage_quota ?? 0,
+      used_count: voucher.used_count ?? 0,
+      stackable_with_member_discount: voucher.stackable_with_member_discount ?? false,
+      is_rush_hour: voucher.is_rush_hour ?? true,
+      is_active: voucher.is_active !== false,
+      created_by_name: voucher.created_by_name ?? 'Owner',
+    };
+
+    if (isUuid(voucher.id)) {
+      const { error } = await supabase.from('vouchers').update(payload).eq('id', voucher.id);
+      if (error) return { mode: 'supabase', synced: false, error: error.message };
+      return { mode: 'supabase', synced: true, id: voucher.id };
+    }
+
+    const { data, error } = await supabase
+      .from('vouchers')
+      .upsert(payload, { onConflict: 'code' })
+      .select('id')
+      .single();
+    if (error) return { mode: 'supabase', synced: false, error: error.message };
+    return { mode: 'supabase', synced: true, id: data?.id ? String(data.id) : undefined };
+  } catch (err) {
+    return {
+      mode: 'supabase',
+      synced: false,
+      error: err instanceof Error ? err.message : 'Gagal menyimpan voucher ke Supabase.',
+    };
+  }
+}
+
+export async function deleteVoucherFromSupabase(voucherId: string, code?: string): Promise<SupabaseSyncStatus> {
+  if (!isSupabaseConfigured || !supabase) {
+    return { mode: 'local', synced: true };
+  }
+  try {
+    const query = isUuid(voucherId)
+      ? supabase.from('vouchers').delete().eq('id', voucherId)
+      : code
+        ? supabase.from('vouchers').delete().eq('code', code)
+        : null;
+    if (!query) return { mode: 'local', synced: true };
+    const { error } = await query;
+    if (error) return { mode: 'supabase', synced: false, error: error.message };
+    return { mode: 'supabase', synced: true };
+  } catch (err) {
+    return {
+      mode: 'supabase',
+      synced: false,
+      error: err instanceof Error ? err.message : 'Gagal menghapus voucher dari Supabase.',
+    };
+  }
+}
+
+export async function incrementVoucherUsageInSupabase(
+  voucherId: string,
+  code: string,
+  nextUsedCount: number
+): Promise<SupabaseSyncStatus> {
+  if (!isSupabaseConfigured || !supabase) {
+    return { mode: 'local', synced: true };
+  }
+  try {
+    const query = isUuid(voucherId)
+      ? supabase.from('vouchers').update({ used_count: nextUsedCount }).eq('id', voucherId)
+      : supabase.from('vouchers').update({ used_count: nextUsedCount }).eq('code', code);
+    const { error } = await query;
+    if (error) return { mode: 'supabase', synced: false, error: error.message };
+    return { mode: 'supabase', synced: true };
+  } catch (err) {
+    return {
+      mode: 'supabase',
+      synced: false,
+      error: err instanceof Error ? err.message : 'Gagal memperbarui kuota voucher di Supabase.',
+    };
+  }
+}
+

@@ -9,6 +9,7 @@ import {
   INITIAL_OPNAME_SCHEDULES,
   INITIAL_ORDERS,
   INITIAL_PURCHASES,
+  INITIAL_VOUCHERS,
 } from '../data/seedData';
 import type {
   AppNotification,
@@ -44,6 +45,7 @@ import type {
   UserProfile,
   UserRole,
   UsernameLoginAuditLog,
+  VoucherRecord,
   WhatsAppEventType,
   WhatsAppLogEntry,
 } from '../types';
@@ -92,12 +94,16 @@ import { getAppSessionToken, supabase } from '../lib/supabase';
 import {
   deleteOrderFromSupabase,
   deleteStoreVideoFromSupabase,
+  deleteVoucherFromSupabase,
   hydrateAllTablesFromSupabase,
+  incrementVoucherUsageInSupabase,
   persistMemberRedemptionToSupabase,
   persistMembershipProgramToSupabase,
   updateCustomerPointsInSupabase,
   upsertStoreVideoToSupabase,
+  upsertVoucherToSupabase,
 } from '../services/supabaseHydrationService';
+import { evaluateVoucherOnCart, normalizeVoucherCode } from '../utils/vouchers';
 
 export type { StoreSettings };
 
@@ -106,6 +112,7 @@ const MEMBERSHIP_PROGRAM_STORAGE_KEY = 'brewflow_membership_program_v1';
 const STORE_VIDEOS_STORAGE_KEY = 'brewflow_tv_videos_v1';
 const EMPLOYEES_STORAGE_KEY = 'brewflow_employees_v1';
 const USERNAME_LOGIN_LOGS_STORAGE_KEY = 'brewflow_username_login_logs_v1';
+const VOUCHERS_STORAGE_KEY = 'brewflow_vouchers_v1';
 
 interface CreateOrderInput {
   items: CartItem[];
@@ -117,6 +124,7 @@ interface CreateOrderInput {
   status: OrderStatus;
   cashier: UserProfile;
   replacesDraftId?: string | null;
+  appliedVoucher?: VoucherRecord | null;
   enableSupabaseSync?: boolean;
 }
 
@@ -175,6 +183,7 @@ interface StoreContextValue {
   membershipProgram: MembershipProgramConfig;
   redemptionLogs: MemberRedemptionLog[];
   storeVideos: StoreVideoItem[];
+  vouchers: VoucherRecord[];
   purchases: PurchaseRecord[];
   opnameSchedules: StockOpnameSchedule[];
   dueOpnameSchedules: StockOpnameSchedule[];
@@ -186,6 +195,17 @@ interface StoreContextValue {
   notifications: AppNotification[];
   hasDueOpname: boolean;
   lowStockItems: InventoryItem[];
+  addVoucher: (input: Omit<VoucherRecord, 'id' | 'used_count' | 'created_at'>) => Promise<{ ok: boolean; voucher?: VoucherRecord; error?: string }>;
+  addVoucherBatch: (
+    codes: string[],
+    template: Omit<VoucherRecord, 'id' | 'code' | 'used_count' | 'created_at'>
+  ) => Promise<{ ok: boolean; count: number; vouchers: VoucherRecord[] }>;
+  updateVoucher: (
+    voucherId: string,
+    patch: Partial<Omit<VoucherRecord, 'id' | 'created_at'>>
+  ) => Promise<{ ok: boolean; error?: string }>;
+  toggleVoucherActive: (voucherId: string) => void;
+  deleteVoucher: (voucherId: string) => void;
   refreshAllFromSupabase: () => Promise<void>;
   refreshOpnameWatcher: (enableSupabaseSync?: boolean) => Promise<void>;
   sendWhatsAppMessage: (input: SendWhatsAppActionInput) => Promise<WhatsAppLogEntry>;
@@ -413,6 +433,17 @@ function loadInitialUsernameLoginLogs(): UsernameLoginAuditLog[] {
   }
 }
 
+function loadInitialVouchers(): VoucherRecord[] {
+  try {
+    const raw = window.localStorage.getItem(VOUCHERS_STORAGE_KEY);
+    if (!raw) return INITIAL_VOUCHERS;
+    const parsed = JSON.parse(raw) as VoucherRecord[];
+    return Array.isArray(parsed) && parsed.length > 0 ? parsed : INITIAL_VOUCHERS;
+  } catch {
+    return INITIAL_VOUCHERS;
+  }
+}
+
 export function StoreProvider({ children }: { children: React.ReactNode }) {
   const [categories, setCategories] = useState<Category[]>(INITIAL_CATEGORIES);
   const [menus, setMenus] = useState<MenuItem[]>(INITIAL_MENUS);
@@ -424,6 +455,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   );
   const [redemptionLogs, setRedemptionLogs] = useState<MemberRedemptionLog[]>([]);
   const [storeVideos, setStoreVideos] = useState<StoreVideoItem[]>(loadInitialStoreVideos);
+  const [vouchers, setVouchers] = useState<VoucherRecord[]>(loadInitialVouchers);
   const [purchases, setPurchases] = useState<PurchaseRecord[]>(INITIAL_PURCHASES);
   const [opnameSchedules, setOpnameSchedules] =
     useState<StockOpnameSchedule[]>(INITIAL_OPNAME_SCHEDULES);
@@ -435,6 +467,14 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   const [employees, setEmployees] = useState<UserProfile[]>(loadInitialEmployees);
   const [settings, setSettings] = useState<StoreSettings>(loadInitialSettings);
   const [watcherNow, setWatcherNow] = useState<Date>(() => new Date());
+
+  const persistVouchers = useCallback((next: VoucherRecord[]) => {
+    try {
+      window.localStorage.setItem(VOUCHERS_STORAGE_KEY, JSON.stringify(next));
+    } catch {
+      // Ignore storage quota errors
+    }
+  }, []);
 
   const lowStockItems = useMemo(
     () =>
@@ -506,13 +546,28 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
 
   const createOrder = useCallback(
     async (input: CreateOrderInput): Promise<CreateOrderResult> => {
+      const voucherEval = input.appliedVoucher
+        ? evaluateVoucherOnCart(input.appliedVoucher, input.items, new Date(), menus)
+        : null;
+      const appliedVoucherValid = Boolean(input.appliedVoucher && voucherEval?.valid);
+      const voucherDiscount = appliedVoucherValid ? voucherEval!.discountAmount : 0;
+
       const summary = calculateCartSummary(input.items, input.customer?.tier ?? null, {
         taxEnabled: settings.taxEnabled,
         taxPercent: settings.taxPercent,
         tierRules: membershipProgram.tiers,
         pointEarningStepRupiah: membershipProgram.limits.point_earning_step_rupiah,
+        voucherDiscountAmount: voucherDiscount,
+        voucherCode: appliedVoucherValid ? input.appliedVoucher!.code : null,
+        voucherStackableWithMember: input.appliedVoucher?.stackable_with_member_discount ?? true,
       });
       const sequence = String(orders.length + 2).padStart(3, '0');
+      const voucherNoteSuffix =
+        appliedVoucherValid && input.appliedVoucher
+          ? `[Voucher ${input.appliedVoucher.code}: -Rp ${summary.voucherDiscountAmount.toLocaleString('id-ID')}]`
+          : '';
+      const combinedNotes = [input.notes.trim(), voucherNoteSuffix].filter(Boolean).join(' · ');
+
       const newOrder: OrderRecord = {
         id: `ord-${Date.now()}`,
         order_number: `BF-261125-${sequence}`,
@@ -529,11 +584,13 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
               : 'Delivery',
         subtotal: summary.subtotal,
         discount_amount: summary.discountAmount,
+        voucher_code: summary.voucherCode,
+        voucher_discount_amount: summary.voucherDiscountAmount,
         tax_amount: summary.taxAmount,
         total_amount: summary.totalAmount,
         payment_method: input.paymentMethod,
         status: input.status,
-        notes: input.notes.trim(),
+        notes: combinedNotes,
         items: input.items.map((cartItem, idx) => ({
           id: `oi-${Date.now()}-${idx}`,
           menu_id: cartItem.menu.id,
@@ -558,6 +615,25 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       let newlyLowStock: InventoryItem[] = [];
 
       if (input.status === 'completed') {
+        if (appliedVoucherValid && input.appliedVoucher) {
+          const targetVoucher = input.appliedVoucher;
+          const nextUsedCount = (targetVoucher.used_count || 0) + 1;
+          setVouchers((prev) => {
+            const next = prev.map((v) =>
+              v.id === targetVoucher.id ? { ...v, used_count: nextUsedCount } : v
+            );
+            persistVouchers(next);
+            return next;
+          });
+          if (input.enableSupabaseSync ?? false) {
+            void incrementVoucherUsageInSupabase(
+              targetVoucher.id,
+              targetVoucher.code,
+              nextUsedCount
+            );
+          }
+        }
+
         const stockCalc = computeRecipeStockDeductions(input.items, inventory);
         deductions = stockCalc.summary;
         if (deductions.length > 0) {
@@ -648,7 +724,9 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     },
     [
       orders.length,
+      menus,
       inventory,
+      persistVouchers,
       membershipProgram.tiers,
       membershipProgram.limits.point_earning_step_rupiah,
       settings.taxEnabled,
@@ -1556,6 +1634,10 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
           setStoreVideos(hydrated.storeVideos);
           persistVideos(hydrated.storeVideos);
         }
+        if (hydrated.vouchers) {
+          setVouchers(hydrated.vouchers);
+          persistVouchers(hydrated.vouchers);
+        }
       }
 
       if (!empRes.error && empRes.data && empRes.data.length > 0) {
@@ -1929,6 +2011,167 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     [settings]
   );
 
+  const addVoucher = useCallback(
+    async (
+      input: Omit<VoucherRecord, 'id' | 'used_count' | 'created_at'>
+    ): Promise<{ ok: boolean; voucher?: VoucherRecord; error?: string }> => {
+      const code = normalizeVoucherCode(input.code);
+      if (!code || code.length < 3) {
+        return { ok: false, error: 'Kode voucher minimal 3 karakter huruf/angka.' };
+      }
+      if (vouchers.some((v) => normalizeVoucherCode(v.code) === code)) {
+        return { ok: false, error: `Kode voucher "${code}" sudah terdaftar.` };
+      }
+
+      const newVoucher: VoucherRecord = {
+        ...input,
+        id: `vch-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        code,
+        used_count: 0,
+        created_at: new Date().toISOString(),
+      };
+
+      setVouchers((prev) => {
+        const next = [newVoucher, ...prev];
+        persistVouchers(next);
+        return next;
+      });
+
+      const sync = await upsertVoucherToSupabase(newVoucher);
+      if (sync.synced && sync.id) {
+        const persistedId = sync.id;
+        setVouchers((prev) => {
+          const next = prev.map((v) => (v.id === newVoucher.id ? { ...v, id: persistedId } : v));
+          persistVouchers(next);
+          return next;
+        });
+        return { ok: true, voucher: { ...newVoucher, id: persistedId } };
+      }
+
+      return { ok: true, voucher: newVoucher };
+    },
+    [vouchers, persistVouchers]
+  );
+
+  const addVoucherBatch = useCallback(
+    async (
+      codes: string[],
+      template: Omit<VoucherRecord, 'id' | 'code' | 'used_count' | 'created_at'>
+    ): Promise<{ ok: boolean; count: number; vouchers: VoucherRecord[] }> => {
+      const existingSet = new Set(vouchers.map((v) => normalizeVoucherCode(v.code)));
+      const nowIso = new Date().toISOString();
+      const created: VoucherRecord[] = [];
+
+      for (let i = 0; i < codes.length; i += 1) {
+        const code = normalizeVoucherCode(codes[i]);
+        if (!code || code.length < 3 || existingSet.has(code)) continue;
+        existingSet.add(code);
+        created.push({
+          ...template,
+          id: `vch-${Date.now()}-${i}-${Math.random().toString(36).slice(2, 5)}`,
+          code,
+          used_count: 0,
+          created_at: nowIso,
+        });
+      }
+
+      if (created.length === 0) {
+        return { ok: false, count: 0, vouchers: [] };
+      }
+
+      setVouchers((prev) => {
+        const next = [...created, ...prev];
+        persistVouchers(next);
+        return next;
+      });
+
+      void Promise.all(
+        created.map(async (voucher) => {
+          const sync = await upsertVoucherToSupabase(voucher);
+          if (sync.synced && sync.id) {
+            setVouchers((prev) => {
+              const next = prev.map((v) => (v.id === voucher.id ? { ...v, id: sync.id! } : v));
+              persistVouchers(next);
+              return next;
+            });
+          }
+        })
+      );
+
+      return { ok: true, count: created.length, vouchers: created };
+    },
+    [vouchers, persistVouchers]
+  );
+
+  const updateVoucher = useCallback(
+    async (
+      voucherId: string,
+      patch: Partial<Omit<VoucherRecord, 'id' | 'created_at'>>
+    ): Promise<{ ok: boolean; error?: string }> => {
+      const current = vouchers.find((v) => v.id === voucherId);
+      if (!current) return { ok: false, error: 'Voucher tidak ditemukan.' };
+
+      const nextCode = patch.code !== undefined ? normalizeVoucherCode(patch.code) : current.code;
+      if (!nextCode || nextCode.length < 3) {
+        return { ok: false, error: 'Kode voucher minimal 3 karakter.' };
+      }
+      if (
+        nextCode !== current.code &&
+        vouchers.some((v) => v.id !== voucherId && normalizeVoucherCode(v.code) === nextCode)
+      ) {
+        return { ok: false, error: `Kode voucher "${nextCode}" sudah digunakan.` };
+      }
+
+      const updated: VoucherRecord = {
+        ...current,
+        ...patch,
+        code: nextCode,
+      };
+
+      setVouchers((prev) => {
+        const next = prev.map((v) => (v.id === voucherId ? updated : v));
+        persistVouchers(next);
+        return next;
+      });
+
+      void upsertVoucherToSupabase(updated);
+      return { ok: true };
+    },
+    [vouchers, persistVouchers]
+  );
+
+  const toggleVoucherActive = useCallback(
+    (voucherId: string) => {
+      let updatedVoucher: VoucherRecord | null = null;
+      setVouchers((prev) => {
+        const next = prev.map((v) => {
+          if (v.id !== voucherId) return v;
+          updatedVoucher = { ...v, is_active: !v.is_active };
+          return updatedVoucher;
+        });
+        persistVouchers(next);
+        return next;
+      });
+      if (updatedVoucher) {
+        void upsertVoucherToSupabase(updatedVoucher);
+      }
+    },
+    [persistVouchers]
+  );
+
+  const deleteVoucher = useCallback(
+    (voucherId: string) => {
+      const target = vouchers.find((v) => v.id === voucherId);
+      setVouchers((prev) => {
+        const next = prev.filter((v) => v.id !== voucherId);
+        persistVouchers(next);
+        return next;
+      });
+      void deleteVoucherFromSupabase(voucherId, target?.code);
+    },
+    [vouchers, persistVouchers]
+  );
+
   const value = useMemo<StoreContextValue>(
     () => ({
       categories,
@@ -1939,6 +2182,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       membershipProgram,
       redemptionLogs,
       storeVideos,
+      vouchers,
       purchases,
       opnameSchedules,
       dueOpnameSchedules,
@@ -1950,6 +2194,11 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       notifications,
       hasDueOpname,
       lowStockItems,
+      addVoucher,
+      addVoucherBatch,
+      updateVoucher,
+      toggleVoucherActive,
+      deleteVoucher,
       refreshAllFromSupabase,
       refreshOpnameWatcher,
       sendWhatsAppMessage,
@@ -2002,6 +2251,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       membershipProgram,
       redemptionLogs,
       storeVideos,
+      vouchers,
       purchases,
       opnameSchedules,
       dueOpnameSchedules,
@@ -2013,6 +2263,11 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       notifications,
       hasDueOpname,
       lowStockItems,
+      addVoucher,
+      addVoucherBatch,
+      updateVoucher,
+      toggleVoucherActive,
+      deleteVoucher,
       refreshAllFromSupabase,
       refreshOpnameWatcher,
       sendWhatsAppMessage,

@@ -32,12 +32,18 @@ export interface TaxConfig {
   taxPercent: number;
   tierRules?: MembershipTierRule[];
   pointEarningStepRupiah?: number;
+  voucherDiscountAmount?: number;
+  voucherCode?: string | null;
+  voucherStackableWithMember?: boolean;
 }
 
 export interface CartSummary {
   itemCount: number;
   subtotal: number;
   discountRate: number;
+  memberDiscountAmount: number;
+  voucherDiscountAmount: number;
+  voucherCode: string | null;
   discountAmount: number;
   taxableAmount: number;
   taxEnabled: boolean;
@@ -55,7 +61,14 @@ export function calculateCartSummary(
   const itemCount = items.reduce((sum, item) => sum + item.quantity, 0);
   const subtotal = items.reduce((sum, item) => sum + item.menu.selling_price * item.quantity, 0);
   const discountRate = getMemberDiscountRate(memberTier, taxConfig.tierRules);
-  const discountAmount = Math.round(subtotal * discountRate);
+  const rawMemberDiscount = Math.round(subtotal * discountRate);
+  const rawVoucherDiscount = Math.max(0, Math.round(taxConfig.voucherDiscountAmount ?? 0));
+  const hasVoucher = rawVoucherDiscount > 0;
+  const allowStacking = taxConfig.voucherStackableWithMember !== false;
+
+  const memberDiscountAmount = hasVoucher && !allowStacking ? 0 : rawMemberDiscount;
+  const voucherDiscountAmount = Math.min(Math.max(0, subtotal - memberDiscountAmount), rawVoucherDiscount);
+  const discountAmount = Math.min(subtotal, memberDiscountAmount + voucherDiscountAmount);
   const taxableAmount = Math.max(0, subtotal - discountAmount);
   const effectiveTaxPercent = taxConfig.taxEnabled ? Math.max(0, taxConfig.taxPercent) : 0;
   const taxAmount = Math.round(taxableAmount * (effectiveTaxPercent / 100));
@@ -71,7 +84,10 @@ export function calculateCartSummary(
   return {
     itemCount,
     subtotal,
-    discountRate,
+    discountRate: memberDiscountAmount > 0 ? discountRate : 0,
+    memberDiscountAmount,
+    voucherDiscountAmount,
+    voucherCode: hasVoucher ? (taxConfig.voucherCode ?? null) : null,
     discountAmount,
     taxableAmount,
     taxEnabled: taxConfig.taxEnabled,

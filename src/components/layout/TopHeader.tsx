@@ -2,7 +2,9 @@ import { useEffect, useRef, useState } from 'react';
 import {
   AlertTriangle,
   Bell,
+  Calendar,
   ClipboardCheck,
+  Clock,
   Menu,
   PanelLeftClose,
   PanelLeftOpen,
@@ -35,7 +37,15 @@ export function TopHeader({
   const { notifications } = useStore();
   const [notifOpen, setNotifOpen] = useState(false);
   const [avatarLoadError, setAvatarLoadError] = useState(false);
+  const [now, setNow] = useState<Date>(() => new Date());
   const dropdownRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      setNow(new Date());
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, []);
 
   useEffect(() => {
     setAvatarLoadError(false);
@@ -57,6 +67,22 @@ export function TopHeader({
 
   const visibleNotifications = notifications.filter((n) => canAccessPage(user.role, n.targetPage));
   const roleLabel = getRoleDisplayLabel(user.role);
+
+  const formattedDate = new Intl.DateTimeFormat('id-ID', {
+    weekday: 'short',
+    day: '2-digit',
+    month: 'short',
+    year: 'numeric',
+  }).format(now);
+
+  const formattedTime = new Intl.DateTimeFormat('id-ID', {
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  })
+    .format(now)
+    .replace(/\./g, ':');
 
   return (
     <header className="flex h-16 shrink-0 items-center justify-between gap-4 border-b border-[#E5E7EB] bg-[#F4F6F5] px-4 lg:px-6">
@@ -113,8 +139,25 @@ export function TopHeader({
         </div>
       </div>
 
-      {/* Right: Notification Bell + User Profile */}
-      <div className="flex shrink-0 items-center gap-3 sm:gap-4">
+      {/* Right: Live Date & Clock + Notification Bell + User Profile */}
+      <div className="flex shrink-0 items-center gap-2.5 sm:gap-3">
+        {/* Live Date & Clock */}
+        <div
+          data-testid="topbar-datetime"
+          aria-label={`Tanggal dan waktu saat ini: ${formattedDate}, ${formattedTime}`}
+          className="hidden h-10 items-center gap-2.5 rounded-xl border border-[#E5E7EB] bg-[#FFFFFF] px-3 text-xs text-[#1A2E26] sm:flex"
+        >
+          <span className="hidden items-center gap-1.5 text-[#6B7280] md:inline-flex whitespace-nowrap">
+            <Calendar className="h-3.5 w-3.5 shrink-0 text-[#109A58]" aria-hidden="true" />
+            <span className="font-medium text-[#1A2E26]">{formattedDate}</span>
+          </span>
+          <span className="hidden h-3.5 w-px bg-[#E5E7EB] md:inline-block" aria-hidden="true" />
+          <span className="inline-flex items-center gap-1.5 font-mono font-semibold text-[#1A2E26] tabular-nums whitespace-nowrap">
+            <Clock className="h-3.5 w-3.5 shrink-0 text-[#109A58]" aria-hidden="true" />
+            <span>{formattedTime}</span>
+          </span>
+        </div>
+
         {/* Notification Bell */}
         <div className="relative" ref={dropdownRef}>
           <button

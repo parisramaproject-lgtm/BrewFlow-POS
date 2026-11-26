@@ -6,11 +6,11 @@ import {
   LayoutDashboard,
   LogOut,
   MonitorPlay,
-  PanelLeftClose,
   ReceiptText,
   Settings,
   ShoppingBag,
   Store,
+  Ticket,
   UserCheck,
   Users,
   X,
@@ -26,13 +26,13 @@ interface SidebarProps {
   mobileOpen: boolean;
   onCloseMobile: () => void;
   desktopHidden: boolean;
-  onHideDesktop: () => void;
 }
 
 const PAGE_ICONS: Record<PageId, React.ComponentType<{ className?: string }>> = {
   dashboard: LayoutDashboard,
   pos: Store,
   orders: ReceiptText,
+  vouchers: Ticket,
   'menu-hpp': Calculator,
   inventory: Boxes,
   purchasing: ShoppingBag,
@@ -49,7 +49,6 @@ export function Sidebar({
   mobileOpen,
   onCloseMobile,
   desktopHidden,
-  onHideDesktop,
 }: SidebarProps) {
   const { user, logout } = useAuth();
   const { hasDueOpname, dueOpnameSchedules, settings } = useStore();
@@ -95,16 +94,6 @@ export function Sidebar({
           className="flex h-8 w-8 items-center justify-center rounded-lg text-[#6B7280] hover:bg-[#F4F6F5] lg:hidden"
         >
           <X className="h-4 w-4" />
-        </button>
-        <button
-          type="button"
-          onClick={onHideDesktop}
-          title="Sembunyikan sidebar"
-          aria-label="Sembunyikan sidebar menu"
-          data-testid="sidebar-hide-button"
-          className="hidden h-8 w-8 shrink-0 items-center justify-center rounded-lg text-[#6B7280] transition-colors hover:bg-[#F4F6F5] hover:text-[#109A58] lg:flex"
-        >
-          <PanelLeftClose className="h-4 w-4" />
         </button>
       </div>
 

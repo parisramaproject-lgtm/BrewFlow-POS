@@ -109,3 +109,39 @@ test('calculateCartSummary sets tax to 0 when taxEnabled is false and supports c
   assert.equal(customTax.totalAmount, 62160);
 });
 
+test('calculateCartSummary handles stackable and non-stackable voucher discounts with member tier', () => {
+  const cart: CartItem[] = [{ menu: sampleMenu, quantity: 2 }]; // subtotal 56000
+
+  // Stackable with Gold (10% = 5600) + Voucher 10000 => total discount 15600
+  const stackable = calculateCartSummary(cart, 'Gold', {
+    taxEnabled: true,
+    taxPercent: 10,
+    voucherDiscountAmount: 10000,
+    voucherCode: 'RUSHPAGI20',
+    voucherStackableWithMember: true,
+  });
+  assert.equal(stackable.memberDiscountAmount, 5600);
+  assert.equal(stackable.voucherDiscountAmount, 10000);
+  assert.equal(stackable.voucherCode, 'RUSHPAGI20');
+  assert.equal(stackable.discountAmount, 15600);
+  assert.equal(stackable.taxableAmount, 40400);
+  assert.equal(stackable.taxAmount, 4040);
+  assert.equal(stackable.totalAmount, 44440);
+
+  // Non-stackable voucher replaces member discount
+  const nonStackable = calculateCartSummary(cart, 'Gold', {
+    taxEnabled: true,
+    taxPercent: 10,
+    voucherDiscountAmount: 12000,
+    voucherCode: 'B1G1SORE',
+    voucherStackableWithMember: false,
+  });
+  assert.equal(nonStackable.memberDiscountAmount, 0);
+  assert.equal(nonStackable.voucherDiscountAmount, 12000);
+  assert.equal(nonStackable.discountRate, 0);
+  assert.equal(nonStackable.discountAmount, 12000);
+  assert.equal(nonStackable.taxableAmount, 44000);
+  assert.equal(nonStackable.totalAmount, 48400);
+});
+
+

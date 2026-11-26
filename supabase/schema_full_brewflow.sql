@@ -564,6 +564,44 @@ CREATE TABLE IF NOT EXISTS public.store_videos (
 );
 
 -- -----------------------------------------------------------------------------
+-- 9B. TABEL VOUCHER & PROMO RUSH HOUR
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS public.vouchers (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  code text NOT NULL UNIQUE,
+  title text NOT NULL,
+  description text DEFAULT '',
+  scheme_type text NOT NULL DEFAULT 'percentage_discount'
+    CHECK (scheme_type IN ('percentage_discount', 'fixed_discount', 'special_item_price', 'buy_x_get_y', 'bundle_price')),
+  discount_percent numeric(6,2) DEFAULT 0,
+  max_discount_amount numeric(14,2) DEFAULT 0,
+  discount_amount numeric(14,2) DEFAULT 0,
+  special_price numeric(14,2) DEFAULT 0,
+  buy_quantity integer DEFAULT 1,
+  free_quantity integer DEFAULT 1,
+  bundle_quantity integer DEFAULT 2,
+  bundle_price numeric(14,2) DEFAULT 0,
+  target_menu_ids jsonb NOT NULL DEFAULT '[]'::jsonb,
+  min_purchase_amount numeric(14,2) NOT NULL DEFAULT 0,
+  valid_from_date date NOT NULL DEFAULT current_date,
+  valid_until_date date NOT NULL DEFAULT (current_date + interval '30 days')::date,
+  start_time text NOT NULL DEFAULT '00:00',
+  end_time text NOT NULL DEFAULT '23:59',
+  active_days jsonb NOT NULL DEFAULT '[0,1,2,3,4,5,6]'::jsonb,
+  max_usage_quota integer NOT NULL DEFAULT 0,
+  used_count integer NOT NULL DEFAULT 0,
+  stackable_with_member_discount boolean NOT NULL DEFAULT false,
+  is_rush_hour boolean NOT NULL DEFAULT true,
+  is_active boolean NOT NULL DEFAULT true,
+  created_by_name text DEFAULT 'Owner',
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+-- Kolom voucher opsional pada tabel orders
+ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS voucher_code text;
+ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS voucher_discount_amount numeric(14,2) NOT NULL DEFAULT 0;
+
+-- -----------------------------------------------------------------------------
 -- 10. AKTIFKAN RLS & HAK AKSES AMAN PADA SELURUH TABEL OPERASIONAL
 -- -----------------------------------------------------------------------------
 DO $$
@@ -586,7 +624,8 @@ BEGIN
     'store_settings',
     'membership_program_settings',
     'member_redemption_logs',
-    'store_videos'
+    'store_videos',
+    'vouchers'
   ]
   LOOP
     EXECUTE format('GRANT SELECT, INSERT, UPDATE, DELETE ON public.%I TO anon, authenticated', t);
@@ -646,5 +685,32 @@ BEGIN
       ('Opname Harian Bahan Baku & Susu', 'daily', '21:00', NULL, NULL, 'raw_material', true, true),
       ('Opname Mingguan Kemasan & Cup', 'weekly', '20:00', 0, NULL, 'packaging', true, false),
       ('Audit Aset & Mesin Bulanan', 'monthly', '10:00', NULL, 1, 'asset', true, false);
+  END IF;
+
+  IF NOT EXISTS (SELECT 1 FROM public.vouchers) THEN
+    INSERT INTO public.vouchers (
+      code, title, description, scheme_type, discount_percent, max_discount_amount, discount_amount,
+      special_price, buy_quantity, free_quantity, bundle_quantity, bundle_price, target_menu_ids,
+      min_purchase_amount, valid_from_date, valid_until_date, start_time, end_time, active_days,
+      max_usage_quota, used_count, stackable_with_member_discount, is_rush_hour, is_active, created_by_name
+    ) VALUES
+      (
+        'RUSHPAGI20', 'Rush Hour Kopi Pagi', 'Potongan 20% maksimal Rp 15.000 untuk jam berangkat kerja.',
+        'percentage_discount', 20, 15000, 0, 0, 1, 1, 2, 0, '[]'::jsonb,
+        25000, current_date, (current_date + interval '60 days')::date, '07:00', '10:00', '[1,2,3,4,5]'::jsonb,
+        100, 0, false, true, true, 'Owner BrewFlow'
+      ),
+      (
+        'SIANG18K', 'Rush Hour Siang Harga Spesial', 'Harga spesial Rp 18.000 per cup saat jam istirahat siang.',
+        'special_item_price', 0, 0, 0, 18000, 1, 1, 2, 0, '[]'::jsonb,
+        0, current_date, (current_date + interval '60 days')::date, '11:30', '14:00', '[0,1,2,3,4,5,6]'::jsonb,
+        80, 0, false, true, true, 'Owner BrewFlow'
+      ),
+      (
+        'B1G1SORE', 'Happy Hour Sore Beli 1 Gratis 1', 'Beli 1 gratis 1 untuk item termurah setiap sore jam santai.',
+        'buy_x_get_y', 0, 0, 0, 0, 1, 1, 2, 0, '[]'::jsonb,
+        0, current_date, (current_date + interval '60 days')::date, '15:00', '18:00', '[0,1,2,3,4,5,6]'::jsonb,
+        50, 0, false, true, true, 'Owner BrewFlow'
+      );
   END IF;
 END $$;

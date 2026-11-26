@@ -16,6 +16,7 @@ import { PurchasingPage } from './pages/PurchasingPage';
 import { SettingsPage } from './pages/SettingsPage';
 import { StockOpnamePage } from './pages/StockOpnamePage';
 import { TVDisplayPage } from './pages/TVDisplayPage';
+import { VouchersPage } from './pages/VouchersPage';
 import type { PageId } from './types';
 import { getDefaultPageForRole } from './utils/rbac';
 
@@ -24,6 +25,7 @@ const VALID_PAGES: PageId[] = [
   'dashboard',
   'pos',
   'orders',
+  'vouchers',
   'menu-hpp',
   'inventory',
   'purchasing',
@@ -102,6 +104,8 @@ function AuthenticatedApp() {
         return <POSPage searchQuery={searchQuery} />;
       case 'orders':
         return <OrdersPage searchQuery={searchQuery} />;
+      case 'vouchers':
+        return <VouchersPage searchQuery={searchQuery} />;
       case 'menu-hpp':
         return <MenuHPPPage searchQuery={searchQuery} />;
       case 'inventory':

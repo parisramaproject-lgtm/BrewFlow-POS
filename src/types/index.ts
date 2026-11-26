@@ -4,6 +4,7 @@ export type PageId =
   | 'dashboard'
   | 'pos'
   | 'orders'
+  | 'vouchers'
   | 'menu-hpp'
   | 'inventory'
   | 'purchasing'
@@ -150,6 +151,8 @@ export interface OrderRecord {
   table_number: string;
   subtotal: number;
   discount_amount: number;
+  voucher_code?: string | null;
+  voucher_discount_amount?: number;
   tax_amount: number;
   total_amount: number;
   payment_method: PaymentMethod;
@@ -371,6 +374,44 @@ export interface StoreVideoItem {
   created_by_name: string;
   created_at: string;
 }
+
+export type VoucherSchemeType =
+  | 'percentage_discount'
+  | 'fixed_discount'
+  | 'special_item_price'
+  | 'buy_x_get_y'
+  | 'bundle_price';
+
+export interface VoucherRecord {
+  id: string;
+  code: string;
+  title: string;
+  description: string;
+  scheme_type: VoucherSchemeType;
+  discount_percent?: number;
+  max_discount_amount?: number;
+  discount_amount?: number;
+  special_price?: number;
+  buy_quantity?: number;
+  free_quantity?: number;
+  bundle_quantity?: number;
+  bundle_price?: number;
+  target_menu_ids: string[];
+  min_purchase_amount: number;
+  valid_from_date: string; // YYYY-MM-DD
+  valid_until_date: string; // YYYY-MM-DD
+  start_time: string; // HH:mm
+  end_time: string; // HH:mm
+  active_days: number[]; // 0=Minggu .. 6=Sabtu
+  max_usage_quota: number; // 0 = tanpa batas
+  used_count: number;
+  stackable_with_member_discount: boolean;
+  is_rush_hour: boolean;
+  is_active: boolean;
+  created_by_name?: string;
+  created_at: string;
+}
+
 
 
 
