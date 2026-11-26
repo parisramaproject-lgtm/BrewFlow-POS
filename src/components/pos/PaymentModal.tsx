@@ -175,7 +175,7 @@ export function PaymentModal({
                   Status Transaksi
                 </span>
                 <span className="font-semibold text-[#109A58]">
-                  Tersimpan ({completedResult.syncStatus.mode === 'supabase' ? 'Supabase Live' : 'Mode Demo'})
+                  {completedResult.syncStatus.mode === 'supabase' ? 'Tersimpan (Supabase)' : 'Tersimpan'}
                 </span>
               </div>
 

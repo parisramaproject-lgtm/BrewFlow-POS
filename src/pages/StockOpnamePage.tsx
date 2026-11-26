@@ -115,7 +115,7 @@ export function StockOpnamePage() {
     const waStatusText = result.whatsappLog
       ? result.whatsappLog.status === 'sent'
         ? `Laporan ringkasan selisih terkirim ke WhatsApp Owner (${settings.whatsappOwnerPhone}) via ${
-            result.whatsappLog.mode === 'edge_function' ? 'Supabase Edge Function' : 'Simulasi Demo'
+            result.whatsappLog.mode === 'edge_function' ? 'Supabase Edge Function' : 'Antrean Lokal'
           }.`
         : `Pengiriman WhatsApp ke Owner gagal: ${result.whatsappLog.error ?? 'Periksa konfigurasi gateway.'}`
       : 'Nomor WhatsApp Owner belum dikonfigurasi.';

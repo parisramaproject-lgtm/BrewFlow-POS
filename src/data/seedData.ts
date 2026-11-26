@@ -10,9 +10,9 @@ import type {
   UserProfile,
 } from '../types';
 
-export const DEMO_USERS: Record<'owner' | 'manager' | 'cashier', UserProfile> = {
-  owner: {
-    id: 'demo-owner-01',
+export const INITIAL_EMPLOYEES: UserProfile[] = [
+  {
+    id: 'emp-01',
     full_name: 'Budi Santoso',
     email: 'generalaffairhrandelajaya@gmail.com',
     role: 'owner',
@@ -28,8 +28,8 @@ export const DEMO_USERS: Record<'owner' | 'manager' | 'cashier', UserProfile> = 
     notes: 'Penanggung jawab utama operasional & keuangan.',
     created_at: '2025-01-10T08:00:00Z',
   },
-  manager: {
-    id: 'demo-manager-01',
+  {
+    id: 'emp-02',
     full_name: 'Rina Wijaya',
     email: 'manager@brewflow.id',
     role: 'manager',
@@ -45,8 +45,8 @@ export const DEMO_USERS: Record<'owner' | 'manager' | 'cashier', UserProfile> = 
     notes: 'PIC Stock Opname & jadwal supplier harian.',
     created_at: '2025-02-14T08:00:00Z',
   },
-  cashier: {
-    id: 'demo-cashier-01',
+  {
+    id: 'emp-03',
     full_name: 'Dimas Pratama',
     email: 'kasir@brewflow.id',
     role: 'cashier',
@@ -62,12 +62,6 @@ export const DEMO_USERS: Record<'owner' | 'manager' | 'cashier', UserProfile> = 
     notes: 'Sertifikasi Kalibrasi Espresso & Latte Art.',
     created_at: '2025-04-02T08:00:00Z',
   },
-};
-
-export const INITIAL_EMPLOYEES: UserProfile[] = [
-  DEMO_USERS.owner,
-  DEMO_USERS.manager,
-  DEMO_USERS.cashier,
   {
     id: 'emp-04',
     full_name: 'Nadia Kusuma',
@@ -492,7 +486,7 @@ export const INITIAL_ORDERS: OrderRecord[] = [
   {
     id: 'ord-101',
     order_number: 'BF-261125-004',
-    cashier_id: 'demo-cashier-01',
+    cashier_id: 'emp-03',
     cashier_name: 'Dimas Pratama',
     customer_id: 'cust-1',
     customer_name: 'Alya Rahmawati',
@@ -528,7 +522,7 @@ export const INITIAL_ORDERS: OrderRecord[] = [
   {
     id: 'ord-102',
     order_number: 'BF-261125-003',
-    cashier_id: 'demo-cashier-01',
+    cashier_id: 'emp-03',
     cashier_name: 'Dimas Pratama',
     customer_id: null,
     customer_name: null,

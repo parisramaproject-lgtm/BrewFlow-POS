@@ -73,7 +73,7 @@ export function isOpnameScheduleDue(
     }
   }
 
-  // Respect explicit due flag (e.g. demo or manual trigger)
+  // Respect explicit due flag (e.g. manual trigger)
   if (schedule.is_due_now) {
     return true;
   }

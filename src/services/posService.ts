@@ -85,7 +85,7 @@ export function computeUpdatedMember(
 }
 
 export interface SupabaseSyncStatus {
-  mode: 'supabase' | 'demo';
+  mode: 'supabase' | 'local';
   synced: boolean;
   error?: string;
 }
@@ -106,7 +106,7 @@ export async function persistOrderToSupabase(params: {
   enableSupabaseSync?: boolean;
 }): Promise<SupabaseSyncStatus> {
   if (!params.enableSupabaseSync || !isSupabaseConfigured || !supabase) {
-    return { mode: 'demo', synced: true };
+    return { mode: 'local', synced: true };
   }
 
   const { order, updatedCustomer, deductions } = params;
@@ -205,7 +205,7 @@ export async function persistCustomerToSupabase(
   enableSupabaseSync = false
 ): Promise<SupabaseSyncStatus> {
   if (!enableSupabaseSync || !isSupabaseConfigured || !supabase) {
-    return { mode: 'demo', synced: true };
+    return { mode: 'local', synced: true };
   }
 
   try {

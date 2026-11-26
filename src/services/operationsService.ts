@@ -101,7 +101,7 @@ export async function upsertInventoryItemToSupabase(
   enableSupabaseSync = false
 ): Promise<SupabaseSyncStatus> {
   if (!enableSupabaseSync || !isSupabaseConfigured || !supabase) {
-    return { mode: 'demo', synced: true };
+    return { mode: 'local', synced: true };
   }
 
   try {
@@ -140,7 +140,7 @@ export async function deleteInventoryItemFromSupabase(
   enableSupabaseSync = false
 ): Promise<SupabaseSyncStatus> {
   if (!enableSupabaseSync || !isSupabaseConfigured || !supabase) {
-    return { mode: 'demo', synced: true };
+    return { mode: 'local', synced: true };
   }
 
   try {
@@ -169,7 +169,7 @@ export async function persistPurchaseToSupabase(params: {
   enableSupabaseSync?: boolean;
 }): Promise<SupabaseSyncStatus> {
   if (!params.enableSupabaseSync || !isSupabaseConfigured || !supabase) {
-    return { mode: 'demo', synced: true };
+    return { mode: 'local', synced: true };
   }
 
   try {
@@ -242,7 +242,7 @@ export async function upsertMenuItemToSupabase(
   enableSupabaseSync = false
 ): Promise<SupabaseSyncStatus> {
   if (!enableSupabaseSync || !isSupabaseConfigured || !supabase) {
-    return { mode: 'demo', synced: true };
+    return { mode: 'local', synced: true };
   }
 
   try {
@@ -278,7 +278,7 @@ export async function deleteMenuItemFromSupabase(
   enableSupabaseSync = false
 ): Promise<SupabaseSyncStatus> {
   if (!enableSupabaseSync || !isSupabaseConfigured || !supabase) {
-    return { mode: 'demo', synced: true };
+    return { mode: 'local', synced: true };
   }
 
   try {
@@ -303,7 +303,7 @@ export async function syncMenuRecipesToSupabase(
   enableSupabaseSync = false
 ): Promise<SupabaseSyncStatus> {
   if (!enableSupabaseSync || !isSupabaseConfigured || !supabase) {
-    return { mode: 'demo', synced: true };
+    return { mode: 'local', synced: true };
   }
 
   try {
@@ -347,7 +347,7 @@ export async function persistStoreSettingsToSupabase(
   enableSupabaseSync = false
 ): Promise<SupabaseSyncStatus> {
   if (!enableSupabaseSync || !isSupabaseConfigured || !supabase) {
-    return { mode: 'demo', synced: true };
+    return { mode: 'local', synced: true };
   }
 
   try {
@@ -426,7 +426,7 @@ export async function upsertOpnameScheduleToSupabase(
   enableSupabaseSync = false
 ): Promise<SupabaseSyncStatus> {
   if (!enableSupabaseSync || !isSupabaseConfigured || !supabase) {
-    return { mode: 'demo', synced: true };
+    return { mode: 'local', synced: true };
   }
 
   try {
@@ -463,7 +463,7 @@ export async function deleteOpnameScheduleFromSupabase(
   enableSupabaseSync = false
 ): Promise<SupabaseSyncStatus> {
   if (!enableSupabaseSync || !isSupabaseConfigured || !supabase) {
-    return { mode: 'demo', synced: true };
+    return { mode: 'local', synced: true };
   }
 
   try {
@@ -495,7 +495,7 @@ export async function persistStockOpnameToSupabase(params: {
   enableSupabaseSync?: boolean;
 }): Promise<SupabaseSyncStatus> {
   if (!params.enableSupabaseSync || !isSupabaseConfigured || !supabase) {
-    return { mode: 'demo', synced: true };
+    return { mode: 'local', synced: true };
   }
 
   try {

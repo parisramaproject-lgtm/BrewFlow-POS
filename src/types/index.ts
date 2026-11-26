@@ -215,7 +215,7 @@ export interface WhatsAppLogEntry {
   event_type: WhatsAppEventType;
   targets: string[];
   preview: string;
-  mode: 'edge_function' | 'demo_simulated';
+  mode: 'edge_function' | 'local';
   status: 'sent' | 'failed';
   error?: string;
   sent_at: string;

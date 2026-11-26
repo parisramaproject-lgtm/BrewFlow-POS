@@ -415,7 +415,7 @@ export function SettingsPage() {
     if (log.status === 'sent') {
       notifySaved(
         `Pesan uji coba WhatsApp terkirim ke ${target} (${
-          log.mode === 'edge_function' ? 'Supabase Edge Function' : 'Simulasi Demo'
+          log.mode === 'edge_function' ? 'Supabase Edge Function' : 'Antrean Lokal'
         }).`
       );
     } else {
@@ -1711,7 +1711,7 @@ export function SettingsPage() {
                           {log.status === 'sent'
                             ? log.mode === 'edge_function'
                               ? 'Terkirim (Live)'
-                              : 'Terkirim (Demo)'
+                              : 'Terkirim (Lokal)'
                             : 'Gagal'}
                         </span>
                       </div>

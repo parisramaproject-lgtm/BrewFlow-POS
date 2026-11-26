@@ -9,7 +9,6 @@ import React, {
 } from 'react';
 import type { User as SupabaseUser } from '@supabase/supabase-js';
 import { isSupabaseConfigured, supabase } from '../lib/supabase';
-import { DEMO_USERS } from '../data/seedData';
 import type { PageId, UserProfile, UserRole } from '../types';
 import {
   extractSupabaseUserIdentity,
@@ -27,18 +26,18 @@ import {
 } from '../utils/rbac';
 import { useStore } from './StoreContext';
 
-const DEMO_STORAGE_KEY = 'brewflow_demo_role_v1';
+const LEGACY_DEMO_STORAGE_KEY = 'brewflow_demo_role_v1';
 
 interface AuthContextValue {
   user: UserProfile | null;
-  authMode: 'supabase_google' | 'supabase' | 'demo' | null;
+  authMode: 'supabase' | null;
+  authProvider: 'google' | 'email' | null;
   authError: string | null;
   clearAuthError: () => void;
   isLoading: boolean;
   isSupabaseReady: boolean;
   signInWithGoogle: () => Promise<{ error: string | null }>;
   signInWithEmail: (email: string, password: string) => Promise<{ error: string | null }>;
-  demoLogin: (role: UserRole) => void;
   logout: () => Promise<void>;
   hasRole: (roles: UserRole | UserRole[]) => boolean;
   canAccess: (page: PageId) => boolean;
@@ -51,13 +50,6 @@ interface AuthContextValue {
 
 const AuthContext = createContext<AuthContextValue | null>(null);
 
-function parseDemoRole(raw: string | null): UserRole | null {
-  if (raw === 'owner' || raw === 'manager' || raw === 'cashier') {
-    return raw;
-  }
-  return null;
-}
-
 function extractOAuthCallbackError(): string | null {
   const searchParams = new URLSearchParams(window.location.search);
   const hashParams = new URLSearchParams(window.location.hash.replace(/^#/, ''));
@@ -69,15 +61,16 @@ function extractOAuthCallbackError(): string | null {
 
   if (!errDesc) return null;
 
-  // Clean error query/hash parameters from address bar
   try {
-    const cleanUrl = `${window.location.pathname}`;
-    window.history.replaceState({}, document.title, cleanUrl);
+    window.history.replaceState({}, document.title, window.location.pathname);
   } catch {
     // Ignore history errors in restricted frames
   }
   return getSupabaseGoogleAuthErrorMessage(errDesc);
 }
+
+const MISSING_SUPABASE_CONFIG_MESSAGE =
+  'Koneksi Supabase belum terdeteksi pada build ini. Pastikan variabel VITE_SUPABASE_URL & VITE_SUPABASE_ANON_KEY (atau NEXT_PUBLIC_SUPABASE_URL & NEXT_PUBLIC_SUPABASE_ANON_KEY dari integrasi Supabase-Vercel) sudah terpasang di Vercel Environment Variables, lalu lakukan Redeploy.';
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
   const { employees } = useStore();
@@ -85,9 +78,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   employeesRef.current = employees;
 
   const [user, setUser] = useState<UserProfile | null>(null);
-  const [authMode, setAuthMode] = useState<'supabase_google' | 'supabase' | 'demo' | null>(null);
-  const authModeRef = useRef<'supabase_google' | 'supabase' | 'demo' | null>(null);
-  authModeRef.current = authMode;
+  const [authMode, setAuthMode] = useState<'supabase' | null>(null);
+  const [authProvider, setAuthProvider] = useState<'google' | 'email' | null>(null);
   const [authError, setAuthError] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState<boolean>(true);
 
@@ -95,18 +87,17 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   /**
    * Resolves a Supabase authenticated user (Google OAuth or Email/Password) against:
-   * 1. Live Supabase `profiles` table (matching by email case-insensitively, or by user ID)
-   * 2. Local employee directory (`employees`) as fallback when `profiles` is not yet seeded
+   * 1. Live Supabase `employees` table (case-insensitive email match)
+   * 2. Fallback to `profiles` table
+   * 3. Fallback to hydrated employee directory in StoreContext
    *
-   * For Google OAuth sign-ins, strictly enforces that the email is registered AND active
-   * in employee data; otherwise signs out immediately and surfaces a clear rejection error.
+   * Strictly rejects unregistered or inactive Google accounts and signs them out immediately.
    */
   const resolveSupabaseUser = useCallback(async (sbUser: SupabaseUser) => {
     const identity = extractSupabaseUserIdentity(sbUser);
     const isGoogleLogin = identity.provider === 'google';
     const normalizedEmail = normalizeEmail(identity.email);
 
-    // Step 1: Try matching in Supabase `employees` allowlist table first, then fallback to `profiles`
     if (supabase) {
       try {
         let matchedRow: Record<string, unknown> | null = null;
@@ -155,6 +146,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
             await supabase.auth.signOut();
             setUser(null);
             setAuthMode(null);
+            setAuthProvider(null);
             setAuthError(
               `Akun karyawan "${name}" (${normalizedEmail}) sedang berstatus Nonaktif. Hubungi Owner untuk mengaktifkan kembali akses.`
             );
@@ -187,7 +179,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
             created_at: String(matchedRow.created_at || new Date().toISOString()),
           };
 
-          // Best-effort link to `profiles` using real auth.users UUID so orders/purchases FKs stay valid
           if (matchedFromEmployeesTable) {
             void (async () => {
               try {
@@ -201,30 +192,29 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
                   { onConflict: 'id' }
                 );
               } catch {
-                // Non-blocking fallback
+                // Non-blocking FK sync
               }
             })();
           }
 
-          window.localStorage.removeItem(DEMO_STORAGE_KEY);
           setAuthError(null);
           setUser(mergeGoogleProfileIntoEmployee(dbEmployee, identity));
-          setAuthMode(isGoogleLogin ? 'supabase_google' : 'supabase');
+          setAuthMode('supabase');
+          setAuthProvider(isGoogleLogin ? 'google' : 'email');
           return;
         }
       } catch {
-        // Fall through to local employee directory check
+        // Fall through to hydrated employee directory check
       }
     }
 
-    // Step 2: Validate against registered employee directory in StoreContext
     const localMatch = matchEmployeeByEmail(identity.email, employeesRef.current);
 
     if (localMatch.status === 'matched') {
-      window.localStorage.removeItem(DEMO_STORAGE_KEY);
       setAuthError(null);
       setUser(mergeGoogleProfileIntoEmployee(localMatch.employee, identity));
-      setAuthMode(isGoogleLogin ? 'supabase_google' : 'supabase');
+      setAuthMode('supabase');
+      setAuthProvider(isGoogleLogin ? 'google' : 'email');
       return;
     }
 
@@ -232,22 +222,22 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       if (supabase) await supabase.auth.signOut();
       setUser(null);
       setAuthMode(null);
+      setAuthProvider(null);
       setAuthError(localMatch.message);
       return;
     }
 
-    // For Google OAuth, strictly reject emails not found in employee data
     if (isGoogleLogin) {
       if (supabase) await supabase.auth.signOut();
       setUser(null);
       setAuthMode(null);
+      setAuthProvider(null);
       setAuthError(localMatch.message);
       return;
     }
 
-    // Non-Google Supabase Email/Password fallback when profiles row hasn't been created yet
+    // Email/password Supabase user fallback when profile row is not yet created
     const fallbackName = identity.displayName || normalizedEmail.split('@')[0] || 'Pengguna';
-    window.localStorage.removeItem(DEMO_STORAGE_KEY);
     setAuthError(null);
     setUser({
       id: sbUser.id,
@@ -260,32 +250,25 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       created_at: new Date().toISOString(),
     });
     setAuthMode('supabase');
+    setAuthProvider('email');
   }, []);
 
   useEffect(() => {
     let active = true;
 
+    // Clean up any legacy storage key from earlier builds
+    try {
+      window.localStorage.removeItem(LEGACY_DEMO_STORAGE_KEY);
+    } catch {
+      // Ignore storage restrictions
+    }
+
     async function bootstrapSession() {
-      // Surface any Supabase OAuth redirect error (e.g. access_denied)
       const callbackError = extractOAuthCallbackError();
       if (callbackError && active) {
         setAuthError(callbackError);
       }
 
-      // Support ?autostart=1 (& optional ?role=owner|manager|cashier) for instant preview
-      const params = new URLSearchParams(window.location.search);
-      if (params.get('autostart') === '1') {
-        const paramRole = parseDemoRole(params.get('role')) ?? 'owner';
-        window.localStorage.setItem(DEMO_STORAGE_KEY, paramRole);
-        if (active) {
-          setUser(DEMO_USERS[paramRole]);
-          setAuthMode('demo');
-          setIsLoading(false);
-        }
-        return;
-      }
-
-      // Check live Supabase session first (so returning Google OAuth callbacks take priority)
       if (supabase) {
         try {
           const {
@@ -293,23 +276,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           } = await supabase.auth.getSession();
           if (session?.user && active) {
             await resolveSupabaseUser(session.user);
-            if (active) setIsLoading(false);
-            return;
           }
         } catch {
-          // Safe fallback to demo or logged-out state
+          // Stay logged out on session read error
         }
-      }
-
-      // Otherwise check persisted Demo Quick Login
-      const storedDemoRole = parseDemoRole(window.localStorage.getItem(DEMO_STORAGE_KEY));
-      if (storedDemoRole) {
-        if (active) {
-          setUser(DEMO_USERS[storedDemoRole]);
-          setAuthMode('demo');
-          setIsLoading(false);
-        }
-        return;
       }
 
       if (active) {
@@ -317,17 +287,15 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       }
     }
 
-    bootstrapSession();
+    void bootstrapSession();
 
     const subscription = supabase?.auth.onAuthStateChange((_event, session) => {
       if (session?.user) {
         void resolveSupabaseUser(session.user);
-      } else if (
-        !window.localStorage.getItem(DEMO_STORAGE_KEY) &&
-        (authModeRef.current === 'supabase' || authModeRef.current === 'supabase_google')
-      ) {
+      } else {
         setUser(null);
         setAuthMode(null);
+        setAuthProvider(null);
       }
     });
 
@@ -337,9 +305,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     };
   }, [resolveSupabaseUser]);
 
-  // Keep active Google-authenticated user synced if Owner edits/deactivates them in EmployeesPage
+  // Keep active Google-authenticated user synced if Owner edits or deactivates them
   useEffect(() => {
-    if (authMode !== 'supabase_google' || !user) return;
+    if (authProvider !== 'google' || !user) return;
     const matched = employees.find(
       (emp) => emp.id === user.id || normalizeEmail(emp.email) === normalizeEmail(user.email)
     );
@@ -348,6 +316,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       if (supabase) void supabase.auth.signOut();
       setUser(null);
       setAuthMode(null);
+      setAuthProvider(null);
       setAuthError(
         `Akun karyawan "${matched.full_name}" telah dinonaktifkan oleh Owner. Anda telah dikeluarkan otomatis.`
       );
@@ -358,22 +327,19 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       matched.role !== user.role ||
       matched.avatar_initials !== user.avatar_initials
     ) {
-      setUser((prev) => (prev ? { ...matched, photo_url: prev.photo_url } : matched));
+      setUser((prev) => (prev ? { ...matched, id: prev.id, photo_url: prev.photo_url } : matched));
     }
-  }, [employees, authMode, user]);
+  }, [employees, authProvider, user]);
 
   const signInWithGoogle = useCallback(async (): Promise<{ error: string | null }> => {
     setAuthError(null);
 
     if (!supabase) {
-      const msg =
-        'Koneksi Supabase belum dikonfigurasi (VITE_SUPABASE_URL & VITE_SUPABASE_ANON_KEY). Isi variabel tersebut di .env / Vercel dan aktifkan Google Provider di Supabase Auth, atau gunakan Demo Quick Login di samping.';
-      setAuthError(msg);
-      return { error: msg };
+      setAuthError(MISSING_SUPABASE_CONFIG_MESSAGE);
+      return { error: MISSING_SUPABASE_CONFIG_MESSAGE };
     }
 
     try {
-      window.localStorage.removeItem(DEMO_STORAGE_KEY);
       const { error } = await supabase.auth.signInWithOAuth({
         provider: 'google',
         options: {
@@ -407,10 +373,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       }
 
       if (!supabase) {
-        return {
-          error:
-            'Koneksi Supabase belum dikonfigurasi (VITE_SUPABASE_URL & VITE_SUPABASE_ANON_KEY). Gunakan tombol Demo Quick Login di samping untuk mencoba aplikasi.',
-        };
+        return { error: MISSING_SUPABASE_CONFIG_MESSAGE };
       }
 
       const { data, error } = await supabase.auth.signInWithPassword({
@@ -430,22 +393,15 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     [resolveSupabaseUser]
   );
 
-  const demoLogin = useCallback((role: UserRole) => {
-    setAuthError(null);
-    window.localStorage.setItem(DEMO_STORAGE_KEY, role);
-    setUser(DEMO_USERS[role]);
-    setAuthMode('demo');
-  }, []);
-
   const logout = useCallback(async () => {
     setAuthError(null);
-    window.localStorage.removeItem(DEMO_STORAGE_KEY);
-    if (supabase && (authMode === 'supabase' || authMode === 'supabase_google')) {
+    if (supabase) {
       await supabase.auth.signOut();
     }
     setUser(null);
     setAuthMode(null);
-  }, [authMode]);
+    setAuthProvider(null);
+  }, []);
 
   const hasRole = useCallback(
     (roles: UserRole | UserRole[]) => {
@@ -467,13 +423,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     () => ({
       user,
       authMode,
+      authProvider,
       authError,
       clearAuthError,
       isLoading,
       isSupabaseReady: isSupabaseConfigured,
       signInWithGoogle,
       signInWithEmail,
-      demoLogin,
       logout,
       hasRole,
       canAccess,
@@ -486,12 +442,12 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     [
       user,
       authMode,
+      authProvider,
       authError,
       clearAuthError,
       isLoading,
       signInWithGoogle,
       signInWithEmail,
-      demoLogin,
       logout,
       hasRole,
       canAccess,

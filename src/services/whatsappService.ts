@@ -49,7 +49,7 @@ function summarizePreview(params: SendWhatsAppParams): string {
 
 /**
  * Triggers the Supabase Edge Function `send-whatsapp` when connected to live Supabase.
- * In Demo mode, simulates delivery cleanly and returns a structured log entry.
+ * Falls back cleanly to a local log entry when Edge Function sync is not active.
  */
 export async function dispatchWhatsAppNotification(
   params: SendWhatsAppParams
@@ -67,7 +67,7 @@ export async function dispatchWhatsAppNotification(
       event_type: params.eventType,
       targets: [],
       preview,
-      mode: 'demo_simulated',
+      mode: 'local',
       status: 'failed',
       error: 'Nomor WhatsApp tujuan belum diisi atau tidak valid.',
       sent_at: nowIso,
@@ -80,7 +80,7 @@ export async function dispatchWhatsAppNotification(
       event_type: params.eventType,
       targets: normalizedTargets,
       preview,
-      mode: 'demo_simulated',
+      mode: 'local',
       status: 'sent',
       sent_at: nowIso,
     };

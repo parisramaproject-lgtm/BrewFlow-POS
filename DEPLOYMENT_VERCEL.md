@@ -21,10 +21,10 @@ Aplikasi **BrewFlow POS** menggunakan **Supabase** secara penuh (Supabase Auth G
    - **Framework Preset**: `Vite`
    - **Build Command**: `npm run build`
    - **Output Directory**: `dist`
-3. Di **Vercel Project Settings → Environment Variables**, tambahkan 2 variabel Supabase Anda:
-   - `VITE_SUPABASE_URL` = `https://<PROJECT-REF>.supabase.co`
-   - `VITE_SUPABASE_ANON_KEY` = Anon Public Key dari Supabase Dashboard → Project Settings → API
-4. Klik **Deploy** (atau jalankan `vercel --prod` lewat CLI).
+3. Di **Vercel Project Settings → Environment Variables**, pastikan variabel Supabase Anda tersedia (salah satu format otomatis didukung oleh aplikasi):
+   - Jika menggunakan **Integrasi Resmi Vercel × Supabase Marketplace**, variabel `NEXT_PUBLIC_SUPABASE_URL` dan `NEXT_PUBLIC_SUPABASE_ANON_KEY` (atau `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY`) **otomatis terbaca** tanpa perlu duplikasi.
+   - Atau jika diisi manual: `VITE_SUPABASE_URL` = `https://<PROJECT-REF>.supabase.co` dan `VITE_SUPABASE_ANON_KEY` = Anon Public Key dari Supabase Dashboard → Project Settings → API.
+4. Klik **Deploy** (atau **Redeploy** di tab Deployments jika Anda baru menambahkan/menghubungkan Environment Variables, karena Vite menyematkan env var saat proses build).
 
 ## 3. Wajib Setelah Deploy: Tambahkan URL Vercel di Supabase Auth
 
