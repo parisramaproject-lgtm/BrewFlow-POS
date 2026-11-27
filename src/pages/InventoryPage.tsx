@@ -10,6 +10,7 @@ import {
   Wrench,
   X,
 } from 'lucide-react';
+import { ConfirmDialog } from '../components/common/ConfirmDialog';
 import { PeriodicExcelExport } from '../components/common/PeriodicExcelExport';
 import { InventoryItemModal } from '../components/inventory/InventoryItemModal';
 import { useAuth } from '../context/AuthContext';
@@ -55,6 +56,11 @@ export function InventoryPage({ searchQuery }: InventoryPageProps) {
   const [modalOpen, setModalOpen] = useState(false);
   const [editingItem, setEditingItem] = useState<InventoryItem | null>(null);
   const [deletingItem, setDeletingItem] = useState<InventoryItem | null>(null);
+  const [pendingItemEdit, setPendingItemEdit] = useState<{
+    id: string;
+    data: InventoryItemInput;
+  } | null>(null);
+  const [confirmBusy, setConfirmBusy] = useState(false);
   const [conditionModalAsset, setConditionModalAsset] = useState<InventoryItem | null>(null);
   const [nextCondition, setNextCondition] = useState<AssetCondition>('Baik');
   const [feedbackBanner, setFeedbackBanner] = useState<string | null>(null);
@@ -121,23 +127,17 @@ export function InventoryPage({ searchQuery }: InventoryPageProps) {
 
   const handleSaveItem = async (data: InventoryItemInput, editingId: string | null) => {
     if (editingId) {
-      await updateInventoryItem(editingId, {
-        ...data,
-        enableSupabaseSync: liveSupabaseEnabled,
-      });
-      showFeedback(
-        `Item "${data.name}" diperbarui. Kalkulasi HPP & daftar pembelian otomatis menyesuaikan.`
-      );
-    } else {
-      const created = await addInventoryItem({
-        ...data,
-        enableSupabaseSync: liveSupabaseEnabled,
-      });
-      setActiveTab(created.category_type);
-      showFeedback(
-        `Item "${created.name}" (${created.sku}) ditambahkan dan siap digunakan di resep HPP & pembelian.`
-      );
+      setPendingItemEdit({ id: editingId, data });
+      return;
     }
+    const created = await addInventoryItem({
+      ...data,
+      enableSupabaseSync: liveSupabaseEnabled,
+    });
+    setActiveTab(created.category_type);
+    showFeedback(
+      `Item "${created.name}" (${created.sku}) ditambahkan dan siap digunakan di resep HPP & pembelian.`
+    );
   };
 
   const handleConfirmDelete = async () => {
@@ -506,47 +506,69 @@ export function InventoryPage({ searchQuery }: InventoryPageProps) {
         </div>
       )}
 
-      {/* Confirm Delete Modal */}
-      {deletingItem && (
-        <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-[#1A2E26]/45 p-4 backdrop-blur-[1px]"
-          role="dialog"
-          aria-modal="true"
-          aria-label={`Konfirmasi Hapus ${deletingItem.name}`}
-        >
-          <div className="w-full max-w-md rounded-2xl border border-[#E5E7EB] bg-[#FFFFFF] p-6 shadow-xl">
-            <h2 className="text-base font-semibold text-[#1A2E26]">Hapus Item Inventori?</h2>
-            <p className="mt-2 text-xs leading-relaxed text-[#6B7280]">
-              Anda akan menghapus <strong className="text-[#1A2E26]">{deletingItem.name}</strong> (
-              {deletingItem.sku}) secara permanen dari inventori.
-            </p>
-            {menusUsingDeletingItem.length > 0 && (
-              <div className="mt-3 rounded-xl border border-[#F59E0B]/40 bg-[#FFFBEB] p-3 text-xs text-[#92400E]">
-                Perhatian: Bahan ini sedang dipakai pada resep{' '}
-                <strong>{menusUsingDeletingItem.length} menu</strong> (
-                {menusUsingDeletingItem.map((m) => m.name).join(', ')}). Menghapus item ini akan
-                otomatis melepaskannya dari resep &amp; memperbarui perhitungan HPP.
-              </div>
-            )}
-            <div className="mt-5 flex justify-end gap-2.5">
-              <button
-                type="button"
-                onClick={() => setDeletingItem(null)}
-                className="h-10 rounded-full border border-[#E5E7EB] px-4 text-xs font-semibold text-[#6B7280] hover:text-[#1A2E26]"
-              >
-                Batal
-              </button>
-              <button
-                type="button"
-                onClick={handleConfirmDelete}
-                className="h-10 rounded-full bg-[#EF4444] px-5 text-xs font-semibold text-white hover:bg-[#DC2626]"
-              >
-                Ya, Hapus Item
-              </button>
+      {/* Confirm Delete & Edit Inventory Dialogs */}
+      <ConfirmDialog
+        open={Boolean(deletingItem)}
+        variant="danger"
+        title="Hapus Item Inventori?"
+        description={
+          deletingItem && (
+            <div className="space-y-2.5">
+              <p>
+                Anda akan menghapus <strong className="text-[#1A2E26]">{deletingItem.name}</strong> (
+                {deletingItem.sku}) secara permanen dari inventori.
+              </p>
+              {menusUsingDeletingItem.length > 0 && (
+                <div className="rounded-xl border border-[#F59E0B]/40 bg-[#FFFBEB] p-3 text-xs text-[#92400E]">
+                  Perhatian: Bahan ini sedang dipakai pada resep{' '}
+                  <strong>{menusUsingDeletingItem.length} menu</strong> (
+                  {menusUsingDeletingItem.map((m) => m.name).join(', ')}). Menghapus item ini akan
+                  otomatis melepaskannya dari resep &amp; memperbarui perhitungan HPP.
+                </div>
+              )}
             </div>
-          </div>
-        </div>
-      )}
+          )
+        }
+        confirmLabel="Ya, Hapus Item"
+        cancelLabel="Batal"
+        onCancel={() => setDeletingItem(null)}
+        onConfirm={handleConfirmDelete}
+      />
+
+      <ConfirmDialog
+        open={Boolean(pendingItemEdit)}
+        variant="warning"
+        title="Konfirmasi Perubahan Item Inventori"
+        description={
+          pendingItemEdit && (
+            <span>
+              Simpan perubahan pada item{' '}
+              <strong className="text-[#1A2E26]">{pendingItemEdit.data.name}</strong>? Kalkulasi
+              HPP menu dan stok minimum akan otomatis menyesuaikan.
+            </span>
+          )
+        }
+        confirmLabel="Ya, Simpan Perubahan"
+        cancelLabel="Batal"
+        isBusy={confirmBusy}
+        onCancel={() => setPendingItemEdit(null)}
+        onConfirm={async () => {
+          if (!pendingItemEdit) return;
+          setConfirmBusy(true);
+          try {
+            await updateInventoryItem(pendingItemEdit.id, {
+              ...pendingItemEdit.data,
+              enableSupabaseSync: liveSupabaseEnabled,
+            });
+            showFeedback(
+              `Item "${pendingItemEdit.data.name}" diperbarui. Kalkulasi HPP & daftar pembelian otomatis menyesuaikan.`
+            );
+            setPendingItemEdit(null);
+          } finally {
+            setConfirmBusy(false);
+          }
+        }}
+      />
     </div>
   );
 }

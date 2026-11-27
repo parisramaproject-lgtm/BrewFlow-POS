@@ -8,6 +8,7 @@ export type PageId =
   | 'menu-hpp'
   | 'inventory'
   | 'purchasing'
+  | 'vendors'
   | 'stock-opname'
   | 'membership'
   | 'tv-display'
@@ -241,14 +242,63 @@ export interface WhatsAppLogEntry {
 
 export type ThermalPrinterConnectionType = 'browser' | 'bluetooth' | 'network' | 'usb_serial';
 
+export type OperationalNotificationType =
+  | 'opname'
+  | 'low_stock'
+  | 'owner_message'
+  | 'restock_request'
+  | 'new_order'
+  | 'purchase'
+  | 'info';
+
 export interface AppNotification {
   id: string;
-  type: 'opname' | 'low_stock' | 'info';
+  type: OperationalNotificationType;
   title: string;
   message: string;
   targetPage: PageId;
+  targetRoles?: UserRole[];
+  senderName?: string;
+  senderRole?: UserRole;
+  restockRequestId?: string;
   timestamp: string;
+  createdAt?: string;
   unread: boolean;
+}
+
+export interface VendorRecord {
+  id: string;
+  name: string;
+  contact_person: string;
+  phone: string;
+  email?: string;
+  category_type: ItemCategoryType;
+  supplied_items: string[];
+  address?: string;
+  payment_terms?: string;
+  notes?: string;
+  is_active: boolean;
+  created_at: string;
+}
+
+export type RestockRequestStatus = 'pending' | 'ordered' | 'completed';
+
+export interface RestockRequestRecord {
+  id: string;
+  inventory_item_id: string;
+  item_name: string;
+  unit: string;
+  current_stock: number;
+  requested_quantity: number;
+  urgency: 'normal' | 'urgent';
+  notes?: string;
+  requested_by_id: string;
+  requested_by_name: string;
+  requested_by_role: UserRole;
+  status: RestockRequestStatus;
+  handled_by_name?: string;
+  created_at: string;
+  updated_at: string;
 }
 
 export interface StoreSettings {

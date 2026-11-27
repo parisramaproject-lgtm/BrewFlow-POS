@@ -9,6 +9,8 @@ import {
   INITIAL_OPNAME_SCHEDULES,
   INITIAL_ORDERS,
   INITIAL_PURCHASES,
+  INITIAL_RESTOCK_REQUESTS,
+  INITIAL_VENDORS,
   INITIAL_VOUCHERS,
 } from '../data/seedData';
 import type {
@@ -29,14 +31,18 @@ import type {
   MembershipTierRule,
   MenuItem,
   OpnameFrequency,
+  OperationalNotificationType,
   OrderRecord,
   OrderStatus,
   OrderType,
+  PageId,
   PaymentMethod,
   PurchaseItemRecord,
   PurchaseRecord,
   RedeemableRewardItem,
   RedemptionLimitConfig,
+  RestockRequestRecord,
+  RestockRequestStatus,
   StockOpnameDetailItem,
   StockOpnameLog,
   StockOpnameSchedule,
@@ -45,6 +51,7 @@ import type {
   UserProfile,
   UserRole,
   UsernameLoginAuditLog,
+  VendorRecord,
   VoucherRecord,
   WhatsAppEventType,
   WhatsAppLogEntry,
@@ -91,13 +98,19 @@ import {
   buildPosReceiptPayload,
   dispatchWhatsAppNotification,
 } from '../services/whatsappService';
+import {
+  broadcastOperationalEvent,
+  subscribeOperationalBroadcast,
+} from '../services/pwaNotificationService';
 import { getAppSessionToken, supabase } from '../lib/supabase';
 import {
+  cancelOrderInSupabase,
   deleteOrderFromSupabase,
   deleteStoreVideoFromSupabase,
   deleteVoucherFromSupabase,
   hydrateAllTablesFromSupabase,
   incrementVoucherUsageInSupabase,
+  isUuid,
   persistMemberRedemptionToSupabase,
   persistMembershipProgramToSupabase,
   updateCustomerPointsInSupabase,
@@ -186,6 +199,10 @@ interface StoreContextValue {
   redemptionLogs: MemberRedemptionLog[];
   storeVideos: StoreVideoItem[];
   vouchers: VoucherRecord[];
+  vendors: VendorRecord[];
+  restockRequests: RestockRequestRecord[];
+  prefilledPurchaseVendorId: string | null;
+  setPrefilledPurchaseVendorId: (vendorId: string | null) => void;
   purchases: PurchaseRecord[];
   opnameSchedules: StockOpnameSchedule[];
   dueOpnameSchedules: StockOpnameSchedule[];
@@ -193,10 +210,40 @@ interface StoreContextValue {
   whatsappLogs: WhatsAppLogEntry[];
   usernameLoginLogs: UsernameLoginAuditLog[];
   employees: UserProfile[];
+  employeesSyncStatus: 'idle' | 'synced' | 'local_only' | 'error';
+  employeesSyncError: string | null;
   settings: StoreSettings;
   notifications: AppNotification[];
   hasDueOpname: boolean;
   lowStockItems: InventoryItem[];
+  addVendor: (input: Omit<VendorRecord, 'id' | 'created_at'>) => VendorRecord;
+  updateVendor: (vendorId: string, patch: Partial<Omit<VendorRecord, 'id' | 'created_at'>>) => void;
+  deleteVendor: (vendorId: string) => void;
+  submitRestockRequest: (input: {
+    inventory_item_id: string;
+    requested_quantity: number;
+    urgency: 'normal' | 'urgent';
+    notes?: string;
+    requested_by_id: string;
+    requested_by_name: string;
+    requested_by_role: UserRole;
+  }) => RestockRequestRecord | null;
+  updateRestockRequestStatus: (
+    requestId: string,
+    status: RestockRequestStatus,
+    handledByName: string
+  ) => void;
+  sendOperationalMessage: (input: {
+    title: string;
+    message: string;
+    type?: OperationalNotificationType;
+    targetRoles: UserRole[];
+    targetPage: PageId;
+    senderName: string;
+    senderRole: UserRole;
+  }) => AppNotification;
+  markNotificationRead: (notificationId: string) => void;
+  markAllNotificationsRead: (role: UserRole) => void;
   addVoucher: (input: Omit<VoucherRecord, 'id' | 'used_count' | 'created_at'>) => Promise<{ ok: boolean; voucher?: VoucherRecord; error?: string }>;
   addVoucherBatch: (
     codes: string[],
@@ -213,6 +260,12 @@ interface StoreContextValue {
   sendWhatsAppMessage: (input: SendWhatsAppActionInput) => Promise<WhatsAppLogEntry>;
   createOrder: (input: CreateOrderInput) => Promise<CreateOrderResult>;
   deleteDraftOrder: (orderId: string) => void;
+  cancelOrder: (input: {
+    orderId: string;
+    reason?: string;
+    cancelledByName: string;
+    cancelledByRole: UserRole;
+  }) => Promise<{ ok: boolean; error?: string }>;
   addCustomer: (input: {
     name: string;
     phone_number: string;
@@ -312,16 +365,22 @@ interface StoreContextValue {
     join_date?: string;
     emergency_contact?: string;
     notes?: string;
-  }) => Promise<void>;
-  updateEmployee: (employeeId: string, patch: Partial<UserProfile>) => void;
+  }) => Promise<{ ok: boolean; error?: string; syncedToSupabase?: boolean }>;
+  updateEmployee: (
+    employeeId: string,
+    patch: Partial<UserProfile>
+  ) => Promise<{ ok: boolean; error?: string }>;
   setEmployeeCredentials: (
     employeeId: string,
     username: string,
     password?: string
   ) => Promise<{ ok: boolean; error?: string }>;
   recordUsernameLoginLog: (entry: UsernameLoginAuditLog) => void;
-  deleteEmployee: (employeeId: string) => void;
-  updateEmployeeRole: (employeeId: string, role: UserRole) => void;
+  deleteEmployee: (employeeId: string) => Promise<{ ok: boolean; error?: string }>;
+  updateEmployeeRole: (
+    employeeId: string,
+    role: UserRole
+  ) => Promise<{ ok: boolean; error?: string }>;
   updateSettings: (
     patch: Partial<StoreSettings>,
     enableSupabaseSync?: boolean
@@ -447,6 +506,71 @@ function loadInitialVouchers(): VoucherRecord[] {
   }
 }
 
+const VENDORS_STORAGE_KEY = 'brewflow_vendors_v1';
+const RESTOCK_REQUESTS_STORAGE_KEY = 'brewflow_restock_requests_v1';
+const OPS_NOTIFICATIONS_STORAGE_KEY = 'brewflow_ops_notifications_v1';
+
+function loadInitialVendors(): VendorRecord[] {
+  try {
+    const raw = window.localStorage.getItem(VENDORS_STORAGE_KEY);
+    if (!raw) return INITIAL_VENDORS;
+    const parsed = JSON.parse(raw) as VendorRecord[];
+    return Array.isArray(parsed) && parsed.length > 0 ? parsed : INITIAL_VENDORS;
+  } catch {
+    return INITIAL_VENDORS;
+  }
+}
+
+function loadInitialRestockRequests(): RestockRequestRecord[] {
+  try {
+    const raw = window.localStorage.getItem(RESTOCK_REQUESTS_STORAGE_KEY);
+    if (!raw) return INITIAL_RESTOCK_REQUESTS;
+    const parsed = JSON.parse(raw) as RestockRequestRecord[];
+    return Array.isArray(parsed) ? parsed : INITIAL_RESTOCK_REQUESTS;
+  } catch {
+    return INITIAL_RESTOCK_REQUESTS;
+  }
+}
+
+function loadInitialOpsNotifications(): AppNotification[] {
+  try {
+    const raw = window.localStorage.getItem(OPS_NOTIFICATIONS_STORAGE_KEY);
+    if (!raw) {
+      return [
+        {
+          id: 'notif-seed-restock-matcha',
+          type: 'restock_request',
+          title: 'Permintaan Restock dari Kasir',
+          message:
+            'Dimas Pratama mengajukan restock Bubuk Uji Matcha Ceremonial (500 gr · Mendesak). Sisa stok 180 gr.',
+          targetPage: 'purchasing',
+          targetRoles: ['owner', 'manager'],
+          senderName: 'Dimas Pratama',
+          senderRole: 'cashier',
+          restockRequestId: 'req-init-matcha',
+          timestamp: 'Hari ini, 09:15',
+          createdAt: '2026-11-26T09:15:00Z',
+          unread: true,
+        },
+      ];
+    }
+    const parsed = JSON.parse(raw) as AppNotification[];
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function formatShortTimeLabel(date: Date = new Date()): string {
+  return new Intl.DateTimeFormat('id-ID', {
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  })
+    .format(date)
+    .replace(/\./g, ':');
+}
+
 export function StoreProvider({ children }: { children: React.ReactNode }) {
   const [categories, setCategories] = useState<Category[]>(INITIAL_CATEGORIES);
   const [menus, setMenus] = useState<MenuItem[]>(INITIAL_MENUS);
@@ -459,6 +583,15 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   const [redemptionLogs, setRedemptionLogs] = useState<MemberRedemptionLog[]>([]);
   const [storeVideos, setStoreVideos] = useState<StoreVideoItem[]>(loadInitialStoreVideos);
   const [vouchers, setVouchers] = useState<VoucherRecord[]>(loadInitialVouchers);
+  const [vendors, setVendors] = useState<VendorRecord[]>(loadInitialVendors);
+  const [restockRequests, setRestockRequests] = useState<RestockRequestRecord[]>(
+    loadInitialRestockRequests
+  );
+  const [prefilledPurchaseVendorId, setPrefilledPurchaseVendorId] = useState<string | null>(null);
+  const [customNotifications, setCustomNotifications] = useState<AppNotification[]>(
+    loadInitialOpsNotifications
+  );
+  const [readAutoNotifIds, setReadAutoNotifIds] = useState<Set<string>>(() => new Set());
   const [purchases, setPurchases] = useState<PurchaseRecord[]>(INITIAL_PURCHASES);
   const [opnameSchedules, setOpnameSchedules] =
     useState<StockOpnameSchedule[]>(INITIAL_OPNAME_SCHEDULES);
@@ -468,6 +601,10 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     loadInitialUsernameLoginLogs
   );
   const [employees, setEmployees] = useState<UserProfile[]>(loadInitialEmployees);
+  const [employeesSyncStatus, setEmployeesSyncStatus] = useState<
+    'idle' | 'synced' | 'local_only' | 'error'
+  >('idle');
+  const [employeesSyncError, setEmployeesSyncError] = useState<string | null>(null);
   const [settings, setSettings] = useState<StoreSettings>(loadInitialSettings);
   const [watcherNow, setWatcherNow] = useState<Date>(() => new Date());
 
@@ -478,6 +615,304 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       // Ignore storage quota errors
     }
   }, []);
+
+  const persistVendors = useCallback((next: VendorRecord[]) => {
+    try {
+      window.localStorage.setItem(VENDORS_STORAGE_KEY, JSON.stringify(next));
+    } catch {
+      // Ignore storage quota errors
+    }
+  }, []);
+
+  const persistRestockRequests = useCallback((next: RestockRequestRecord[]) => {
+    try {
+      window.localStorage.setItem(RESTOCK_REQUESTS_STORAGE_KEY, JSON.stringify(next));
+    } catch {
+      // Ignore storage quota errors
+    }
+  }, []);
+
+  const persistOpsNotifications = useCallback((next: AppNotification[]) => {
+    try {
+      window.localStorage.setItem(OPS_NOTIFICATIONS_STORAGE_KEY, JSON.stringify(next.slice(0, 60)));
+    } catch {
+      // Ignore storage quota errors
+    }
+  }, []);
+
+  const pushOperationalNotification = useCallback(
+    (notif: Omit<AppNotification, 'id' | 'timestamp' | 'createdAt' | 'unread'>): AppNotification => {
+      const now = new Date();
+      const created: AppNotification = {
+        ...notif,
+        id: `ops-notif-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        timestamp: `Hari ini, ${formatShortTimeLabel(now)}`,
+        createdAt: now.toISOString(),
+        unread: true,
+      };
+      setCustomNotifications((prev) => {
+        const next = [created, ...prev].slice(0, 60);
+        persistOpsNotifications(next);
+        return next;
+      });
+      broadcastOperationalEvent(created);
+      return created;
+    },
+    [persistOpsNotifications]
+  );
+
+  // Sync operational notifications & restock requests across tabs in real time
+  useEffect(() => {
+    const unsubscribe = subscribeOperationalBroadcast((incoming) => {
+      setCustomNotifications((prev) => {
+        if (prev.some((n) => n.id === incoming.id)) return prev;
+        return [incoming, ...prev].slice(0, 60);
+      });
+    });
+
+    const handleStorage = (event: StorageEvent) => {
+      if (event.key === OPS_NOTIFICATIONS_STORAGE_KEY && event.newValue) {
+        try {
+          const parsed = JSON.parse(event.newValue) as AppNotification[];
+          if (Array.isArray(parsed)) setCustomNotifications(parsed);
+        } catch {
+          // Ignore malformed storage payload
+        }
+      }
+      if (event.key === RESTOCK_REQUESTS_STORAGE_KEY && event.newValue) {
+        try {
+          const parsed = JSON.parse(event.newValue) as RestockRequestRecord[];
+          if (Array.isArray(parsed)) setRestockRequests(parsed);
+        } catch {
+          // Ignore malformed storage payload
+        }
+      }
+      if (event.key === VENDORS_STORAGE_KEY && event.newValue) {
+        try {
+          const parsed = JSON.parse(event.newValue) as VendorRecord[];
+          if (Array.isArray(parsed)) setVendors(parsed);
+        } catch {
+          // Ignore malformed storage payload
+        }
+      }
+    };
+
+    window.addEventListener('storage', handleStorage);
+    return () => {
+      unsubscribe();
+      window.removeEventListener('storage', handleStorage);
+    };
+  }, []);
+
+  const addVendor = useCallback(
+    (input: Omit<VendorRecord, 'id' | 'created_at'>): VendorRecord => {
+      const created: VendorRecord = {
+        ...input,
+        id: `vnd-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`,
+        name: input.name.trim(),
+        contact_person: input.contact_person.trim(),
+        phone: input.phone.trim(),
+        email: input.email?.trim() || undefined,
+        address: input.address?.trim() || undefined,
+        payment_terms: input.payment_terms?.trim() || undefined,
+        notes: input.notes?.trim() || undefined,
+        supplied_items: input.supplied_items.map((s) => s.trim()).filter(Boolean),
+        created_at: new Date().toISOString(),
+      };
+      setVendors((prev) => {
+        const next = [created, ...prev];
+        persistVendors(next);
+        return next;
+      });
+      return created;
+    },
+    [persistVendors]
+  );
+
+  const updateVendor = useCallback(
+    (vendorId: string, patch: Partial<Omit<VendorRecord, 'id' | 'created_at'>>) => {
+      setVendors((prev) => {
+        const next = prev.map((v) =>
+          v.id === vendorId
+            ? {
+                ...v,
+                ...patch,
+                name: patch.name !== undefined ? patch.name.trim() : v.name,
+                contact_person:
+                  patch.contact_person !== undefined
+                    ? patch.contact_person.trim()
+                    : v.contact_person,
+                phone: patch.phone !== undefined ? patch.phone.trim() : v.phone,
+                supplied_items:
+                  patch.supplied_items !== undefined
+                    ? patch.supplied_items.map((s) => s.trim()).filter(Boolean)
+                    : v.supplied_items,
+              }
+            : v
+        );
+        persistVendors(next);
+        return next;
+      });
+    },
+    [persistVendors]
+  );
+
+  const deleteVendor = useCallback(
+    (vendorId: string) => {
+      setVendors((prev) => {
+        const next = prev.filter((v) => v.id !== vendorId);
+        persistVendors(next);
+        return next;
+      });
+    },
+    [persistVendors]
+  );
+
+  const submitRestockRequest = useCallback(
+    (input: {
+      inventory_item_id: string;
+      requested_quantity: number;
+      urgency: 'normal' | 'urgent';
+      notes?: string;
+      requested_by_id: string;
+      requested_by_name: string;
+      requested_by_role: UserRole;
+    }): RestockRequestRecord | null => {
+      const inv = inventory.find((item) => item.id === input.inventory_item_id);
+      if (!inv) return null;
+      const nowIso = new Date().toISOString();
+      const created: RestockRequestRecord = {
+        id: `req-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`,
+        inventory_item_id: inv.id,
+        item_name: inv.name,
+        unit: inv.unit,
+        current_stock: inv.current_stock,
+        requested_quantity: Math.max(1, input.requested_quantity),
+        urgency: input.urgency,
+        notes: input.notes?.trim() || undefined,
+        requested_by_id: input.requested_by_id,
+        requested_by_name: input.requested_by_name,
+        requested_by_role: input.requested_by_role,
+        status: 'pending',
+        created_at: nowIso,
+        updated_at: nowIso,
+      };
+      setRestockRequests((prev) => {
+        const next = [created, ...prev].slice(0, 50);
+        persistRestockRequests(next);
+        return next;
+      });
+
+      const urgencyTag = input.urgency === 'urgent' ? 'Mendesak' : 'Normal';
+      pushOperationalNotification({
+        type: 'restock_request',
+        title: `Permintaan Restock (${urgencyTag})`,
+        message: `${input.requested_by_name} mengajukan pembelian ${inv.name} sejumlah ${created.requested_quantity} ${inv.unit} (sisa stok ${inv.current_stock} ${inv.unit})${created.notes ? ` · "${created.notes}"` : ''}.`,
+        targetPage: 'purchasing',
+        targetRoles: ['owner', 'manager'],
+        senderName: input.requested_by_name,
+        senderRole: input.requested_by_role,
+        restockRequestId: created.id,
+      });
+
+      return created;
+    },
+    [inventory, persistRestockRequests, pushOperationalNotification]
+  );
+
+  const updateRestockRequestStatus = useCallback(
+    (requestId: string, status: RestockRequestStatus, handledByName: string) => {
+      const target = restockRequests.find((r) => r.id === requestId);
+      setRestockRequests((prev) => {
+        const next = prev.map((r) =>
+          r.id === requestId
+            ? { ...r, status, handled_by_name: handledByName, updated_at: new Date().toISOString() }
+            : r
+        );
+        persistRestockRequests(next);
+        return next;
+      });
+      if (target) {
+        const label =
+          status === 'ordered'
+            ? 'sedang diproses pemesanan ke vendor'
+            : status === 'completed'
+              ? 'sudah selesai direstock'
+              : 'menunggu diproses';
+        pushOperationalNotification({
+          type: 'purchase',
+          title: `Update Restock: ${target.item_name}`,
+          message: `Permintaan restock ${target.item_name} (${target.requested_quantity} ${target.unit}) ${label} oleh ${handledByName}.`,
+          targetPage: 'pos',
+          targetRoles: ['cashier', 'manager', 'owner'],
+          senderName: handledByName,
+          restockRequestId: requestId,
+        });
+      }
+    },
+    [restockRequests, persistRestockRequests, pushOperationalNotification]
+  );
+
+  const sendOperationalMessage = useCallback(
+    (input: {
+      title: string;
+      message: string;
+      type?: OperationalNotificationType;
+      targetRoles: UserRole[];
+      targetPage: PageId;
+      senderName: string;
+      senderRole: UserRole;
+    }): AppNotification => {
+      return pushOperationalNotification({
+        type: input.type ?? 'owner_message',
+        title: input.title.trim() || 'Pesan dari Owner',
+        message: input.message.trim(),
+        targetPage: input.targetPage,
+        targetRoles: input.targetRoles,
+        senderName: input.senderName,
+        senderRole: input.senderRole,
+      });
+    },
+    [pushOperationalNotification]
+  );
+
+  const markNotificationRead = useCallback(
+    (notificationId: string) => {
+      if (notificationId.startsWith('notif-opname-') || notificationId.startsWith('notif-stock-')) {
+        setReadAutoNotifIds((prev) => {
+          const next = new Set(prev);
+          next.add(notificationId);
+          return next;
+        });
+        return;
+      }
+      setCustomNotifications((prev) => {
+        const next = prev.map((n) => (n.id === notificationId ? { ...n, unread: false } : n));
+        persistOpsNotifications(next);
+        return next;
+      });
+    },
+    [persistOpsNotifications]
+  );
+
+  const markAllNotificationsRead = useCallback(
+    (role: UserRole) => {
+      setReadAutoNotifIds((prev) => {
+        const next = new Set(prev);
+        for (const sch of opnameSchedules) next.add(`notif-opname-${sch.id}`);
+        for (const inv of inventory) next.add(`notif-stock-${inv.id}`);
+        return next;
+      });
+      setCustomNotifications((prev) => {
+        const next = prev.map((n) =>
+          !n.targetRoles || n.targetRoles.includes(role) ? { ...n, unread: false } : n
+        );
+        persistOpsNotifications(next);
+        return next;
+      });
+    },
+    [inventory, opnameSchedules, persistOpsNotifications]
+  );
 
   const lowStockItems = useMemo(
     () =>
@@ -495,31 +930,38 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   const hasDueOpname = dueOpnameSchedules.length > 0;
 
   const notifications = useMemo<AppNotification[]>(() => {
-    const items: AppNotification[] = [];
+    const autoItems: AppNotification[] = [];
     for (const schedule of dueOpnameSchedules) {
-      items.push({
-        id: `notif-opname-${schedule.id}`,
+      const id = `notif-opname-${schedule.id}`;
+      autoItems.push({
+        id,
         type: 'opname',
         title: 'Jadwal Stock Opname Jatuh Tempo',
         message: `${schedule.title} dijadwalkan pukul ${schedule.execution_time} WIB dan belum dikerjakan hari ini.`,
         targetPage: 'stock-opname',
+        targetRoles: ['owner', 'manager'],
         timestamp: 'Hari ini',
-        unread: true,
+        unread: !readAutoNotifIds.has(id),
       });
     }
     for (const inv of lowStockItems) {
-      items.push({
-        id: `notif-stock-${inv.id}`,
+      const id = `notif-stock-${inv.id}`;
+      const isDepleted = inv.current_stock <= 0;
+      autoItems.push({
+        id,
         type: 'low_stock',
-        title: 'Stok Menipis',
-        message: `${inv.name} tersisa ${inv.current_stock} ${inv.unit} (batas min. ${inv.min_stock_threshold} ${inv.unit}).`,
+        title: isDepleted ? `Stok Habis: ${inv.name}` : `Stok Menipis: ${inv.name}`,
+        message: isDepleted
+          ? `${inv.name} HABIS (0 ${inv.unit}). Menu terkait otomatis dikunci di Kasir sampai direstock.`
+          : `${inv.name} tersisa ${inv.current_stock} ${inv.unit} (batas min. ${inv.min_stock_threshold} ${inv.unit}).`,
         targetPage: 'inventory',
+        targetRoles: ['owner', 'manager', 'cashier'],
         timestamp: 'Otomatis',
-        unread: true,
+        unread: !readAutoNotifIds.has(id),
       });
     }
-    return items;
-  }, [dueOpnameSchedules, lowStockItems]);
+    return [...customNotifications, ...autoItems];
+  }, [customNotifications, dueOpnameSchedules, lowStockItems, readAutoNotifIds]);
 
   const sendWhatsAppMessage = useCallback(
     async (input: SendWhatsAppActionInput): Promise<WhatsAppLogEntry> => {
@@ -661,6 +1103,40 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
           const nextCustomer = updatedCustomer;
           setCustomers((prev) => prev.map((c) => (c.id === customerId ? nextCustomer : c)));
         }
+
+        // Dispatch live operational notification for Owner & Manager on incoming completed order
+        const itemsPreview = input.items
+          .slice(0, 2)
+          .map((it) => `${it.quantity}x ${it.menu.name}`)
+          .join(', ');
+        const extraItemSuffix =
+          input.items.length > 2 ? ` +${input.items.length - 2} menu lainnya` : '';
+        pushOperationalNotification({
+          type: 'new_order',
+          title: `Orderan Masuk ${newOrder.order_number}`,
+          message: `Rp ${summary.totalAmount.toLocaleString('id-ID')} (${input.paymentMethod.toUpperCase()}) · ${itemsPreview}${extraItemSuffix} · Kasir: ${input.cashier.full_name}`,
+          targetPage: 'orders',
+          targetRoles: ['owner', 'manager'],
+          senderName: input.cashier.full_name,
+          senderRole: input.cashier.role,
+        });
+
+        if (newlyLowStock.length > 0) {
+          const depletedList = newlyLowStock.filter((i) => i.current_stock <= 0);
+          const headline =
+            depletedList.length > 0
+              ? `Stok Bahan Habis (${depletedList.map((i) => i.name).join(', ')})`
+              : `Stok Menipis Setelah Transaksi`;
+          pushOperationalNotification({
+            type: 'low_stock',
+            title: headline,
+            message: newlyLowStock
+              .map((i) => `${i.name}: sisa ${i.current_stock} ${i.unit}`)
+              .join(' · '),
+            targetPage: 'inventory',
+            targetRoles: ['owner', 'manager', 'cashier'],
+          });
+        }
       }
 
       const syncStatus = await persistOrderToSupabase({
@@ -746,6 +1222,51 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     setOrders((prev) => prev.filter((o) => !(o.id === orderId && o.status === 'draft')));
     void deleteOrderFromSupabase(orderId);
   }, []);
+
+  const cancelOrder = useCallback(
+    async (input: {
+      orderId: string;
+      reason?: string;
+      cancelledByName: string;
+      cancelledByRole: UserRole;
+    }): Promise<{ ok: boolean; error?: string }> => {
+      const target = orders.find((o) => o.id === input.orderId);
+      if (!target) {
+        return { ok: false, error: 'Data pesanan tidak ditemukan.' };
+      }
+      if (target.status === 'cancelled') {
+        return { ok: true };
+      }
+      const cleanReason = (input.reason ?? '').trim();
+      const cancelTag = cleanReason
+        ? `[DIBATALKAN oleh ${input.cancelledByName}: ${cleanReason}]`
+        : `[DIBATALKAN oleh ${input.cancelledByName}]`;
+      const nextNotes = target.notes ? `${target.notes} · ${cancelTag}` : cancelTag;
+
+      setOrders((prev) =>
+        prev.map((o) =>
+          o.id === input.orderId ? { ...o, status: 'cancelled', notes: nextNotes } : o
+        )
+      );
+
+      pushOperationalNotification({
+        type: 'info',
+        title: `Pesanan ${target.order_number} Dibatalkan`,
+        message: `${input.cancelledByName} membatalkan pesanan senilai Rp ${target.total_amount.toLocaleString('id-ID')}${cleanReason ? ` · Alasan: ${cleanReason}` : ''}.`,
+        targetPage: 'orders',
+        targetRoles: ['owner', 'manager'],
+        senderName: input.cancelledByName,
+        senderRole: input.cancelledByRole,
+      });
+
+      const syncRes = await cancelOrderInSupabase(target.id, target.order_number, nextNotes);
+      if (!syncRes.synced && syncRes.error) {
+        return { ok: true, error: syncRes.error };
+      }
+      return { ok: true };
+    },
+    [orders, pushOperationalNotification]
+  );
 
   const persistProgram = useCallback((next: MembershipProgramConfig) => {
     try {
@@ -1449,9 +1970,41 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         );
       }
 
+      // Auto-complete any pending/ordered cashier restock requests covered by this purchase
+      if (touchedIds.size > 0) {
+        setRestockRequests((prev) => {
+          let changed = false;
+          const next = prev.map((req) => {
+            if (req.status !== 'completed' && touchedIds.has(req.inventory_item_id)) {
+              changed = true;
+              return {
+                ...req,
+                status: 'completed' as RestockRequestStatus,
+                handled_by_name: input.purchased_by_name,
+                updated_at: nowIso,
+              };
+            }
+            return req;
+          });
+          if (changed) {
+            persistRestockRequests(next);
+          }
+          return changed ? next : prev;
+        });
+      }
+
+      pushOperationalNotification({
+        type: 'purchase',
+        title: `Pembelian / Restock: ${record.supplier_name}`,
+        message: `${input.purchased_by_name} mencatat pembelian ${record.items.length} item senilai Rp ${totalCost.toLocaleString('id-ID')}. Stok inventori otomatis diperbarui.`,
+        targetPage: 'purchasing',
+        targetRoles: ['owner', 'manager', 'cashier'],
+        senderName: input.purchased_by_name,
+      });
+
       return { purchase: finalPurchase, syncStatus };
     },
-    [inventory]
+    [inventory, persistRestockRequests, pushOperationalNotification]
   );
 
   const submitStockOpname = useCallback(
@@ -1629,8 +2182,12 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       } = await supabase.auth.getSession();
       if (!session && !getAppSessionToken()) return;
 
-      const [hydrated, empRes] = await Promise.all([
+      const [hydrated, empRpcRes, empTableRes] = await Promise.all([
         hydrateAllTablesFromSupabase(INITIAL_SETTINGS),
+        supabase.rpc('get_all_employees_for_owner').then(
+          (res) => res,
+          () => ({ data: null, error: { message: 'RPC unavailable' } })
+        ),
         supabase.from('employees').select('*').order('created_at', { ascending: true }),
       ]);
 
@@ -1676,8 +2233,20 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         }
       }
 
-      if (!empRes.error && empRes.data && empRes.data.length > 0) {
-        const mapped: UserProfile[] = empRes.data.map((row) => {
+      // Extract employees from SECURITY DEFINER RPC first (works for both Google OAuth & Username sessions),
+      // falling back to direct table select.
+      let remoteEmployeeRows: Array<Record<string, unknown>> | null = null;
+      const rpcPayload = empRpcRes?.data as
+        | { ok?: boolean; employees?: Array<Record<string, unknown>> }
+        | null;
+      if (!empRpcRes?.error && rpcPayload?.ok && Array.isArray(rpcPayload.employees)) {
+        remoteEmployeeRows = rpcPayload.employees;
+      } else if (!empTableRes.error && Array.isArray(empTableRes.data) && empTableRes.data.length > 0) {
+        remoteEmployeeRows = empTableRes.data as Array<Record<string, unknown>>;
+      }
+
+      if (remoteEmployeeRows && remoteEmployeeRows.length > 0) {
+        const mapped: UserProfile[] = remoteEmployeeRows.map((row) => {
           const name = String(row.full_name || 'Karyawan');
           const initials = name
             .split(/\s+/)
@@ -1720,11 +2289,20 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
           persistEmployees(merged);
           return merged;
         });
+        setEmployeesSyncStatus('synced');
+        setEmployeesSyncError(null);
+      } else {
+        // Direct select returned 0 rows (commonly because RLS policy was still `TO authenticated` during a Username session)
+        setEmployeesSyncStatus('error');
+        setEmployeesSyncError(
+          empTableRes.error?.message ||
+            'Daftar karyawan belum tersinkron dari tabel Supabase employees. Jalankan ulang file SQL supabase/schema_google_oauth_employees.sql terbaru di Supabase SQL Editor.'
+        );
       }
     } catch {
       // Keep local state intact if remote tables are not yet created
     }
-  }, [persistEmployees, persistVideos]);
+  }, [persistEmployees, persistVideos, persistVouchers]);
 
   useEffect(() => {
     if (!supabase) return;
@@ -1743,19 +2321,66 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     };
   }, [refreshAllFromSupabase]);
 
-  const syncEmployeeToSupabase = useCallback(async (employee: UserProfile) => {
-    if (!supabase) return;
-    try {
-      const {
-        data: { session },
-      } = await supabase.auth.getSession();
-      if (!session && !getAppSessionToken()) return;
+  const syncEmployeeToSupabase = useCallback(
+    async (
+      employee: UserProfile,
+      previousEmail?: string
+    ): Promise<{ ok: boolean; id?: string; error?: string }> => {
+      if (!supabase) return { ok: true };
+      try {
+        const {
+          data: { session },
+        } = await supabase.auth.getSession();
+        if (!session && !getAppSessionToken()) {
+          return {
+            ok: false,
+            error: 'Sesi Supabase belum aktif. Silakan masuk ulang agar perubahan tersimpan ke database.',
+          };
+        }
 
-      await supabase.from('employees').upsert(
-        {
+        const cleanEmail = employee.email.trim().toLowerCase();
+        const cleanPrevEmail = previousEmail ? previousEmail.trim().toLowerCase() : null;
+        const cleanUsername = employee.username ? normalizeUsername(employee.username) : null;
+
+        // 1. Prefer SECURITY DEFINER RPC (works for both Google OAuth & Username sessions cleanly)
+        const rpcRes = await supabase.rpc('upsert_employee_by_owner', {
+          p_id: isUuid(employee.id) ? employee.id : null,
+          p_previous_email: cleanPrevEmail,
+          p_full_name: employee.full_name,
+          p_email: cleanEmail,
+          p_username: cleanUsername,
+          p_role: employee.role,
+          p_phone_number: employee.phone_number,
+          p_is_active: employee.is_active,
+          p_shift: employee.shift ?? 'Shift Pagi (07:00 - 15:00)',
+          p_position: employee.position ?? 'Barista & Kasir',
+          p_employment_status: employee.employment_status ?? 'Kontrak',
+          p_monthly_salary: employee.monthly_salary ?? 0,
+          p_join_date: employee.join_date || new Date().toISOString().slice(0, 10),
+          p_emergency_contact: employee.emergency_contact ?? '',
+          p_notes: employee.notes ?? '',
+        });
+
+        if (!rpcRes.error && rpcRes.data && typeof rpcRes.data === 'object') {
+          const payload = rpcRes.data as {
+            ok?: boolean;
+            error?: string;
+            employee?: { id?: string };
+          };
+          if (payload.ok) {
+            return { ok: true, id: payload.employee?.id ? String(payload.employee.id) : undefined };
+          }
+          return {
+            ok: false,
+            error: payload.error || 'Gagal menyimpan data karyawan ke Supabase.',
+          };
+        }
+
+        // 2. Fallback to direct table update / upsert (when RPC is not yet installed in SQL Editor)
+        const rowPayload = {
           full_name: employee.full_name,
-          email: employee.email.trim().toLowerCase(),
-          username: employee.username ? normalizeUsername(employee.username) : null,
+          email: cleanEmail,
+          username: cleanUsername,
           role: employee.role,
           phone_number: employee.phone_number,
           is_active: employee.is_active,
@@ -1766,26 +2391,93 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
           join_date: employee.join_date || null,
           emergency_contact: employee.emergency_contact ?? '',
           notes: employee.notes ?? '',
-        },
-        { onConflict: 'email' }
-      );
-    } catch {
-      // Safe fallback when Supabase `employees` table is not yet created
-    }
-  }, []);
+        };
 
-  const deleteEmployeeFromSupabase = useCallback(async (email: string) => {
-    if (!supabase || !email.trim()) return;
-    try {
-      const {
-        data: { session },
-      } = await supabase.auth.getSession();
-      if (!session && !getAppSessionToken()) return;
-      await supabase.from('employees').delete().ilike('email', email.trim());
-    } catch {
-      // Safe fallback
-    }
-  }, []);
+        if (isUuid(employee.id)) {
+          const { data, error } = await supabase
+            .from('employees')
+            .update(rowPayload)
+            .eq('id', employee.id)
+            .select('id')
+            .maybeSingle();
+          if (!error && data?.id) {
+            return { ok: true, id: String(data.id) };
+          }
+        } else if (cleanPrevEmail && cleanPrevEmail !== cleanEmail) {
+          const { data, error } = await supabase
+            .from('employees')
+            .update(rowPayload)
+            .ilike('email', cleanPrevEmail)
+            .select('id')
+            .maybeSingle();
+          if (!error && data?.id) {
+            return { ok: true, id: String(data.id) };
+          }
+        }
+
+        const { data, error } = await supabase
+          .from('employees')
+          .upsert(rowPayload, { onConflict: 'email' })
+          .select('id')
+          .maybeSingle();
+
+        if (error) {
+          return {
+            ok: false,
+            error: `Supabase menolak penyimpanan karyawan (${error.message}). Jalankan ulang file SQL supabase/schema_google_oauth_employees.sql terbaru di Supabase SQL Editor.`,
+          };
+        }
+        return { ok: true, id: data?.id ? String(data.id) : undefined };
+      } catch (err) {
+        return {
+          ok: false,
+          error:
+            err instanceof Error
+              ? err.message
+              : 'Gagal menyinkronkan data karyawan ke Supabase.',
+        };
+      }
+    },
+    []
+  );
+
+  const deleteEmployeeFromSupabase = useCallback(
+    async (email: string): Promise<{ ok: boolean; error?: string }> => {
+      if (!supabase || !email.trim()) return { ok: true };
+      try {
+        const {
+          data: { session },
+        } = await supabase.auth.getSession();
+        if (!session && !getAppSessionToken()) {
+          return { ok: false, error: 'Sesi Supabase belum aktif.' };
+        }
+
+        const rpcRes = await supabase.rpc('delete_employee_by_owner', {
+          p_email: email.trim().toLowerCase(),
+        });
+        if (!rpcRes.error && rpcRes.data && typeof rpcRes.data === 'object') {
+          const payload = rpcRes.data as { ok?: boolean; error?: string };
+          if (payload.ok) return { ok: true };
+          return { ok: false, error: payload.error || 'Gagal menghapus karyawan di Supabase.' };
+        }
+
+        const { error } = await supabase
+          .from('employees')
+          .delete()
+          .ilike('email', email.trim());
+        if (error) {
+          return { ok: false, error: error.message };
+        }
+        return { ok: true };
+      } catch (err) {
+        return {
+          ok: false,
+          error: err instanceof Error ? err.message : 'Gagal menghapus karyawan di Supabase.',
+        };
+      }
+    },
+    []
+  );
 
   const recordUsernameLoginLog = useCallback((entry: UsernameLoginAuditLog) => {
     setUsernameLoginLogs((prev) => {
@@ -1814,7 +2506,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       join_date?: string;
       emergency_contact?: string;
       notes?: string;
-    }) => {
+    }): Promise<{ ok: boolean; error?: string; syncedToSupabase?: boolean }> => {
       const initials = input.full_name
         .trim()
         .split(/\s+/)
@@ -1829,7 +2521,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       const created: UserProfile = {
         id: `emp-${Date.now()}`,
         full_name: input.full_name.trim(),
-        email: input.email.trim(),
+        email: input.email.trim().toLowerCase(),
         username: normalizedUser || undefined,
         has_password: Boolean(passwordHash),
         password_hash: passwordHash,
@@ -1846,23 +2538,66 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         notes: input.notes?.trim() || '',
         created_at: new Date().toISOString(),
       };
+
+      const syncRes = await syncEmployeeToSupabase(created);
+      const savedEmployee: UserProfile =
+        syncRes.ok && syncRes.id ? { ...created, id: syncRes.id } : created;
+
       setEmployees((prev) => {
-        const next = [...prev, created];
+        const next = [...prev, savedEmployee];
         persistEmployees(next);
         return next;
       });
-      await syncEmployeeToSupabase(created);
+
+      if (!syncRes.ok) {
+        return {
+          ok: false,
+          syncedToSupabase: false,
+          error:
+            syncRes.error ||
+            'Karyawan hanya tersimpan lokal dan belum masuk ke Supabase employees. Jalankan ulang SQL supabase/schema_google_oauth_employees.sql.',
+        };
+      }
+
       if (supabase && normalizedUser && trimmedPass) {
         try {
-          await supabase.rpc('set_employee_username_credentials', {
-            p_email: created.email.trim().toLowerCase(),
+          const { data, error } = await supabase.rpc('set_employee_username_credentials', {
+            p_email: savedEmployee.email.trim().toLowerCase(),
             p_username: normalizedUser,
             p_password: trimmedPass,
           });
-        } catch {
-          // Safe fallback if RPC is not yet installed
+          if (error) {
+            return {
+              ok: false,
+              syncedToSupabase: false,
+              error: `Karyawan tersimpan, tetapi gagal menyimpan kata sandi ke Supabase (${error.message}).`,
+            };
+          }
+          if (data && typeof data === 'object' && (data as { ok?: boolean }).ok === false) {
+            return {
+              ok: false,
+              syncedToSupabase: false,
+              error: String(
+                (data as { error?: string }).error ||
+                  'Karyawan tersimpan, tetapi gagal menyimpan username & kata sandi ke Supabase.'
+              ),
+            };
+          }
+        } catch (err) {
+          return {
+            ok: false,
+            syncedToSupabase: false,
+            error:
+              err instanceof Error
+                ? err.message
+                : 'Gagal menyimpan username & kata sandi ke Supabase.',
+          };
         }
       }
+
+      setEmployeesSyncStatus('synced');
+      setEmployeesSyncError(null);
+      return { ok: true, syncedToSupabase: Boolean(supabase) };
     },
     [persistEmployees, syncEmployeeToSupabase]
   );
@@ -1914,123 +2649,162 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       }
 
       const nextHash = trimmedPass ? await hashPasswordLocal(trimmedPass) : target.password_hash;
+      const updatedTarget: UserProfile = {
+        ...target,
+        username: normalizedUser,
+        password_hash: normalizedUser ? nextHash : undefined,
+        has_password: Boolean(normalizedUser && (nextHash || target.has_password)),
+      };
 
-      setEmployees((prev) => {
-        const next = prev.map((emp) => {
-          if (emp.id !== employeeId) return emp;
-          return {
-            ...emp,
-            username: normalizedUser,
-            password_hash: normalizedUser ? nextHash : undefined,
-            has_password: Boolean(normalizedUser && (nextHash || emp.has_password)),
-          };
-        });
-        persistEmployees(next);
-        return next;
-      });
-
+      // Ensure employee row exists in Supabase `public.employees` BEFORE updating password_hash via RPC
       if (supabase) {
+        const ensureRowRes = await syncEmployeeToSupabase(updatedTarget);
+        if (!ensureRowRes.ok) {
+          return {
+            ok: false,
+            error:
+              ensureRowRes.error ||
+              'Gagal menyinkronkan data karyawan ke tabel employees di Supabase.',
+          };
+        }
+        if (ensureRowRes.id) {
+          updatedTarget.id = ensureRowRes.id;
+        }
+
         try {
           const { data, error } = await supabase.rpc('set_employee_username_credentials', {
-            p_email: target.email.trim().toLowerCase(),
+            p_email: updatedTarget.email.trim().toLowerCase(),
             p_username: normalizedUser ?? '',
             p_password: trimmedPass || null,
           });
-          if (!error && data && typeof data === 'object' && (data as { ok?: boolean }).ok === false) {
+          if (error) {
             return {
               ok: false,
-              error: String((data as { error?: string }).error || 'Gagal menyimpan kredensial ke Supabase.'),
+              error: `Gagal menyimpan username & kata sandi ke Supabase (${error.message}).`,
             };
           }
-        } catch {
-          // Local PBKDF2 fallback remains updated
+          if (data && typeof data === 'object' && (data as { ok?: boolean }).ok === false) {
+            return {
+              ok: false,
+              error: String(
+                (data as { error?: string }).error || 'Gagal menyimpan kredensial ke Supabase.'
+              ),
+            };
+          }
+        } catch (err) {
+          return {
+            ok: false,
+            error:
+              err instanceof Error ? err.message : 'Gagal menyimpan kredensial ke Supabase.',
+          };
         }
       }
 
-      return { ok: true };
-    },
-    [employees, persistEmployees]
-  );
-
-  const updateEmployee = useCallback(
-    (employeeId: string, patch: Partial<UserProfile>) => {
-      let updatedRecord: UserProfile | null = null;
       setEmployees((prev) => {
-        const next = prev.map((emp) => {
-          if (emp.id !== employeeId) return emp;
-          const nextName =
-            patch.full_name !== undefined ? patch.full_name.trim() || emp.full_name : emp.full_name;
-          const nextInitials =
-            patch.full_name !== undefined
-              ? nextName
-                  .split(/\s+/)
-                  .map((p) => p[0])
-                  .join('')
-                  .slice(0, 2)
-                  .toUpperCase() || emp.avatar_initials
-              : emp.avatar_initials;
-          updatedRecord = {
-            ...emp,
-            ...patch,
-            full_name: nextName,
-            avatar_initials: nextInitials,
-            email: patch.email !== undefined ? patch.email.trim() : emp.email,
-            phone_number:
-              patch.phone_number !== undefined ? patch.phone_number.trim() : emp.phone_number,
-            shift: patch.shift !== undefined ? patch.shift.trim() : emp.shift,
-            position: patch.position !== undefined ? patch.position.trim() : emp.position,
-            emergency_contact:
-              patch.emergency_contact !== undefined
-                ? patch.emergency_contact.trim()
-                : emp.emergency_contact,
-            notes: patch.notes !== undefined ? patch.notes.trim() : emp.notes,
-          };
-          return updatedRecord;
-        });
+        const next = prev.map((emp) => (emp.id === employeeId ? updatedTarget : emp));
         persistEmployees(next);
         return next;
       });
-      if (updatedRecord) {
-        void syncEmployeeToSupabase(updatedRecord);
-      }
+
+      return { ok: true };
     },
-    [persistEmployees, syncEmployeeToSupabase]
+    [employees, persistEmployees, syncEmployeeToSupabase]
+  );
+
+  const updateEmployee = useCallback(
+    async (
+      employeeId: string,
+      patch: Partial<UserProfile>
+    ): Promise<{ ok: boolean; error?: string }> => {
+      const existing = employees.find((emp) => emp.id === employeeId);
+      if (!existing) {
+        return { ok: false, error: 'Data karyawan tidak ditemukan.' };
+      }
+
+      const previousEmail = existing.email;
+      const nextName =
+        patch.full_name !== undefined
+          ? patch.full_name.trim() || existing.full_name
+          : existing.full_name;
+      const nextInitials =
+        patch.full_name !== undefined
+          ? nextName
+              .split(/\s+/)
+              .map((p) => p[0])
+              .join('')
+              .slice(0, 2)
+              .toUpperCase() || existing.avatar_initials
+          : existing.avatar_initials;
+
+      const updatedRecord: UserProfile = {
+        ...existing,
+        ...patch,
+        full_name: nextName,
+        avatar_initials: nextInitials,
+        email: patch.email !== undefined ? patch.email.trim().toLowerCase() : existing.email,
+        phone_number:
+          patch.phone_number !== undefined ? patch.phone_number.trim() : existing.phone_number,
+        shift: patch.shift !== undefined ? patch.shift.trim() : existing.shift,
+        position: patch.position !== undefined ? patch.position.trim() : existing.position,
+        emergency_contact:
+          patch.emergency_contact !== undefined
+            ? patch.emergency_contact.trim()
+            : existing.emergency_contact,
+        notes: patch.notes !== undefined ? patch.notes.trim() : existing.notes,
+      };
+
+      setEmployees((prev) => {
+        const next = prev.map((emp) => (emp.id === employeeId ? updatedRecord : emp));
+        persistEmployees(next);
+        return next;
+      });
+
+      const syncRes = await syncEmployeeToSupabase(updatedRecord, previousEmail);
+      if (syncRes.ok && syncRes.id && syncRes.id !== updatedRecord.id) {
+        setEmployees((prev) => {
+          const next = prev.map((emp) =>
+            emp.id === employeeId ? { ...emp, id: syncRes.id! } : emp
+          );
+          persistEmployees(next);
+          return next;
+        });
+      }
+      return { ok: syncRes.ok, error: syncRes.error };
+    },
+    [employees, persistEmployees, syncEmployeeToSupabase]
   );
 
   const deleteEmployee = useCallback(
-    (employeeId: string) => {
-      let removedEmail = '';
+    async (employeeId: string): Promise<{ ok: boolean; error?: string }> => {
+      const target = employees.find((emp) => emp.id === employeeId);
+      const removedEmail = target?.email ?? '';
       setEmployees((prev) => {
-        const target = prev.find((emp) => emp.id === employeeId);
-        removedEmail = target?.email ?? '';
         const next = prev.filter((emp) => emp.id !== employeeId);
         persistEmployees(next);
         return next;
       });
       if (removedEmail) {
-        void deleteEmployeeFromSupabase(removedEmail);
+        return deleteEmployeeFromSupabase(removedEmail);
       }
+      return { ok: true };
     },
-    [persistEmployees, deleteEmployeeFromSupabase]
+    [employees, persistEmployees, deleteEmployeeFromSupabase]
   );
 
   const updateEmployeeRole = useCallback(
-    (employeeId: string, role: UserRole) => {
-      let updatedRecord: UserProfile | null = null;
+    async (employeeId: string, role: UserRole): Promise<{ ok: boolean; error?: string }> => {
+      const existing = employees.find((emp) => emp.id === employeeId);
+      if (!existing) return { ok: false, error: 'Data karyawan tidak ditemukan.' };
+      const updatedRecord: UserProfile = { ...existing, role };
       setEmployees((prev) => {
-        const next = prev.map((emp) => {
-          if (emp.id !== employeeId) return emp;
-          updatedRecord = { ...emp, role };
-          return updatedRecord;
-        });
+        const next = prev.map((emp) => (emp.id === employeeId ? updatedRecord : emp));
         persistEmployees(next);
         return next;
       });
-      if (updatedRecord) {
-        void syncEmployeeToSupabase(updatedRecord);
-      }
+      const syncRes = await syncEmployeeToSupabase(updatedRecord, existing.email);
+      return { ok: syncRes.ok, error: syncRes.error };
     },
-    [persistEmployees, syncEmployeeToSupabase]
+    [employees, persistEmployees, syncEmployeeToSupabase]
   );
 
   const updateSettings = useCallback(
@@ -2219,6 +2993,10 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       redemptionLogs,
       storeVideos,
       vouchers,
+      vendors,
+      restockRequests,
+      prefilledPurchaseVendorId,
+      setPrefilledPurchaseVendorId,
       purchases,
       opnameSchedules,
       dueOpnameSchedules,
@@ -2226,10 +3004,20 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       whatsappLogs,
       usernameLoginLogs,
       employees,
+      employeesSyncStatus,
+      employeesSyncError,
       settings,
       notifications,
       hasDueOpname,
       lowStockItems,
+      addVendor,
+      updateVendor,
+      deleteVendor,
+      submitRestockRequest,
+      updateRestockRequestStatus,
+      sendOperationalMessage,
+      markNotificationRead,
+      markAllNotificationsRead,
       addVoucher,
       addVoucherBatch,
       updateVoucher,
@@ -2240,6 +3028,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       sendWhatsAppMessage,
       createOrder,
       deleteDraftOrder,
+      cancelOrder,
       addCustomer,
       adjustCustomerPoints,
       updateMembershipLimits,
@@ -2288,6 +3077,9 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       redemptionLogs,
       storeVideos,
       vouchers,
+      vendors,
+      restockRequests,
+      prefilledPurchaseVendorId,
       purchases,
       opnameSchedules,
       dueOpnameSchedules,
@@ -2295,10 +3087,20 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       whatsappLogs,
       usernameLoginLogs,
       employees,
+      employeesSyncStatus,
+      employeesSyncError,
       settings,
       notifications,
       hasDueOpname,
       lowStockItems,
+      addVendor,
+      updateVendor,
+      deleteVendor,
+      submitRestockRequest,
+      updateRestockRequestStatus,
+      sendOperationalMessage,
+      markNotificationRead,
+      markAllNotificationsRead,
       addVoucher,
       addVoucherBatch,
       updateVoucher,
@@ -2309,6 +3111,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       sendWhatsAppMessage,
       createOrder,
       deleteDraftOrder,
+      cancelOrder,
       addCustomer,
       adjustCustomerPoints,
       updateMembershipLimits,

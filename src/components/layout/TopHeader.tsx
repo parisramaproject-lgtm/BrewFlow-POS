@@ -1,9 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import {
-  AlertTriangle,
   Bell,
   Calendar,
-  ClipboardCheck,
   Clock,
   Menu,
   PanelLeftClose,
@@ -14,7 +12,10 @@ import {
 import { useAuth } from '../../context/AuthContext';
 import { useStore } from '../../context/StoreContext';
 import type { PageId } from '../../types';
-import { canAccessPage, getRoleDisplayLabel } from '../../utils/rbac';
+import { countUnreadForRole } from '../../utils/operationalNotifications';
+import { getRoleDisplayLabel } from '../../utils/rbac';
+import { PWAInstallButton } from '../common/PWAInstallButton';
+import { NotificationCenterDropdown } from './NotificationCenterDropdown';
 
 interface TopHeaderProps {
   searchQuery: string;
@@ -65,7 +66,7 @@ export function TopHeader({
 
   if (!user) return null;
 
-  const visibleNotifications = notifications.filter((n) => canAccessPage(user.role, n.targetPage));
+  const unreadCount = countUnreadForRole(notifications, user.role);
   const roleLabel = getRoleDisplayLabel(user.role);
 
   const formattedDate = new Intl.DateTimeFormat('id-ID', {
@@ -139,8 +140,10 @@ export function TopHeader({
         </div>
       </div>
 
-      {/* Right: Live Date & Clock + Notification Bell + User Profile */}
-      <div className="flex shrink-0 items-center gap-2.5 sm:gap-3">
+      {/* Right: PWA Install + Live Date & Clock + Notification Bell + User Profile */}
+      <div className="flex shrink-0 items-center gap-2 sm:gap-2.5">
+        <PWAInstallButton />
+
         {/* Live Date & Clock */}
         <div
           data-testid="topbar-datetime"
@@ -162,72 +165,28 @@ export function TopHeader({
         <div className="relative" ref={dropdownRef}>
           <button
             type="button"
+            data-testid="header-notification-bell"
             onClick={() => setNotifOpen((prev) => !prev)}
-            aria-label={`Notifikasi (${visibleNotifications.length} aktif)`}
+            aria-label={`Notifikasi (${unreadCount} belum dibaca)`}
             aria-expanded={notifOpen}
             className="relative flex h-10 w-10 items-center justify-center rounded-full border border-[#E5E7EB] bg-[#FFFFFF] text-[#1A2E26] transition-colors hover:border-[#109A58] hover:text-[#109A58] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#109A58]"
           >
             <Bell className="h-[18px] w-[18px]" />
-            {visibleNotifications.length > 0 && (
-              <span className="absolute -right-0.5 -top-0.5 flex h-4 min-w-4 items-center justify-center rounded-full bg-[#EF4444] px-1 text-[10px] font-bold text-white tabular-nums">
-                {visibleNotifications.length}
+            {unreadCount > 0 && (
+              <span
+                data-testid="header-notification-badge"
+                className="absolute -right-0.5 -top-0.5 flex h-4 min-w-4 items-center justify-center rounded-full bg-[#EF4444] px-1 text-[10px] font-bold text-white tabular-nums"
+              >
+                {unreadCount}
               </span>
             )}
           </button>
 
           {notifOpen && (
-            <div
-              role="region"
-              aria-label="Daftar Notifikasi"
-              className="absolute right-0 top-12 z-40 w-80 rounded-2xl border border-[#E5E7EB] bg-[#FFFFFF] p-2 shadow-lg sm:w-96"
-            >
-              <div className="flex items-center justify-between border-b border-[#E5E7EB] px-3 py-2">
-                <h3 className="text-sm font-semibold text-[#1A2E26]">Notifikasi Operasional</h3>
-                <span className="text-xs text-[#6B7280] tabular-nums">
-                  {visibleNotifications.length} aktif
-                </span>
-              </div>
-
-              {visibleNotifications.length === 0 ? (
-                <div className="px-4 py-8 text-center text-sm text-[#6B7280]">
-                  Semua stok dan jadwal opname dalam kondisi aman.
-                </div>
-              ) : (
-                <div className="max-h-72 divide-y divide-[#E5E7EB] overflow-y-auto">
-                  {visibleNotifications.map((notif) => (
-                    <button
-                      key={notif.id}
-                      type="button"
-                      onClick={() => {
-                        onNavigate(notif.targetPage);
-                        setNotifOpen(false);
-                      }}
-                      className="flex w-full items-start gap-3 px-3 py-3 text-left transition-colors hover:bg-[#F4F6F5]"
-                    >
-                      <div
-                        className={`mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-lg ${
-                          notif.type === 'opname'
-                            ? 'bg-[#FEF2F2] text-[#EF4444]'
-                            : 'bg-[#FFFBEB] text-[#F59E0B]'
-                        }`}
-                      >
-                        {notif.type === 'opname' ? (
-                          <ClipboardCheck className="h-4 w-4" />
-                        ) : (
-                          <AlertTriangle className="h-4 w-4" />
-                        )}
-                      </div>
-                      <div className="min-w-0 flex-1">
-                        <p className="text-xs font-semibold text-[#1A2E26]">{notif.title}</p>
-                        <p className="mt-0.5 text-xs leading-relaxed text-[#6B7280]">
-                          {notif.message}
-                        </p>
-                      </div>
-                    </button>
-                  ))}
-                </div>
-              )}
-            </div>
+            <NotificationCenterDropdown
+              onNavigate={onNavigate}
+              onClose={() => setNotifOpen(false)}
+            />
           )}
         </div>
 

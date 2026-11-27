@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { NotificationWatcher } from '../common/NotificationWatcher';
+import { OfflineIndicator } from '../common/OfflineIndicator';
 import { Sidebar } from './Sidebar';
 import { TopHeader } from './TopHeader';
 import type { PageId } from '../../types';
@@ -49,6 +50,7 @@ export function AppLayout({
   return (
     <div className="flex h-screen w-full overflow-hidden bg-[#F4F6F5] text-[#1A2E26]">
       <NotificationWatcher />
+      <OfflineIndicator />
 
       {/* Column 1: Left Navigation Sidebar (220px, hideable on desktop + drawer on tablet/mobile) */}
       <Sidebar

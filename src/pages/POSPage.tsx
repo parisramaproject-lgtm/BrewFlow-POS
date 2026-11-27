@@ -1,5 +1,6 @@
 import React, { useMemo, useState } from 'react';
 import {
+  AlertTriangle,
   CheckCircle2,
   Clock,
   Coffee,
@@ -8,6 +9,7 @@ import {
   FileClock,
   LayoutGrid,
   Minus,
+  PackagePlus,
   Pencil,
   Plus,
   ShoppingBag,
@@ -17,6 +19,7 @@ import {
   Utensils,
   X,
 } from 'lucide-react';
+import { ConfirmDialog } from '../components/common/ConfirmDialog';
 import { ProductVisual } from '../components/common/ProductVisual';
 import { MemberModal } from '../components/pos/MemberModal';
 import { PaymentModal } from '../components/pos/PaymentModal';
@@ -33,6 +36,10 @@ import type {
   VoucherRecord,
 } from '../types';
 import { formatRupiah } from '../utils/format';
+import {
+  evaluateMenuStockAvailability,
+  formatMissingIngredientsLabel,
+} from '../utils/menuStockAvailability';
 import { calculateCartSummary } from '../utils/posCalculations';
 import {
   evaluateVoucherOnCart,
@@ -64,13 +71,16 @@ export function POSPage({ searchQuery }: POSPageProps) {
   const {
     categories,
     menus,
+    inventory,
     customers,
     orders,
     vouchers,
     settings,
     membershipProgram,
     createOrder,
+    deleteDraftOrder,
     addCustomer,
+    submitRestockRequest,
   } = useStore();
   const liveSupabaseEnabled = authMode === 'supabase';
 
@@ -93,6 +103,8 @@ export function POSPage({ searchQuery }: POSPageProps) {
   const [paymentModalOpen, setPaymentModalOpen] = useState(false);
   const [memberModalOpen, setMemberModalOpen] = useState(false);
   const [draftsDrawerOpen, setDraftsDrawerOpen] = useState(false);
+  const [confirmClearCartOpen, setConfirmClearCartOpen] = useState(false);
+  const [deletingDraftOrder, setDeletingDraftOrder] = useState<OrderRecord | null>(null);
   const [feedbackBanner, setFeedbackBanner] = useState<string | null>(null);
 
   const filteredMenus = useMemo(() => {
@@ -156,7 +168,35 @@ export function POSPage({ searchQuery }: POSPageProps) {
     [orders.length]
   );
 
+  const menuAvailabilityMap = useMemo(() => {
+    const map = new Map<string, ReturnType<typeof evaluateMenuStockAvailability>>();
+    for (const menu of menus) {
+      map.set(menu.id, evaluateMenuStockAvailability(menu, inventory, cart));
+    }
+    return map;
+  }, [menus, inventory, cart]);
+
+  const outOfStockMenuCount = useMemo(
+    () => filteredMenus.filter((m) => menuAvailabilityMap.get(m.id)?.isOutOfStock).length,
+    [filteredMenus, menuAvailabilityMap]
+  );
+
   const handleAddToCart = (menu: MenuItem) => {
+    const availability = evaluateMenuStockAvailability(menu, inventory, cart);
+    if (availability.isOutOfStock) {
+      setFeedbackBanner(
+        `"${menu.name}" tidak dapat dipesan karena ${formatMissingIngredientsLabel(availability.missingIngredients).toLowerCase()}.`
+      );
+      window.setTimeout(() => setFeedbackBanner(null), 4500);
+      return;
+    }
+    if (!availability.canAddOneMore) {
+      setFeedbackBanner(
+        `Jumlah "${menu.name}" sudah mencapai batas maksimum stok bahan baku yang tersedia.`
+      );
+      window.setTimeout(() => setFeedbackBanner(null), 4000);
+      return;
+    }
     setCart((prev) => {
       const existing = prev.find((item) => item.menu.id === menu.id);
       if (existing) {
@@ -168,7 +208,45 @@ export function POSPage({ searchQuery }: POSPageProps) {
     });
   };
 
+  const handleQuickRequestRestock = (menu: MenuItem) => {
+    if (!user) return;
+    const availability = menuAvailabilityMap.get(menu.id);
+    const firstMissing = availability?.missingIngredients[0];
+    if (!firstMissing) return;
+    const invItem = inventory.find((i) => i.id === firstMissing.inventory_item_id);
+    const suggestedQty = Math.max(
+      invItem ? invItem.min_stock_threshold * 2 : 10,
+      firstMissing.needed_per_serving * 10
+    );
+    submitRestockRequest({
+      inventory_item_id: firstMissing.inventory_item_id,
+      requested_quantity: Math.round(suggestedQty),
+      urgency: 'urgent',
+      notes: `Bahan habis di Kasir POS (memblokir menu ${menu.name}).`,
+      requested_by_id: user.id,
+      requested_by_name: user.full_name,
+      requested_by_role: user.role,
+    });
+    setFeedbackBanner(
+      `Notifikasi permintaan restock "${firstMissing.name}" berhasil dikirim ke Owner & Manager.`
+    );
+    window.setTimeout(() => setFeedbackBanner(null), 5000);
+  };
+
   const handleUpdateQty = (menuId: string, delta: number) => {
+    if (delta > 0) {
+      const targetMenu = menus.find((m) => m.id === menuId);
+      if (targetMenu) {
+        const availability = evaluateMenuStockAvailability(targetMenu, inventory, cart);
+        if (!availability.canAddOneMore) {
+          setFeedbackBanner(
+            `Stok bahan untuk "${targetMenu.name}" tidak mencukupi untuk menambah porsi lagi.`
+          );
+          window.setTimeout(() => setFeedbackBanner(null), 4000);
+          return;
+        }
+      }
+    }
     setCart((prev) =>
       prev
         .map((item) =>
@@ -343,11 +421,20 @@ export function POSPage({ searchQuery }: POSPageProps) {
 
         {/* Horizontal Category Strip */}
         <div className="mb-5">
-          <div className="flex items-center justify-between">
+          <div className="flex flex-wrap items-center justify-between gap-2">
             <h1 className="text-xl font-semibold text-[#1A2E26]">Kategori Menu</h1>
-            <span className="text-xs text-[#6B7280] tabular-nums">
-              {filteredMenus.length} menu tersedia
-            </span>
+            <div className="flex items-center gap-2 text-xs tabular-nums">
+              <span className="text-[#6B7280]">{filteredMenus.length} menu tampil</span>
+              {outOfStockMenuCount > 0 && (
+                <span
+                  data-testid="pos-outofstock-summary"
+                  className="inline-flex items-center gap-1 rounded-full border border-[#EF4444]/30 bg-[#FEF2F2] px-2.5 py-0.5 text-[11px] font-semibold text-[#DC2626]"
+                >
+                  <AlertTriangle className="h-3 w-3" />
+                  <span>{outOfStockMenuCount} bahan habis</span>
+                </span>
+              )}
+            </div>
           </div>
 
           <div
@@ -392,17 +479,43 @@ export function POSPage({ searchQuery }: POSPageProps) {
           <div className="grid grid-cols-2 gap-3.5 md:grid-cols-[repeat(auto-fill,minmax(168px,1fr))] lg:gap-4">
             {filteredMenus.map((menu) => {
               const inCartQty = cart.find((item) => item.menu.id === menu.id)?.quantity ?? 0;
+              const availability =
+                menuAvailabilityMap.get(menu.id) ??
+                evaluateMenuStockAvailability(menu, inventory, cart);
+              const isBlocked = availability.isOutOfStock;
+              const isCartFull = !isBlocked && !availability.canAddOneMore;
+
               return (
                 <article
                   key={menu.id}
-                  className="flex flex-col items-center rounded-2xl border border-[#E5E7EB] bg-[#FFFFFF] p-4 text-center shadow-xs transition-colors hover:border-[#109A58]/40"
+                  data-testid={`pos-menu-card-${menu.id}`}
+                  data-stock-status={isBlocked ? 'out-of-stock' : 'available'}
+                  className={`flex flex-col items-center rounded-2xl border p-4 text-center shadow-xs transition-colors ${
+                    isBlocked
+                      ? 'border-[#FCA5A5] bg-[#FEF2F2]/40'
+                      : 'border-[#E5E7EB] bg-[#FFFFFF] hover:border-[#109A58]/40'
+                  }`}
                 >
                   <div className="relative flex justify-center pt-1">
-                    <ProductVisual
-                      tone={menu.visual_tone}
-                      name={menu.name}
-                      imageUrl={menu.image_url}
-                    />
+                    <div className={isBlocked ? 'opacity-50 grayscale' : ''}>
+                      <ProductVisual
+                        tone={menu.visual_tone}
+                        name={menu.name}
+                        imageUrl={menu.image_url}
+                      />
+                    </div>
+                    {isBlocked ? (
+                      <span
+                        data-testid={`pos-menu-oos-badge-${menu.id}`}
+                        className="absolute -bottom-1.5 left-1/2 -translate-x-1/2 whitespace-nowrap rounded-full bg-[#DC2626] px-2.5 py-0.5 text-[10px] font-bold text-white shadow-xs"
+                      >
+                        Bahan Habis
+                      </span>
+                    ) : availability.isLowServings ? (
+                      <span className="absolute -bottom-1.5 left-1/2 -translate-x-1/2 whitespace-nowrap rounded-full bg-[#D97706] px-2 py-0.5 text-[10px] font-bold text-white shadow-xs tabular-nums">
+                        Sisa {availability.maxServingsFromStock} porsi
+                      </span>
+                    ) : null}
                     {inCartQty > 0 && (
                       <span
                         aria-label={`${inCartQty} di keranjang`}
@@ -413,23 +526,79 @@ export function POSPage({ searchQuery }: POSPageProps) {
                     )}
                   </div>
 
-                  <h2 className="mt-3.5 line-clamp-2 min-h-[2.5rem] text-sm font-medium leading-snug text-[#1A2E26]">
+                  <h2
+                    className={`mt-3.5 line-clamp-2 min-h-[2.5rem] text-sm font-medium leading-snug ${
+                      isBlocked ? 'text-[#6B7280]' : 'text-[#1A2E26]'
+                    }`}
+                  >
                     {menu.name}
                   </h2>
 
-                  <p className="mt-1 text-sm font-bold text-[#1A2E26] tabular-nums">
+                  <p
+                    className={`mt-1 text-sm font-bold tabular-nums ${
+                      isBlocked ? 'text-[#9CA3AF] line-through' : 'text-[#1A2E26]'
+                    }`}
+                  >
                     {formatRupiah(menu.selling_price)}
                   </p>
 
-                  <button
-                    type="button"
-                    onClick={() => handleAddToCart(menu)}
-                    aria-label={`Tambah ${menu.name} ke pesanan`}
-                    className="mt-4 flex h-9 w-full items-center justify-center gap-1.5 rounded-full bg-[#109A58] px-4 text-xs font-semibold text-white transition-colors hover:bg-[#0D8A4E] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#109A58]"
-                  >
-                    <Plus className="h-3.5 w-3.5" />
-                    <span className="whitespace-nowrap">Tambah</span>
-                  </button>
+                  {isBlocked && (
+                    <p
+                      data-testid={`pos-menu-oos-note-${menu.id}`}
+                      className="mt-1.5 line-clamp-2 rounded-lg bg-[#FEF2F2] px-2 py-1 text-[10.5px] font-semibold leading-snug text-[#B91C1C]"
+                    >
+                      {formatMissingIngredientsLabel(availability.missingIngredients)}
+                    </p>
+                  )}
+
+                  {isCartFull && (
+                    <p className="mt-1.5 rounded-lg bg-[#FFFBEB] px-2 py-1 text-[10.5px] font-semibold text-[#B45309]">
+                      Maks. stok bahan ({availability.maxServingsFromStock} porsi)
+                    </p>
+                  )}
+
+                  <div className="mt-auto w-full pt-3 space-y-1.5">
+                    <button
+                      type="button"
+                      disabled={isBlocked || isCartFull}
+                      onClick={() => handleAddToCart(menu)}
+                      aria-label={
+                        isBlocked
+                          ? `${menu.name} tidak bisa dipesan karena bahan baku habis`
+                          : `Tambah ${menu.name} ke pesanan`
+                      }
+                      className={`flex h-9 w-full items-center justify-center gap-1.5 rounded-full px-4 text-xs font-semibold transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#109A58] ${
+                        isBlocked
+                          ? 'cursor-not-allowed bg-[#E5E7EB] text-[#6B7280]'
+                          : isCartFull
+                            ? 'cursor-not-allowed bg-[#FEF3C7] text-[#92400E]'
+                            : 'bg-[#109A58] text-white hover:bg-[#0D8A4E]'
+                      }`}
+                    >
+                      {isBlocked ? (
+                        <span className="whitespace-nowrap">Tidak Bisa Dipesan</span>
+                      ) : isCartFull ? (
+                        <span className="whitespace-nowrap">Stok Maksimal</span>
+                      ) : (
+                        <>
+                          <Plus className="h-3.5 w-3.5" />
+                          <span className="whitespace-nowrap">Tambah</span>
+                        </>
+                      )}
+                    </button>
+
+                    {isBlocked && (
+                      <button
+                        type="button"
+                        data-testid={`pos-request-restock-${menu.id}`}
+                        onClick={() => handleQuickRequestRestock(menu)}
+                        className="flex h-7 w-full items-center justify-center gap-1 rounded-full border border-[#F59E0B]/40 bg-[#FFFBEB] px-3 text-[11px] font-semibold text-[#B45309] transition-colors hover:bg-[#FEF3C7]"
+                      >
+                        <PackagePlus className="h-3 w-3 shrink-0" />
+                        <span className="whitespace-nowrap">Ajukan Restock</span>
+                      </button>
+                    )}
+                  </div>
                 </article>
               );
             })}
@@ -452,6 +621,18 @@ export function POSPage({ searchQuery }: POSPageProps) {
               </p>
             </div>
             <div className="flex items-center gap-1.5">
+              {cart.length > 0 && (
+                <button
+                  type="button"
+                  data-testid="pos-clear-cart-button"
+                  onClick={() => setConfirmClearCartOpen(true)}
+                  aria-label="Batalkan dan kosongkan keranjang"
+                  title="Batalkan / Kosongkan keranjang"
+                  className="flex h-8 w-8 items-center justify-center rounded-full border border-[#FCA5A5] bg-[#FEF2F2] text-[#DC2626] transition-colors hover:bg-[#FEE2E2]"
+                >
+                  <Trash2 className="h-3.5 w-3.5" />
+                </button>
+              )}
               {savedDrafts.length > 0 && (
                 <button
                   type="button"
@@ -495,22 +676,36 @@ export function POSPage({ searchQuery }: POSPageProps) {
               </div>
               <div className="space-y-1.5">
                 {savedDrafts.map((draft) => (
-                  <button
+                  <div
                     key={draft.id}
-                    type="button"
-                    onClick={() => handleLoadDraft(draft)}
-                    className="flex w-full items-center justify-between rounded-lg bg-[#FFFFFF] px-3 py-2 text-left text-xs hover:bg-[#E6F5EE]/60"
+                    className="flex items-center gap-1.5 rounded-lg bg-[#FFFFFF] px-2.5 py-2 hover:bg-[#E6F5EE]/50"
                   >
-                    <div>
-                      <p className="font-mono font-semibold text-[#1A2E26]">{draft.order_number}</p>
-                      <p className="text-[11px] text-[#6B7280]">
-                        {draft.table_number} · {draft.items.length} menu
-                      </p>
-                    </div>
-                    <span className="font-bold text-[#109A58] tabular-nums">
-                      {formatRupiah(draft.total_amount)}
-                    </span>
-                  </button>
+                    <button
+                      type="button"
+                      onClick={() => handleLoadDraft(draft)}
+                      className="flex min-w-0 flex-1 items-center justify-between text-left text-xs"
+                    >
+                      <div className="min-w-0">
+                        <p className="truncate font-mono font-semibold text-[#1A2E26]">
+                          {draft.order_number}
+                        </p>
+                        <p className="text-[11px] text-[#6B7280]">
+                          {draft.table_number} · {draft.items.length} menu
+                        </p>
+                      </div>
+                      <span className="ml-2 shrink-0 font-bold text-[#109A58] tabular-nums">
+                        {formatRupiah(draft.total_amount)}
+                      </span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setDeletingDraftOrder(draft)}
+                      aria-label={`Hapus draft ${draft.order_number}`}
+                      className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg text-[#6B7280] hover:bg-[#FEF2F2] hover:text-[#EF4444]"
+                    >
+                      <Trash2 className="h-3.5 w-3.5" />
+                    </button>
+                  </div>
                 ))}
               </div>
             </div>
@@ -656,9 +851,10 @@ export function POSPage({ searchQuery }: POSPageProps) {
                       </span>
                       <button
                         type="button"
+                        disabled={!menuAvailabilityMap.get(item.menu.id)?.canAddOneMore}
                         onClick={() => handleUpdateQty(item.menu.id, 1)}
                         aria-label={`Tambah jumlah ${item.menu.name}`}
-                        className="flex h-6 w-6 items-center justify-center rounded-full bg-[#109A58] text-white hover:bg-[#0D8A4E]"
+                        className="flex h-6 w-6 items-center justify-center rounded-full bg-[#109A58] text-white hover:bg-[#0D8A4E] disabled:cursor-not-allowed disabled:bg-[#D1D5DB]"
                       >
                         <Plus className="h-3 w-3" />
                       </button>
@@ -919,6 +1115,63 @@ export function POSPage({ searchQuery }: POSPageProps) {
         settings={settings}
         onClose={() => setPaymentModalOpen(false)}
         onConfirm={handleConfirmPayment}
+      />
+
+      <ConfirmDialog
+        open={confirmClearCartOpen}
+        variant="danger"
+        title="Batalkan Pesanan di Keranjang?"
+        description={
+          <span>
+            Seluruh <strong>{summary.itemCount} item</strong> pada keranjang aktif senilai{' '}
+            <strong className="text-[#1A2E26]">{formatRupiah(summary.totalAmount)}</strong> akan
+            dihapus dan pesanan dibatalkan.
+          </span>
+        }
+        confirmLabel="Ya, Batalkan Pesanan"
+        cancelLabel="Kembali"
+        onCancel={() => setConfirmClearCartOpen(false)}
+        onConfirm={() => {
+          setCart([]);
+          setOrderNote('');
+          setSelectedCustomer(null);
+          setAppliedVoucherId(null);
+          setVoucherInput('');
+          setVoucherError(null);
+          setActiveDraftId(null);
+          setConfirmClearCartOpen(false);
+          setFeedbackBanner('Pesanan di keranjang telah dibatalkan.');
+          window.setTimeout(() => setFeedbackBanner(null), 3500);
+        }}
+      />
+
+      <ConfirmDialog
+        open={Boolean(deletingDraftOrder)}
+        variant="danger"
+        title="Hapus Draft Pesanan?"
+        description={
+          deletingDraftOrder && (
+            <span>
+              Draft <strong className="font-mono text-[#1A2E26]">{deletingDraftOrder.order_number}</strong>{' '}
+              ({deletingDraftOrder.table_number} · {formatRupiah(deletingDraftOrder.total_amount)})
+              akan dihapus permanen.
+            </span>
+          )
+        }
+        confirmLabel="Ya, Hapus Draft"
+        cancelLabel="Batal"
+        onCancel={() => setDeletingDraftOrder(null)}
+        onConfirm={() => {
+          if (!deletingDraftOrder) return;
+          const draftNo = deletingDraftOrder.order_number;
+          deleteDraftOrder(deletingDraftOrder.id);
+          if (activeDraftId === deletingDraftOrder.id) {
+            setActiveDraftId(null);
+          }
+          setDeletingDraftOrder(null);
+          setFeedbackBanner(`Draft pesanan ${draftNo} telah dihapus.`);
+          window.setTimeout(() => setFeedbackBanner(null), 3500);
+        }}
       />
     </div>
   );

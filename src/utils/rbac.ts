@@ -48,6 +48,11 @@ export const NAV_ITEMS: NavItemConfig[] = [
     allowedRoles: ['owner', 'manager'],
   },
   {
+    id: 'vendors',
+    label: 'Vendor & Supplier',
+    allowedRoles: ['owner', 'manager'],
+  },
+  {
     id: 'stock-opname',
     label: 'Stock Opname',
     allowedRoles: ['owner', 'manager'],
@@ -117,6 +122,10 @@ export function canManageInventory(role: UserRole): boolean {
 }
 
 export function canManageVouchers(role: UserRole): boolean {
+  return role === 'owner' || role === 'manager';
+}
+
+export function canManageVendors(role: UserRole): boolean {
   return role === 'owner' || role === 'manager';
 }
 

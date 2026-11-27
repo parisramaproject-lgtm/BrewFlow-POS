@@ -23,6 +23,7 @@ import {
   VolumeX,
   X,
 } from 'lucide-react';
+import { ConfirmDialog } from '../components/common/ConfirmDialog';
 import { useAuth } from '../context/AuthContext';
 import { useStore } from '../context/StoreContext';
 import type { StoreVideoItem } from '../types';
@@ -62,6 +63,7 @@ export function TVDisplayPage() {
   const [uploadedFileName, setUploadedFileName] = useState<string>('');
   const [formError, setFormError] = useState<string | null>(null);
   const [toast, setToast] = useState<string | null>(null);
+  const [deletingVideo, setDeletingVideo] = useState<StoreVideoItem | null>(null);
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const stageContainerRef = useRef<HTMLDivElement | null>(null);
@@ -574,10 +576,7 @@ export function TVDisplayPage() {
                         <button
                           type="button"
                           data-testid={`delete-video-${video.id}`}
-                          onClick={() => {
-                            deleteStoreVideo(video.id);
-                            showToast(`Video "${video.title}" dihapus dari playlist TV.`);
-                          }}
+                          onClick={() => setDeletingVideo(video)}
                           aria-label={`Hapus video ${video.title}`}
                           className="rounded-lg p-1.5 text-[#6B7280] transition-colors hover:bg-[#FEF2F2] hover:text-[#EF4444]"
                         >
@@ -756,6 +755,30 @@ export function TVDisplayPage() {
 
       {/* Fullscreen TV Overlay */}
       {isFullscreenMode && renderTVStage(true)}
+
+      <ConfirmDialog
+        open={Boolean(deletingVideo)}
+        variant="danger"
+        title="Hapus Video dari Playlist TV?"
+        description={
+          deletingVideo && (
+            <span>
+              Video <strong className="text-[#1A2E26]">{deletingVideo.title}</strong> akan dihapus
+              dari daftar putar Display TV Store.
+            </span>
+          )
+        }
+        confirmLabel="Ya, Hapus Video"
+        cancelLabel="Batal"
+        onCancel={() => setDeletingVideo(null)}
+        onConfirm={() => {
+          if (!deletingVideo) return;
+          const removedTitle = deletingVideo.title;
+          deleteStoreVideo(deletingVideo.id);
+          setDeletingVideo(null);
+          showToast(`Video "${removedTitle}" dihapus dari playlist TV.`);
+        }}
+      />
     </div>
   );
 }

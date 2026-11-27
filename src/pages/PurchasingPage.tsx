@@ -1,9 +1,12 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
   ArrowDownRight,
   ArrowUpRight,
+  BellRing,
+  Building2,
   CheckCircle2,
   Filter,
+  MessageCircle,
   Plus,
   ReceiptText,
   ShoppingBag,
@@ -31,6 +34,10 @@ import {
   isInventoryLinkedExpenseCategory,
 } from '../utils/expenseCategories';
 import { formatDateTime, formatRupiah } from '../utils/format';
+import {
+  buildVendorOrderMessage,
+  buildVendorWhatsAppUrl,
+} from '../utils/operationalNotifications';
 
 const OTHER_INVENTORY_VALUE = '__other__';
 
@@ -73,7 +80,18 @@ const PAYMENT_METHOD_LABELS: Record<ExpensePaymentMethod, string> = {
 
 export function PurchasingPage() {
   const { user, authMode } = useAuth();
-  const { inventory, purchases, settings, addInventoryItem, createPurchase } = useStore();
+  const {
+    inventory,
+    purchases,
+    vendors,
+    restockRequests,
+    prefilledPurchaseVendorId,
+    setPrefilledPurchaseVendorId,
+    updateRestockRequestStatus,
+    settings,
+    addInventoryItem,
+    createPurchase,
+  } = useStore();
   const liveSupabaseEnabled = authMode === 'supabase';
 
   const inventoryById = useMemo(
@@ -84,11 +102,27 @@ export function PurchasingPage() {
   const [expenseCategory, setExpenseCategory] =
     useState<ExpenseCategoryId>('pembelian_bahan_baku');
   const [supplierName, setSupplierName] = useState('');
+  const [selectedVendorId, setSelectedVendorId] = useState<string>('');
   const [invoiceNumber, setInvoiceNumber] = useState('');
   const [paymentMethod, setPaymentMethod] = useState<ExpensePaymentMethod>('transfer');
   const [notes, setNotes] = useState('');
   const [historyCategoryFilter, setHistoryCategoryFilter] = useState<ExpenseCategoryId | 'all'>(
     'all'
+  );
+
+  const activeVendors = useMemo(
+    () => vendors.filter((v) => v.is_active),
+    [vendors]
+  );
+
+  const selectedVendor = useMemo(
+    () => vendors.find((v) => v.id === selectedVendorId) ?? null,
+    [vendors, selectedVendorId]
+  );
+
+  const openRestockRequests = useMemo(
+    () => restockRequests.filter((req) => req.status !== 'completed'),
+    [restockRequests]
   );
 
   const suggestedInventoryForCategory = useMemo(() => {
@@ -170,6 +204,75 @@ export function PurchasingPage() {
   const handleCategoryChange = (nextCat: ExpenseCategoryId) => {
     setExpenseCategory(nextCat);
     setLines([makeDefaultLine(nextCat, `line-${Date.now()}`)]);
+    setErrorMsg(null);
+  };
+
+  useEffect(() => {
+    if (!prefilledPurchaseVendorId) return;
+    const vendor = vendors.find((v) => v.id === prefilledPurchaseVendorId);
+    if (vendor) {
+      setSelectedVendorId(vendor.id);
+      setSupplierName(vendor.name);
+      const mappedCategory = getDefaultExpenseCategoryForInventory(vendor.category_type);
+      setExpenseCategory(mappedCategory);
+      setLines([makeDefaultLine(mappedCategory, `line-vendor-${Date.now()}`)]);
+    }
+    setPrefilledPurchaseVendorId(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [prefilledPurchaseVendorId, vendors]);
+
+  const handleSelectSavedVendor = (vendorId: string) => {
+    setSelectedVendorId(vendorId);
+    if (!vendorId) return;
+    const vendor = vendors.find((v) => v.id === vendorId);
+    if (!vendor) return;
+    setSupplierName(vendor.name);
+  };
+
+  const handleApplyRestockRequestToForm = (requestId: string) => {
+    const req = restockRequests.find((r) => r.id === requestId);
+    if (!req) return;
+    const inv = inventoryById.get(req.inventory_item_id);
+    const targetExpenseCategory = inv
+      ? inv.expense_category ?? getDefaultExpenseCategoryForInventory(inv.category_type)
+      : 'pembelian_bahan_baku';
+
+    setExpenseCategory(targetExpenseCategory);
+    setLines([
+      {
+        rowId: `line-restock-${Date.now()}`,
+        mode: 'inventory',
+        inventory_item_id: inv?.id ?? OTHER_INVENTORY_VALUE,
+        new_item_name: inv ? '' : req.item_name,
+        new_item_unit: req.unit,
+        new_item_sku: '',
+        new_item_min_stock: '10',
+        new_item_category: inv?.category_type ?? 'raw_material',
+        custom_name: '',
+        custom_unit: req.unit,
+        quantity: String(req.requested_quantity),
+        unit_price: inv ? String(inv.last_purchase_price) : '',
+      },
+    ]);
+
+    // Auto-suggest matching vendor if one supplies this item or category
+    const matchedVendor =
+      activeVendors.find((v) =>
+        v.supplied_items.some((s) =>
+          req.item_name.toLowerCase().includes(s.toLowerCase()) ||
+          s.toLowerCase().includes(req.item_name.toLowerCase())
+        )
+      ) ??
+      (inv ? activeVendors.find((v) => v.category_type === inv.category_type) : undefined);
+
+    if (matchedVendor) {
+      setSelectedVendorId(matchedVendor.id);
+      setSupplierName(matchedVendor.name);
+    }
+
+    setNotes(
+      `Restock dari permintaan ${req.requested_by_name}${req.notes ? ` · ${req.notes}` : ''}`
+    );
     setErrorMsg(null);
   };
 
@@ -445,6 +548,7 @@ export function PurchasingPage() {
     }
 
     setSupplierName('');
+    setSelectedVendorId('');
     setInvoiceNumber('');
     setNotes('');
     setLines([nextResetLine]);
@@ -542,6 +646,80 @@ export function PurchasingPage() {
         </div>
       )}
 
+      {/* Pending Cashier Restock Requests Strip */}
+      {openRestockRequests.length > 0 && (
+        <section
+          aria-label="Permintaan Restock dari Kasir"
+          data-testid="purchasing-restock-queue"
+          className="rounded-2xl border border-[#F59E0B]/40 bg-[#FFFBEB] p-4"
+        >
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <BellRing className="h-4 w-4 text-[#D97706]" />
+              <h2 className="text-xs font-bold uppercase tracking-wide text-[#92400E]">
+                Permintaan Restock dari Tim ({openRestockRequests.length})
+              </h2>
+            </div>
+            <p className="text-[11px] text-[#92400E]">
+              Klik &quot;Isi ke Form&quot; untuk langsung mencatat pembelian &amp; menyelesaikan permintaan.
+            </p>
+          </div>
+          <div className="mt-3 grid grid-cols-1 gap-2.5 md:grid-cols-2">
+            {openRestockRequests.map((req) => (
+              <div
+                key={req.id}
+                className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-[#F59E0B]/30 bg-white px-3.5 py-2.5"
+              >
+                <div className="min-w-0">
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <span className="text-xs font-semibold text-[#1A2E26]">{req.item_name}</span>
+                    <span
+                      className={`rounded-full px-2 py-0.5 text-[10px] font-bold ${
+                        req.urgency === 'urgent'
+                          ? 'bg-[#FEF2F2] text-[#EF4444]'
+                          : 'bg-[#E6F5EE] text-[#109A58]'
+                      }`}
+                    >
+                      {req.urgency === 'urgent' ? 'Mendesak' : 'Normal'}
+                    </span>
+                    {req.status === 'ordered' && (
+                      <span className="rounded-full bg-[#EFF6FF] px-2 py-0.5 text-[10px] font-semibold text-[#2563EB]">
+                        Sedang Dipesan
+                      </span>
+                    )}
+                  </div>
+                  <p className="mt-0.5 text-[11px] text-[#6B7280] tabular-nums">
+                    Ajuan: <strong className="text-[#1A2E26]">{req.requested_quantity} {req.unit}</strong> ·
+                    Sisa stok: {req.current_stock} {req.unit} · Oleh {req.requested_by_name}
+                  </p>
+                  {req.notes && (
+                    <p className="mt-0.5 text-[11px] text-[#6B7280]">Catatan: {req.notes}</p>
+                  )}
+                </div>
+                <div className="flex items-center gap-1.5">
+                  <button
+                    type="button"
+                    onClick={() => handleApplyRestockRequestToForm(req.id)}
+                    className="rounded-full bg-[#109A58] px-3 py-1.5 text-[11px] font-semibold text-white hover:bg-[#0D8A4E] whitespace-nowrap"
+                  >
+                    Isi ke Form
+                  </button>
+                  {req.status === 'pending' && user && (
+                    <button
+                      type="button"
+                      onClick={() => updateRestockRequestStatus(req.id, 'ordered', user.full_name)}
+                      className="rounded-full border border-[#E5E7EB] bg-white px-2.5 py-1.5 text-[11px] font-semibold text-[#6B7280] hover:border-[#2563EB] hover:text-[#2563EB] whitespace-nowrap"
+                    >
+                      Tandai Dipesan
+                    </button>
+                  )}
+                </div>
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
+
       {/* Multi-Item Purchase / Expense Entry Form */}
       <form
         onSubmit={handleSubmit}
@@ -598,16 +776,43 @@ export function PurchasingPage() {
           </div>
 
           <div>
-            <label htmlFor="po-supplier" className="block text-xs font-semibold text-[#1A2E26]">
-              {isCurrentCategoryStockLinked
-                ? 'Nama Supplier / Vendor *'
-                : 'Pihak Penerima / Vendor *'}
-            </label>
+            <div className="flex items-center justify-between gap-2">
+              <label htmlFor="po-supplier" className="block text-xs font-semibold text-[#1A2E26]">
+                {isCurrentCategoryStockLinked
+                  ? 'Nama Supplier / Vendor *'
+                  : 'Pihak Penerima / Vendor *'}
+              </label>
+              {activeVendors.length > 0 && (
+                <span className="inline-flex items-center gap-1 text-[10px] font-medium text-[#109A58]">
+                  <Building2 className="h-3 w-3" />
+                  {activeVendors.length} vendor
+                </span>
+              )}
+            </div>
+            {activeVendors.length > 0 && (
+              <select
+                aria-label="Pilih dari vendor tersimpan"
+                data-testid="po-vendor-picker"
+                value={selectedVendorId}
+                onChange={(e) => handleSelectSavedVendor(e.target.value)}
+                className="mt-1.5 h-8 w-full rounded-lg border border-[#E5E7EB] bg-[#F4F6F5] px-2.5 text-[11px] font-medium text-[#1A2E26] focus:border-[#109A58] focus:bg-white focus:outline-none"
+              >
+                <option value="">-- Pilih Vendor Tersimpan (Opsional) --</option>
+                {activeVendors.map((v) => (
+                  <option key={v.id} value={v.id}>
+                    {v.name} (PIC: {v.contact_person})
+                  </option>
+                ))}
+              </select>
+            )}
             <input
               id="po-supplier"
               type="text"
               value={supplierName}
-              onChange={(e) => setSupplierName(e.target.value)}
+              onChange={(e) => {
+                setSupplierName(e.target.value);
+                if (selectedVendorId) setSelectedVendorId('');
+              }}
               placeholder={
                 isCurrentCategoryStockLinked
                   ? 'Misal: PT Kopi Nusantara Roastery'
@@ -615,6 +820,33 @@ export function PurchasingPage() {
               }
               className="mt-1.5 h-10 w-full rounded-xl border border-[#E5E7EB] px-3 text-sm text-[#1A2E26] focus:border-[#109A58] focus:outline-none"
             />
+            {selectedVendor && (
+              <div className="mt-1 flex items-center justify-between gap-2 text-[11px] text-[#6B7280]">
+                <span className="truncate">
+                  PIC: {selectedVendor.contact_person} · {selectedVendor.phone}
+                </span>
+                {(() => {
+                  const quickMsg = buildVendorOrderMessage({
+                    vendor: selectedVendor,
+                    shopName: settings.shopName,
+                    items: [],
+                  });
+                  const waHref = buildVendorWhatsAppUrl(selectedVendor.phone, quickMsg);
+                  if (!waHref) return null;
+                  return (
+                    <a
+                      href={waHref}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="inline-flex shrink-0 items-center gap-1 font-semibold text-[#109A58] hover:underline"
+                    >
+                      <MessageCircle className="h-3 w-3" />
+                      <span>Chat WA</span>
+                    </a>
+                  );
+                })()}
+              </div>
+            )}
           </div>
 
           <div>

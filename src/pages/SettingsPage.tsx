@@ -18,6 +18,7 @@ import {
   Usb,
   Wifi,
 } from 'lucide-react';
+import { ConfirmDialog } from '../components/common/ConfirmDialog';
 import { PrintableReceipt } from '../components/common/PrintableReceipt';
 import { useAuth } from '../context/AuthContext';
 import { useStore } from '../context/StoreContext';
@@ -73,6 +74,9 @@ export function SettingsPage() {
 
   const [activeTab, setActiveTab] = useState<'store' | 'printer' | 'schedule' | 'whatsapp'>(
     'store'
+  );
+  const [deletingSchedule, setDeletingSchedule] = useState<{ id: string; title: string } | null>(
+    null
   );
 
   // Store, Tax & Receipt Form Draft State
@@ -1523,7 +1527,7 @@ export function SettingsPage() {
                       <button
                         type="button"
                         aria-label={`Hapus jadwal ${sch.title}`}
-                        onClick={() => void deleteOpnameSchedule(sch.id, liveSupabaseEnabled)}
+                        onClick={() => setDeletingSchedule({ id: sch.id, title: sch.title })}
                         className="rounded-lg p-1.5 text-[#6B7280] transition-colors hover:bg-[#FEF2F2] hover:text-[#EF4444]"
                       >
                         <Trash2 className="h-4 w-4" />
@@ -1749,6 +1753,29 @@ supabase functions deploy send-whatsapp`}
           </div>
         </div>
       )}
+
+      <ConfirmDialog
+        open={Boolean(deletingSchedule)}
+        variant="danger"
+        title="Hapus Jadwal Stock Opname?"
+        description={
+          deletingSchedule && (
+            <span>
+              Jadwal <strong className="text-[#1A2E26]">{deletingSchedule.title}</strong> akan
+              dihapus permanen dari pengingat Stock Opname.
+            </span>
+          )
+        }
+        confirmLabel="Ya, Hapus Jadwal"
+        cancelLabel="Batal"
+        onCancel={() => setDeletingSchedule(null)}
+        onConfirm={async () => {
+          if (!deletingSchedule) return;
+          const targetId = deletingSchedule.id;
+          setDeletingSchedule(null);
+          await deleteOpnameSchedule(targetId, liveSupabaseEnabled);
+        }}
+      />
     </div>
   );
 }

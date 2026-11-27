@@ -319,26 +319,212 @@ BEGIN
     RETURN jsonb_build_object('ok', false, 'error', 'Kata sandi minimal 6 karakter.');
   END IF;
 
+  IF v_clean_username IS NOT NULL AND EXISTS (
+    SELECT 1
+    FROM public.employees e
+    WHERE lower(trim(coalesce(e.username, ''))) = v_clean_username
+      AND lower(trim(e.email)) <> v_clean_email
+  ) THEN
+    RETURN jsonb_build_object('ok', false, 'error', format('Username "@%s" sudah dipakai karyawan lain.', v_clean_username));
+  END IF;
+
   UPDATE public.employees
   SET
     username = v_clean_username,
     password_hash = CASE
+      WHEN v_clean_username IS NULL THEN NULL
       WHEN p_password IS NOT NULL AND trim(p_password) <> '' THEN crypt(p_password, gen_salt('bf', 10))
       ELSE password_hash
     END
   WHERE lower(trim(email)) = v_clean_email;
 
   IF NOT FOUND THEN
-    RETURN jsonb_build_object('ok', false, 'error', 'Data karyawan tidak ditemukan di tabel employees.');
+    RETURN jsonb_build_object('ok', false, 'error', 'Data karyawan tidak ditemukan di tabel employees. Simpan data karyawan ke Supabase terlebih dahulu.');
   END IF;
 
   RETURN jsonb_build_object('ok', true);
 END;
 $$;
 
+-- 2e. RPC SECURITY DEFINER bagi Owner untuk membaca, menyimpan/mengedit, dan menghapus data karyawan
+-- Bekerja penuh baik saat Owner login dengan Google OAuth maupun Username & Password.
+CREATE OR REPLACE FUNCTION public.get_all_employees_for_owner()
+RETURNS jsonb
+LANGUAGE plpgsql
+STABLE
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_rows jsonb;
+BEGIN
+  IF NOT public.is_active_owner() THEN
+    RETURN jsonb_build_object('ok', false, 'error', 'Hanya Owner aktif yang dapat membaca seluruh daftar karyawan.');
+  END IF;
+
+  SELECT coalesce(
+    jsonb_agg(
+      (to_jsonb(e) - 'password_hash')
+      || jsonb_build_object('has_password', (e.password_hash IS NOT NULL AND e.password_hash <> ''))
+      ORDER BY e.created_at ASC
+    ),
+    '[]'::jsonb
+  )
+  INTO v_rows
+  FROM public.employees e;
+
+  RETURN jsonb_build_object('ok', true, 'employees', v_rows);
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION public.upsert_employee_by_owner(
+  p_id uuid DEFAULT NULL,
+  p_previous_email text DEFAULT NULL,
+  p_full_name text DEFAULT 'Karyawan',
+  p_email text DEFAULT '',
+  p_username text DEFAULT NULL,
+  p_role text DEFAULT 'cashier',
+  p_phone_number text DEFAULT '-',
+  p_is_active boolean DEFAULT true,
+  p_shift text DEFAULT 'Shift Pagi (07:00 - 15:00)',
+  p_position text DEFAULT 'Barista & Kasir',
+  p_employment_status text DEFAULT 'Kontrak',
+  p_monthly_salary numeric DEFAULT 0,
+  p_join_date date DEFAULT current_date,
+  p_emergency_contact text DEFAULT '',
+  p_notes text DEFAULT ''
+)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_clean_email text;
+  v_clean_prev_email text;
+  v_clean_username text;
+  v_clean_role text;
+  v_existing_id uuid;
+  v_saved public.employees%ROWTYPE;
+BEGIN
+  IF NOT public.is_active_owner() THEN
+    RETURN jsonb_build_object('ok', false, 'error', 'Hanya Owner aktif yang dapat menambah atau mengubah data karyawan.');
+  END IF;
+
+  v_clean_email := lower(trim(coalesce(p_email, '')));
+  v_clean_prev_email := nullif(lower(trim(coalesce(p_previous_email, ''))), '');
+  v_clean_username := nullif(lower(trim(regexp_replace(coalesce(p_username, ''), '^@+', ''))), '');
+  v_clean_role := CASE
+    WHEN lower(trim(coalesce(p_role, ''))) IN ('owner', 'manager', 'cashier') THEN lower(trim(p_role))
+    ELSE 'cashier'
+  END;
+
+  IF v_clean_email = '' THEN
+    RETURN jsonb_build_object('ok', false, 'error', 'Email karyawan wajib diisi.');
+  END IF;
+
+  IF p_id IS NOT NULL THEN
+    SELECT id INTO v_existing_id FROM public.employees WHERE id = p_id LIMIT 1;
+  END IF;
+
+  IF v_existing_id IS NULL AND v_clean_prev_email IS NOT NULL THEN
+    SELECT id INTO v_existing_id FROM public.employees WHERE lower(trim(email)) = v_clean_prev_email LIMIT 1;
+  END IF;
+
+  IF v_existing_id IS NULL THEN
+    SELECT id INTO v_existing_id FROM public.employees WHERE lower(trim(email)) = v_clean_email LIMIT 1;
+  END IF;
+
+  IF v_existing_id IS NOT NULL THEN
+    UPDATE public.employees
+    SET
+      full_name = coalesce(nullif(trim(p_full_name), ''), full_name),
+      email = v_clean_email,
+      username = CASE WHEN p_username IS NULL THEN username ELSE v_clean_username END,
+      role = v_clean_role,
+      phone_number = coalesce(nullif(trim(p_phone_number), ''), '-'),
+      is_active = coalesce(p_is_active, true),
+      shift = coalesce(p_shift, shift),
+      position = coalesce(p_position, position),
+      employment_status = coalesce(p_employment_status, employment_status),
+      monthly_salary = coalesce(p_monthly_salary, 0),
+      join_date = coalesce(p_join_date, join_date),
+      emergency_contact = coalesce(p_emergency_contact, ''),
+      notes = coalesce(p_notes, '')
+    WHERE id = v_existing_id
+    RETURNING * INTO v_saved;
+  ELSE
+    INSERT INTO public.employees (
+      full_name,
+      email,
+      username,
+      role,
+      phone_number,
+      is_active,
+      shift,
+      position,
+      employment_status,
+      monthly_salary,
+      join_date,
+      emergency_contact,
+      notes
+    )
+    VALUES (
+      coalesce(nullif(trim(p_full_name), ''), 'Karyawan'),
+      v_clean_email,
+      v_clean_username,
+      v_clean_role,
+      coalesce(nullif(trim(p_phone_number), ''), '-'),
+      coalesce(p_is_active, true),
+      coalesce(p_shift, 'Shift Pagi (07:00 - 15:00)'),
+      coalesce(p_position, 'Barista & Kasir'),
+      coalesce(p_employment_status, 'Kontrak'),
+      coalesce(p_monthly_salary, 0),
+      coalesce(p_join_date, current_date),
+      coalesce(p_emergency_contact, ''),
+      coalesce(p_notes, '')
+    )
+    RETURNING * INTO v_saved;
+  END IF;
+
+  RETURN jsonb_build_object(
+    'ok', true,
+    'employee', (to_jsonb(v_saved) - 'password_hash') || jsonb_build_object('has_password', (v_saved.password_hash IS NOT NULL AND v_saved.password_hash <> ''))
+  );
+EXCEPTION
+  WHEN unique_violation THEN
+    RETURN jsonb_build_object('ok', false, 'error', 'Email atau username sudah digunakan karyawan lain di Supabase.');
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION public.delete_employee_by_owner(
+  p_email text
+)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_clean_email text;
+BEGIN
+  IF NOT public.is_active_owner() THEN
+    RETURN jsonb_build_object('ok', false, 'error', 'Hanya Owner aktif yang dapat menghapus karyawan.');
+  END IF;
+
+  v_clean_email := lower(trim(coalesce(p_email, '')));
+  IF v_clean_email = '' THEN
+    RETURN jsonb_build_object('ok', false, 'error', 'Email karyawan tidak valid.');
+  END IF;
+
+  DELETE FROM public.employees WHERE lower(trim(email)) = v_clean_email;
+  RETURN jsonb_build_object('ok', true);
+END;
+$$;
+
 GRANT USAGE ON SCHEMA public TO anon, authenticated;
 GRANT SELECT, INSERT, UPDATE, DELETE ON public.employees TO anon, authenticated;
-GRANT SELECT ON public.login_audit_logs TO authenticated;
+GRANT SELECT ON public.login_audit_logs TO anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.get_app_session_token() TO anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.is_active_owner() TO anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.get_my_employee_profile() TO authenticated;
@@ -346,8 +532,13 @@ GRANT EXECUTE ON FUNCTION public.authenticate_employee_username(text, text) TO a
 GRANT EXECUTE ON FUNCTION public.get_app_session_profile() TO anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.revoke_app_session() TO anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.set_employee_username_credentials(text, text, text) TO anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.get_all_employees_for_owner() TO anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.upsert_employee_by_owner(uuid, text, text, text, text, text, text, boolean, text, text, text, numeric, date, text, text) TO anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.delete_employee_by_owner(text) TO anon, authenticated;
 
 -- 3. Aktifkan Row Level Security (RLS) pada tabel employees & login_audit_logs
+-- PENTING: Menggunakan `TO anon, authenticated` agar sesi login Username (app_sessions)
+-- tetap dapat dilayani oleh `public.is_active_owner()` tanpa membuka akses publik tanpa sesi.
 ALTER TABLE public.employees ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.login_audit_logs ENABLE ROW LEVEL SECURITY;
 
@@ -355,15 +546,15 @@ DROP POLICY IF EXISTS "Owner can read login audit logs" ON public.login_audit_lo
 CREATE POLICY "Owner can read login audit logs"
   ON public.login_audit_logs
   FOR SELECT
-  TO authenticated
+  TO anon, authenticated
   USING (public.is_active_owner());
 
--- Karyawan yang login via Google/Email dapat membaca data dirinya sendiri; Owner aktif dapat membaca semua karyawan
+-- Karyawan yang login via Google/Email dapat membaca data dirinya sendiri; Owner aktif (Google maupun Username) dapat membaca semua karyawan
 DROP POLICY IF EXISTS "Employees read own or owner reads all" ON public.employees;
 CREATE POLICY "Employees read own or owner reads all"
   ON public.employees
   FOR SELECT
-  TO authenticated
+  TO anon, authenticated
   USING (
     lower(trim(email)) = lower(trim(coalesce(auth.jwt() ->> 'email', '')))
     OR auth_user_id = auth.uid()
@@ -375,14 +566,14 @@ DROP POLICY IF EXISTS "Owner can insert employees" ON public.employees;
 CREATE POLICY "Owner can insert employees"
   ON public.employees
   FOR INSERT
-  TO authenticated
+  TO anon, authenticated
   WITH CHECK (public.is_active_owner());
 
 DROP POLICY IF EXISTS "Owner can update employees" ON public.employees;
 CREATE POLICY "Owner can update employees"
   ON public.employees
   FOR UPDATE
-  TO authenticated
+  TO anon, authenticated
   USING (public.is_active_owner())
   WITH CHECK (public.is_active_owner());
 
@@ -390,7 +581,7 @@ DROP POLICY IF EXISTS "Owner can delete employees" ON public.employees;
 CREATE POLICY "Owner can delete employees"
   ON public.employees
   FOR DELETE
-  TO authenticated
+  TO anon, authenticated
   USING (public.is_active_owner());
 
 -- 4. Seed akun Owner utama (termasuk parisramaproject@gmail.com)

@@ -729,3 +729,28 @@ export async function incrementVoucherUsageInSupabase(
   }
 }
 
+export async function cancelOrderInSupabase(
+  orderId: string,
+  orderNumber: string,
+  notes?: string
+): Promise<SupabaseSyncStatus> {
+  if (!isSupabaseConfigured || !supabase) {
+    return { mode: 'local', synced: true };
+  }
+  try {
+    const patch: Record<string, unknown> = { status: 'cancelled' };
+    if (notes !== undefined) patch.notes = notes;
+    const query = isUuid(orderId)
+      ? supabase.from('orders').update(patch).eq('id', orderId)
+      : supabase.from('orders').update(patch).eq('order_number', orderNumber);
+    const { error } = await query;
+    if (error) return { mode: 'supabase', synced: false, error: error.message };
+    return { mode: 'supabase', synced: true };
+  } catch (err) {
+    return {
+      mode: 'supabase',
+      synced: false,
+      error: err instanceof Error ? err.message : 'Gagal membatalkan pesanan di Supabase.',
+    };
+  }
+}

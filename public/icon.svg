@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" fill="none">
+  <rect width="512" height="512" rx="112" fill="#109A58"/>
+  <rect x="44" y="44" width="424" height="424" rx="84" fill="#0D8A4E" opacity="0.35"/>
+  <!-- Steam waves -->
+  <path d="M196 154c0-18 16-24 16-42" stroke="#FFFFFF" stroke-width="18" stroke-linecap="round"/>
+  <path d="M256 144c0-20 16-26 16-46" stroke="#FFFFFF" stroke-width="18" stroke-linecap="round"/>
+  <path d="M316 154c0-18 16-24 16-42" stroke="#FFFFFF" stroke-width="18" stroke-linecap="round"/>
+  <!-- Coffee cup body -->
+  <path d="M132 196h212v106c0 54-44 98-98 98h-16c-54 0-98-44-98-98V196z" fill="#FFFFFF"/>
+  <!-- Cup handle -->
+  <path d="M344 220h26c26 0 46 20 46 46s-20 46-46 46h-26" stroke="#FFFFFF" stroke-width="24" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- Coffee leaf / accent inside cup -->
+  <path d="M202 278c18-32 48-44 74-36-8 28-30 50-62 52-6 0-12-6-12-16z" fill="#109A58"/>
+  <!-- Saucer -->
+  <rect x="120" y="416" width="240" height="22" rx="11" fill="#D1FAE5"/>
+</svg>

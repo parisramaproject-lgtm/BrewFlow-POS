@@ -10,6 +10,7 @@ import {
   X,
 } from 'lucide-react';
 import { AccessDenied } from '../components/common/AccessDenied';
+import { ConfirmDialog } from '../components/common/ConfirmDialog';
 import { PeriodicExcelExport } from '../components/common/PeriodicExcelExport';
 import { ProductVisual } from '../components/common/ProductVisual';
 import { MenuFormModal } from '../components/menu/MenuFormModal';
@@ -48,6 +49,11 @@ export function MenuHPPPage({ searchQuery }: MenuHPPPageProps) {
   const [menuModalOpen, setMenuModalOpen] = useState(false);
   const [editingMenu, setEditingMenu] = useState<MenuItem | null>(null);
   const [deletingMenu, setDeletingMenu] = useState<MenuItem | null>(null);
+  const [pendingMenuEdit, setPendingMenuEdit] = useState<{
+    id: string;
+    data: MenuItemInput;
+  } | null>(null);
+  const [confirmMenuBusy, setConfirmMenuBusy] = useState(false);
   const [feedbackBanner, setFeedbackBanner] = useState<string | null>(null);
 
   const consumableInventory = useMemo(
@@ -137,19 +143,15 @@ export function MenuHPPPage({ searchQuery }: MenuHPPPageProps) {
 
   const handleSaveMenu = async (data: MenuItemInput, editingId: string | null) => {
     if (editingId) {
-      await updateMenuItem(editingId, {
-        ...data,
-        enableSupabaseSync: liveSupabaseEnabled,
-      });
-      showFeedback(`Menu "${data.name}" berhasil diperbarui.`);
-    } else {
-      const created = await addMenuItem({
-        ...data,
-        enableSupabaseSync: liveSupabaseEnabled,
-      });
-      setSelectedMenuId(created.id);
-      showFeedback(`Menu "${created.name}" ditambahkan ke katalog POS.`);
+      setPendingMenuEdit({ id: editingId, data });
+      return;
     }
+    const created = await addMenuItem({
+      ...data,
+      enableSupabaseSync: liveSupabaseEnabled,
+    });
+    setSelectedMenuId(created.id);
+    showFeedback(`Menu "${created.name}" ditambahkan ke katalog POS.`);
   };
 
   const handleConfirmDeleteMenu = async () => {
@@ -772,39 +774,58 @@ export function MenuHPPPage({ searchQuery }: MenuHPPPageProps) {
         onSubmit={handleSaveMenu}
       />
 
-      {/* Confirm Delete Menu Modal */}
-      {deletingMenu && (
-        <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-[#1A2E26]/45 p-4 backdrop-blur-[1px]"
-          role="dialog"
-          aria-modal="true"
-          aria-label={`Konfirmasi Hapus Menu ${deletingMenu.name}`}
-        >
-          <div className="w-full max-w-sm rounded-2xl border border-[#E5E7EB] bg-[#FFFFFF] p-6 shadow-xl">
-            <h2 className="text-base font-semibold text-[#1A2E26]">Hapus Menu?</h2>
-            <p className="mt-2 text-xs leading-relaxed text-[#6B7280]">
+      {/* Confirm Delete Menu Dialog */}
+      <ConfirmDialog
+        open={Boolean(deletingMenu)}
+        variant="danger"
+        title="Hapus Menu?"
+        description={
+          deletingMenu && (
+            <span>
               Menu <strong className="text-[#1A2E26]">{deletingMenu.name}</strong> akan dihapus
-              dari katalog POS dan daftar resep.
-            </p>
-            <div className="mt-5 flex justify-end gap-2.5">
-              <button
-                type="button"
-                onClick={() => setDeletingMenu(null)}
-                className="h-9 rounded-full border border-[#E5E7EB] px-4 text-xs font-semibold text-[#6B7280]"
-              >
-                Batal
-              </button>
-              <button
-                type="button"
-                onClick={handleConfirmDeleteMenu}
-                className="h-9 rounded-full bg-[#EF4444] px-5 text-xs font-semibold text-white hover:bg-[#DC2626]"
-              >
-                Hapus Menu
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
+              permanen dari katalog POS dan daftar resep.
+            </span>
+          )
+        }
+        confirmLabel="Ya, Hapus Menu"
+        cancelLabel="Batal"
+        onCancel={() => setDeletingMenu(null)}
+        onConfirm={handleConfirmDeleteMenu}
+      />
+
+      {/* Confirm Edit Menu Dialog */}
+      <ConfirmDialog
+        open={Boolean(pendingMenuEdit)}
+        variant="warning"
+        title="Konfirmasi Perubahan Data Menu"
+        description={
+          pendingMenuEdit && (
+            <span>
+              Simpan perubahan pada menu{' '}
+              <strong className="text-[#1A2E26]">{pendingMenuEdit.data.name}</strong> dengan harga
+              jual <strong>{formatRupiah(pendingMenuEdit.data.selling_price)}</strong>?
+            </span>
+          )
+        }
+        confirmLabel="Ya, Simpan Perubahan"
+        cancelLabel="Batal"
+        isBusy={confirmMenuBusy}
+        onCancel={() => setPendingMenuEdit(null)}
+        onConfirm={async () => {
+          if (!pendingMenuEdit) return;
+          setConfirmMenuBusy(true);
+          try {
+            await updateMenuItem(pendingMenuEdit.id, {
+              ...pendingMenuEdit.data,
+              enableSupabaseSync: liveSupabaseEnabled,
+            });
+            showFeedback(`Menu "${pendingMenuEdit.data.name}" berhasil diperbarui.`);
+            setPendingMenuEdit(null);
+          } finally {
+            setConfirmMenuBusy(false);
+          }
+        }}
+      />
     </div>
   );
 }

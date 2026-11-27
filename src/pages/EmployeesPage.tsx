@@ -1,5 +1,6 @@
 import React, { useMemo, useState } from 'react';
 import {
+  AlertTriangle,
   Check,
   CheckCircle2,
   Eye,
@@ -10,12 +11,14 @@ import {
   Mail,
   Pencil,
   Plus,
+  RefreshCw,
   Trash2,
   Users,
   Wallet,
   X,
 } from 'lucide-react';
 import { AccessDenied } from '../components/common/AccessDenied';
+import { ConfirmDialog, type ConfirmDialogVariant } from '../components/common/ConfirmDialog';
 import { useAuth } from '../context/AuthContext';
 import { useStore } from '../context/StoreContext';
 import { DEFAULT_OWNER_ALERT_EMAIL } from '../services/loginAlertService';
@@ -59,6 +62,9 @@ export function EmployeesPage({ onNavigate }: EmployeesPageProps) {
   const { canSeeEmployees } = useAuth();
   const {
     employees,
+    employeesSyncStatus,
+    employeesSyncError,
+    refreshAllFromSupabase,
     settings,
     usernameLoginLogs,
     addEmployee,
@@ -99,7 +105,26 @@ export function EmployeesPage({ onNavigate }: EmployeesPageProps) {
   const [showModalPassword, setShowModalPassword] = useState(false);
   const [modalError, setModalError] = useState<string | null>(null);
   const [savingModal, setSavingModal] = useState(false);
+  const [syncingEmployees, setSyncingEmployees] = useState(false);
   const [toastMsg, setToastMsg] = useState<string | null>(null);
+
+  // Reusable confirmation dialog state for delete, role change, and edit actions
+  const [confirmState, setConfirmState] = useState<{
+    open: boolean;
+    variant: ConfirmDialogVariant;
+    title: string;
+    description: React.ReactNode;
+    confirmLabel: string;
+    onConfirm: () => Promise<void> | void;
+  }>({
+    open: false,
+    variant: 'warning',
+    title: '',
+    description: '',
+    confirmLabel: 'Ya, Lanjutkan',
+    onConfirm: () => {},
+  });
+  const [confirmBusy, setConfirmBusy] = useState(false);
 
   const stats = useMemo(() => {
     const activeCount = employees.filter((e) => e.is_active).length;
@@ -175,7 +200,7 @@ export function EmployeesPage({ onNavigate }: EmployeesPageProps) {
       return;
     }
 
-    await addEmployee({
+    const addRes = await addEmployee({
       full_name: fullName,
       position,
       email,
@@ -189,6 +214,13 @@ export function EmployeesPage({ onNavigate }: EmployeesPageProps) {
       join_date: joinDate,
       emergency_contact: emergencyContact,
     });
+    if (!addRes.ok) {
+      setErrorMsg(
+        addRes.error ||
+          'Gagal menyinkronkan karyawan baru ke Supabase. Pastikan SQL employees terbaru sudah dijalankan.'
+      );
+      return;
+    }
     setFullName('');
     setPosition('Barista & Kasir');
     setEmail('');
@@ -204,8 +236,8 @@ export function EmployeesPage({ onNavigate }: EmployeesPageProps) {
     setShowAddForm(false);
     notify(
       normalizedUser
-        ? `Akun karyawan & login username "@${normalizedUser}" berhasil ditambahkan.`
-        : 'Akun karyawan baru berhasil ditambahkan.'
+        ? `Akun karyawan & login username "@${normalizedUser}" berhasil disimpan ke database.`
+        : 'Akun karyawan baru berhasil disimpan ke database.'
     );
   };
 
@@ -222,6 +254,11 @@ export function EmployeesPage({ onNavigate }: EmployeesPageProps) {
 
   const commitInlineEdit = (emp: UserProfile, field: EditableCellField) => {
     const trimmed = draftValue.trim();
+    const currentRaw = emp[field] !== undefined && emp[field] !== null ? String(emp[field]) : '';
+    if (trimmed === currentRaw.trim()) {
+      cancelInlineEdit();
+      return;
+    }
     if (field === 'full_name' && !trimmed) {
       cancelInlineEdit();
       return;
@@ -243,18 +280,39 @@ export function EmployeesPage({ onNavigate }: EmployeesPageProps) {
       }
     }
 
-    if (field === 'monthly_salary') {
-      const parsed = Math.max(0, Number(draftValue.replace(/[^\d]/g, '')) || 0);
-      updateEmployee(emp.id, { monthly_salary: parsed });
-    } else if (field === 'employment_status') {
-      updateEmployee(emp.id, { employment_status: draftValue as EmploymentStatus });
-    } else {
-      updateEmployee(emp.id, { [field]: trimmed });
-    }
+    const patch: Partial<UserProfile> =
+      field === 'monthly_salary'
+        ? { monthly_salary: Math.max(0, Number(draftValue.replace(/[^\d]/g, '')) || 0) }
+        : field === 'employment_status'
+          ? { employment_status: draftValue as EmploymentStatus }
+          : { [field]: trimmed };
 
     setEditingCell(null);
     setDraftValue('');
-    notify(`Data karyawan "${field === 'full_name' ? trimmed : emp.full_name}" berhasil diperbarui.`);
+
+    setConfirmState({
+      open: true,
+      variant: 'warning',
+      title: 'Konfirmasi Perubahan Data Karyawan',
+      description: (
+        <span>
+          Apakah Anda yakin ingin menyimpan perubahan data untuk{' '}
+          <strong className="text-[#1A2E26]">{emp.full_name}</strong>? Perubahan akan langsung
+          disinkronkan ke database.
+        </span>
+      ),
+      confirmLabel: 'Ya, Simpan Perubahan',
+      onConfirm: async () => {
+        const res = await updateEmployee(emp.id, patch);
+        if (!res.ok) {
+          notify(res.error || 'Gagal menyimpan perubahan ke Supabase.');
+        } else {
+          notify(
+            `Data karyawan "${field === 'full_name' ? trimmed : emp.full_name}" berhasil diperbarui.`
+          );
+        }
+      },
+    });
   };
 
   const handleInlineKeyDown = (
@@ -292,16 +350,21 @@ export function EmployeesPage({ onNavigate }: EmployeesPageProps) {
     });
   };
 
-  const handleSaveDetailModal = async (e: React.FormEvent) => {
-    e.preventDefault();
+  const executeSaveDetailModal = async () => {
     if (!detailEmployee || savingModal) return;
     setModalError(null);
     setSavingModal(true);
 
-    updateEmployee(detailEmployee.id, {
+    const updateRes = await updateEmployee(detailEmployee.id, {
       ...modalDraft,
       monthly_salary: Math.max(0, Number(modalDraft.monthly_salary) || 0),
     });
+
+    if (!updateRes.ok) {
+      setModalError(updateRes.error || 'Gagal menyimpan perubahan data karyawan ke Supabase.');
+      setSavingModal(false);
+      return;
+    }
 
     const trimmedModalUser = modalUsername.trim();
     const trimmedModalPass = modalPassword.trim();
@@ -330,6 +393,34 @@ export function EmployeesPage({ onNavigate }: EmployeesPageProps) {
     setDetailEmployee(null);
   };
 
+  const handleSaveDetailModal = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!detailEmployee || savingModal) return;
+    setConfirmState({
+      open: true,
+      variant: 'warning',
+      title: 'Konfirmasi Simpan Perubahan Karyawan',
+      description: (
+        <span>
+          Simpan perubahan data profil dan/atau kredensial login untuk{' '}
+          <strong className="text-[#1A2E26]">
+            {modalDraft.full_name || detailEmployee.full_name}
+          </strong>
+          ?
+        </span>
+      ),
+      confirmLabel: 'Ya, Simpan Perubahan',
+      onConfirm: executeSaveDetailModal,
+    });
+  };
+
+  const handleManualSyncEmployees = async () => {
+    setSyncingEmployees(true);
+    await refreshAllFromSupabase();
+    setSyncingEmployees(false);
+    notify('Sinkronisasi daftar karyawan dari Supabase selesai dijalankan.');
+  };
+
   const isCellEditing = (empId: string, field: EditableCellField) =>
     editingCell?.employeeId === empId && editingCell?.field === field;
 
@@ -350,15 +441,52 @@ export function EmployeesPage({ onNavigate }: EmployeesPageProps) {
           </p>
         </div>
 
-        <button
-          type="button"
-          onClick={() => setShowAddForm((prev) => !prev)}
-          className="inline-flex items-center gap-1.5 rounded-full bg-[#109A58] px-4 py-2 text-xs font-semibold text-white hover:bg-[#0D8A4E] whitespace-nowrap"
-        >
-          <Plus className="h-4 w-4" />
-          <span>Tambah Karyawan</span>
-        </button>
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            disabled={syncingEmployees}
+            onClick={() => void handleManualSyncEmployees()}
+            className="inline-flex items-center gap-1.5 rounded-full border border-[#E5E7EB] bg-white px-3.5 py-2 text-xs font-semibold text-[#1A2E26] hover:border-[#109A58] hover:text-[#109A58] disabled:opacity-50 whitespace-nowrap"
+          >
+            <RefreshCw className={`h-3.5 w-3.5 ${syncingEmployees ? 'animate-spin' : ''}`} />
+            <span>{syncingEmployees ? 'Menyinkronkan...' : 'Sinkronkan Supabase'}</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => setShowAddForm((prev) => !prev)}
+            className="inline-flex items-center gap-1.5 rounded-full bg-[#109A58] px-4 py-2 text-xs font-semibold text-white hover:bg-[#0D8A4E] whitespace-nowrap"
+          >
+            <Plus className="h-4 w-4" />
+            <span>Tambah Karyawan</span>
+          </button>
+        </div>
       </div>
+
+      {employeesSyncStatus === 'error' && employeesSyncError && (
+        <div
+          role="alert"
+          data-testid="employees-sync-warning"
+          className="flex flex-wrap items-start justify-between gap-3 rounded-2xl border border-[#F59E0B]/40 bg-[#FFFBEB] px-4 py-3 text-xs text-[#92400E]"
+        >
+          <div className="flex items-start gap-2.5">
+            <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-[#D97706]" />
+            <div>
+              <p className="font-semibold">
+                Daftar karyawan belum tersinkron dengan tabel Supabase <code>public.employees</code>
+              </p>
+              <p className="mt-0.5 leading-relaxed">{employeesSyncError}</p>
+            </div>
+          </div>
+          <button
+            type="button"
+            disabled={syncingEmployees}
+            onClick={() => void handleManualSyncEmployees()}
+            className="rounded-full bg-[#D97706] px-3 py-1.5 text-[11px] font-semibold text-white hover:bg-[#B45309] whitespace-nowrap"
+          >
+            Coba Sinkron Lagi
+          </button>
+        </div>
+      )}
 
       {/* Operational KPI Strip */}
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
@@ -855,8 +983,34 @@ export function EmployeesPage({ onNavigate }: EmployeesPageProps) {
                         aria-label={`Ubah role untuk ${emp.full_name}`}
                         value={emp.role}
                         onChange={(e) => {
-                          updateEmployeeRole(emp.id, e.target.value as UserRole);
-                          notify(`Role "${emp.full_name}" diubah ke ${getRoleDisplayLabel(e.target.value as UserRole)}.`);
+                          const nextRole = e.target.value as UserRole;
+                          if (nextRole === emp.role) return;
+                          setConfirmState({
+                            open: true,
+                            variant: 'warning',
+                            title: 'Konfirmasi Perubahan Role Akses',
+                            description: (
+                              <span>
+                                Ubah hak akses <strong className="text-[#1A2E26]">{emp.full_name}</strong>{' '}
+                                dari <strong>{getRoleDisplayLabel(emp.role)}</strong> menjadi{' '}
+                                <strong className="text-[#109A58]">
+                                  {getRoleDisplayLabel(nextRole)}
+                                </strong>
+                                ?
+                              </span>
+                            ),
+                            confirmLabel: 'Ya, Ubah Role',
+                            onConfirm: async () => {
+                              const res = await updateEmployeeRole(emp.id, nextRole);
+                              if (!res.ok) {
+                                notify(res.error || 'Gagal mengubah role di Supabase.');
+                              } else {
+                                notify(
+                                  `Role "${emp.full_name}" diubah ke ${getRoleDisplayLabel(nextRole)}.`
+                                );
+                              }
+                            },
+                          });
                         }}
                         className="h-8 rounded-lg border border-[#E5E7EB] bg-white px-2 text-xs font-semibold text-[#1A2E26] focus:border-[#109A58] focus:outline-none"
                       >
@@ -881,8 +1035,29 @@ export function EmployeesPage({ onNavigate }: EmployeesPageProps) {
                           <button
                             type="button"
                             onClick={() => {
-                              deleteEmployee(emp.id);
-                              notify(`Data karyawan "${emp.full_name}" telah dihapus.`);
+                              setConfirmState({
+                                open: true,
+                                variant: 'danger',
+                                title: 'Hapus Data Karyawan?',
+                                description: (
+                                  <span>
+                                    Apakah Anda yakin ingin menghapus{' '}
+                                    <strong className="text-[#1A2E26]">{emp.full_name}</strong> (
+                                    {emp.email})? Akun ini tidak akan bisa login lagi ke BrewFlow POS.
+                                  </span>
+                                ),
+                                confirmLabel: 'Ya, Hapus Karyawan',
+                                onConfirm: async () => {
+                                  const res = await deleteEmployee(emp.id);
+                                  if (!res.ok) {
+                                    notify(
+                                      res.error || 'Karyawan dihapus lokal, gagal hapus di Supabase.'
+                                    );
+                                  } else {
+                                    notify(`Data karyawan "${emp.full_name}" telah dihapus.`);
+                                  }
+                                },
+                              });
                             }}
                             aria-label={`Hapus karyawan ${emp.full_name}`}
                             className="rounded-lg p-1.5 text-[#6B7280] transition-colors hover:bg-[#FEF2F2] hover:text-[#EF4444]"
@@ -924,6 +1099,15 @@ export function EmployeesPage({ onNavigate }: EmployeesPageProps) {
           <span className="rounded-full bg-[#E6F5EE] px-3 py-1 text-[11px] font-semibold text-[#109A58] tabular-nums">
             {usernameLoginLogs.length} riwayat login
           </span>
+        </div>
+
+        <div className="rounded-xl border border-[#109A58]/20 bg-[#E6F5EE]/40 px-3.5 py-2.5 text-[11px] leading-relaxed text-[#1A2E26]">
+          <strong>Pengiriman Langsung via Sandi Aplikasi Google (Gmail SMTP):</strong> Cukup tambahkan{' '}
+          <code className="rounded bg-white px-1 py-0.5 font-mono text-[10px]">GMAIL_USER</code>,{' '}
+          <code className="rounded bg-white px-1 py-0.5 font-mono text-[10px]">GMAIL_APP_PASSWORD</code>{' '}
+          (16 karakter dari Google Account → Keamanan → Sandi Aplikasi), dan{' '}
+          <code className="rounded bg-white px-1 py-0.5 font-mono text-[10px]">OWNER_ALERT_EMAIL</code>{' '}
+          di <strong>Vercel → Settings → Environment Variables</strong> lalu redeploy.
         </div>
 
         {usernameLoginLogs.length === 0 ? (
@@ -1246,6 +1430,26 @@ export function EmployeesPage({ onNavigate }: EmployeesPageProps) {
           </div>
         </div>
       )}
+
+      <ConfirmDialog
+        open={confirmState.open}
+        variant={confirmState.variant}
+        title={confirmState.title}
+        description={confirmState.description}
+        confirmLabel={confirmState.confirmLabel}
+        cancelLabel="Batal"
+        isBusy={confirmBusy}
+        onCancel={() => setConfirmState((prev) => ({ ...prev, open: false }))}
+        onConfirm={async () => {
+          setConfirmBusy(true);
+          try {
+            await confirmState.onConfirm();
+          } finally {
+            setConfirmBusy(false);
+            setConfirmState((prev) => ({ ...prev, open: false }));
+          }
+        }}
+      />
     </div>
   );
 }

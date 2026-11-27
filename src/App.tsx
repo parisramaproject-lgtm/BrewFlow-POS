@@ -16,6 +16,7 @@ import { PurchasingPage } from './pages/PurchasingPage';
 import { SettingsPage } from './pages/SettingsPage';
 import { StockOpnamePage } from './pages/StockOpnamePage';
 import { TVDisplayPage } from './pages/TVDisplayPage';
+import { VendorsPage } from './pages/VendorsPage';
 import { VouchersPage } from './pages/VouchersPage';
 import type { PageId } from './types';
 import { getDefaultPageForRole } from './utils/rbac';
@@ -29,6 +30,7 @@ const VALID_PAGES: PageId[] = [
   'menu-hpp',
   'inventory',
   'purchasing',
+  'vendors',
   'stock-opname',
   'membership',
   'tv-display',
@@ -112,6 +114,8 @@ function AuthenticatedApp() {
         return <InventoryPage searchQuery={searchQuery} />;
       case 'purchasing':
         return <PurchasingPage />;
+      case 'vendors':
+        return <VendorsPage searchQuery={searchQuery} onNavigate={handleSelectPage} />;
       case 'stock-opname':
         return <StockOpnamePage />;
       case 'membership':

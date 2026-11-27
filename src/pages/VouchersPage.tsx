@@ -11,6 +11,7 @@ import {
   Trash2,
   X,
 } from 'lucide-react';
+import { ConfirmDialog } from '../components/common/ConfirmDialog';
 import { useAuth } from '../context/AuthContext';
 import { useStore } from '../context/StoreContext';
 import type { VoucherRecord, VoucherSchemeType } from '../types';
@@ -124,6 +125,13 @@ export function VouchersPage({ searchQuery }: VouchersPageProps) {
   const [form, setForm] = useState<VoucherFormState>(buildDefaultFormState);
   const [formError, setFormError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  const [deletingVoucher, setDeletingVoucher] = useState<VoucherRecord | null>(null);
+  const [pendingEditVoucher, setPendingEditVoucher] = useState<{
+    id: string;
+    code: string;
+    title: string;
+    payload: Parameters<typeof updateVoucher>[1];
+  } | null>(null);
 
   const now = new Date();
 
@@ -319,21 +327,26 @@ export function VouchersPage({ searchQuery }: VouchersPageProps) {
       created_by_name: user?.full_name || 'Owner',
     };
 
-    setSubmitting(true);
-    try {
-      if (editingVoucherId) {
-        const res = await updateVoucher(editingVoucherId, {
-          ...template,
-          code: normalizeVoucherCode(form.code),
-        });
-        if (!res.ok) {
-          setFormError(res.error || 'Gagal memperbarui voucher.');
-          return;
-        }
-        setModalOpen(false);
-        showToast(`Voucher ${normalizeVoucherCode(form.code)} berhasil diperbarui.`);
+    if (editingVoucherId) {
+      const normalizedCode = normalizeVoucherCode(form.code);
+      if (normalizedCode.length < 3) {
+        setFormError('Kode voucher minimal 3 karakter.');
         return;
       }
+      setPendingEditVoucher({
+        id: editingVoucherId,
+        code: normalizedCode,
+        title: template.title,
+        payload: {
+          ...template,
+          code: normalizedCode,
+        },
+      });
+      return;
+    }
+
+    setSubmitting(true);
+    try {
 
       if (form.mode === 'batch') {
         const safeCount = Math.max(2, Math.min(50, Number(form.batchCount) || 5));
@@ -685,10 +698,7 @@ export function VouchersPage({ searchQuery }: VouchersPageProps) {
                               </button>
                               <button
                                 type="button"
-                                onClick={() => {
-                                  deleteVoucher(voucher.id);
-                                  showToast(`Voucher ${voucher.code} telah dihapus.`);
-                                }}
+                                onClick={() => setDeletingVoucher(voucher)}
                                 aria-label={`Hapus voucher ${voucher.code}`}
                                 className="inline-flex h-8 w-8 items-center justify-center rounded-lg border border-[#E5E7EB] text-[#6B7280] hover:border-[#EF4444] hover:text-[#EF4444]"
                               >
@@ -1346,6 +1356,67 @@ export function VouchersPage({ searchQuery }: VouchersPageProps) {
           </div>
         </div>
       )}
+
+      <ConfirmDialog
+        open={Boolean(deletingVoucher)}
+        variant="danger"
+        title="Hapus Voucher Promo?"
+        description={
+          deletingVoucher && (
+            <span>
+              Voucher <strong className="font-mono text-[#1A2E26]">{deletingVoucher.code}</strong> (
+              {deletingVoucher.title}) akan dihapus permanen dan tidak bisa digunakan lagi di Kasir.
+            </span>
+          )
+        }
+        confirmLabel="Ya, Hapus Voucher"
+        cancelLabel="Batal"
+        onCancel={() => setDeletingVoucher(null)}
+        onConfirm={() => {
+          if (!deletingVoucher) return;
+          const removedCode = deletingVoucher.code;
+          deleteVoucher(deletingVoucher.id);
+          setDeletingVoucher(null);
+          showToast(`Voucher ${removedCode} telah dihapus.`);
+        }}
+      />
+
+      <ConfirmDialog
+        open={Boolean(pendingEditVoucher)}
+        variant="warning"
+        title="Konfirmasi Perubahan Voucher"
+        description={
+          pendingEditVoucher && (
+            <span>
+              Simpan perubahan pada voucher{' '}
+              <strong className="font-mono text-[#1A2E26]">{pendingEditVoucher.code}</strong> (
+              {pendingEditVoucher.title})? Aturan promo baru langsung berlaku di Kasir/POS.
+            </span>
+          )
+        }
+        confirmLabel="Ya, Simpan Perubahan"
+        cancelLabel="Batal"
+        isBusy={submitting}
+        onCancel={() => setPendingEditVoucher(null)}
+        onConfirm={async () => {
+          if (!pendingEditVoucher) return;
+          setSubmitting(true);
+          try {
+            const res = await updateVoucher(pendingEditVoucher.id, pendingEditVoucher.payload);
+            if (!res.ok) {
+              setFormError(res.error || 'Gagal memperbarui voucher.');
+              setPendingEditVoucher(null);
+              return;
+            }
+            const savedCode = pendingEditVoucher.code;
+            setPendingEditVoucher(null);
+            setModalOpen(false);
+            showToast(`Voucher ${savedCode} berhasil diperbarui.`);
+          } finally {
+            setSubmitting(false);
+          }
+        }}
+      />
     </div>
   );
 }
