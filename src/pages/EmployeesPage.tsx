@@ -8,6 +8,7 @@ import {
   Info,
   KeyRound,
   Lock,
+  LogOut,
   Mail,
   Pencil,
   Plus,
@@ -71,6 +72,7 @@ export function EmployeesPage({ onNavigate }: EmployeesPageProps) {
     updateEmployee,
     setEmployeeCredentials,
     deleteEmployee,
+    revokeAllEmployeeSessions,
     updateEmployeeRole,
   } = useStore();
 
@@ -192,7 +194,7 @@ export function EmployeesPage({ onNavigate }: EmployeesPageProps) {
       }
       const passCheck = validatePassword(password);
       if (!passCheck.valid) {
-        setErrorMsg(passCheck.error || 'Kata sandi minimal 6 karakter.');
+        setErrorMsg(passCheck.error || 'Kata sandi minimal 8 karakter.');
         return;
       }
     } else if (password.trim()) {
@@ -639,7 +641,7 @@ export function EmployeesPage({ onNavigate }: EmployeesPageProps) {
               type="password"
               value={password}
               onChange={(e) => setPassword(e.target.value)}
-              placeholder="Password Login Username (min. 6 karakter)"
+              placeholder="Password Login Username (min. 8 karakter)"
               className="h-10 rounded-xl border border-[#E5E7EB] px-3 text-xs text-[#1A2E26] focus:border-[#109A58] focus:outline-none"
             />
           </div>
@@ -1241,7 +1243,7 @@ export function EmployeesPage({ onNavigate }: EmployeesPageProps) {
                         placeholder={
                           detailEmployee.has_password
                             ? 'Kosongkan jika tidak diubah'
-                            : 'Minimal 6 karakter'
+                            : 'Minimal 8 karakter'
                         }
                         className="h-10 w-full rounded-xl border border-[#E5E7EB] bg-white pl-3 pr-9 text-xs text-[#1A2E26] focus:border-[#109A58] focus:outline-none"
                       />
@@ -1267,6 +1269,45 @@ export function EmployeesPage({ onNavigate }: EmployeesPageProps) {
                   otomatis mengirim email konfirmasi ke{' '}
                   <strong>{settings.ownerLoginAlertEmail || DEFAULT_OWNER_ALERT_EMAIL}</strong>.
                 </p>
+                <div className="flex flex-wrap items-center justify-between gap-2 border-t border-[#109A58]/15 pt-2.5">
+                  <span className="text-[11px] text-[#4B5563]">
+                    Paksa keluar dari semua perangkat jika perangkat hilang atau akun mencurigakan.
+                  </span>
+                  <button
+                    type="button"
+                    data-testid="revoke-all-sessions-btn"
+                    onClick={() => {
+                      const targetEmp = detailEmployee;
+                      setConfirmState({
+                        open: true,
+                        variant: 'danger',
+                        title: 'Cabut Semua Sesi Aktif?',
+                        description: (
+                          <span>
+                            Seluruh sesi login username milik{' '}
+                            <strong className="text-[#1A2E26]">{targetEmp.full_name}</strong> di
+                            semua perangkat akan segera dikeluarkan dan wajib login ulang.
+                          </span>
+                        ),
+                        confirmLabel: 'Ya, Cabut Semua Sesi',
+                        onConfirm: async () => {
+                          const res = await revokeAllEmployeeSessions(targetEmp.id);
+                          if (!res.ok) {
+                            notify(res.error || 'Gagal mencabut sesi aktif karyawan.');
+                          } else {
+                            notify(
+                              `Berhasil mencabut ${res.revokedCount ?? 0} sesi aktif untuk "${targetEmp.full_name}".`
+                            );
+                          }
+                        },
+                      });
+                    }}
+                    className="inline-flex items-center gap-1.5 rounded-full border border-[#FCA5A5] bg-white px-3 py-1.5 text-[11px] font-semibold text-[#DC2626] transition-colors hover:bg-[#FEF2F2] whitespace-nowrap"
+                  >
+                    <LogOut className="h-3.5 w-3.5" />
+                    <span>Cabut Semua Sesi Aktif</span>
+                  </button>
+                </div>
               </div>
 
               <div className="grid grid-cols-1 gap-3.5 sm:grid-cols-2">

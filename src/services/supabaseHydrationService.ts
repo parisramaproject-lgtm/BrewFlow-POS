@@ -1,5 +1,6 @@
 import { isSupabaseConfigured, supabase } from '../lib/supabase';
 import type {
+  AppNotification,
   AssetCondition,
   Category,
   Customer,
@@ -12,20 +13,29 @@ import type {
   MembershipProgramConfig,
   MenuItem,
   MenuRecipeItem,
+  OperationalNotificationType,
   OrderItemRecord,
   OrderRecord,
   OrderStatus,
   OrderType,
+  PageId,
   PaymentMethod,
   PurchaseItemRecord,
   PurchaseRecord,
+  RestockRequestRecord,
+  RestockRequestStatus,
   StockOpnameDetailItem,
   StockOpnameLog,
   StockOpnameSchedule,
   StoreSettings,
   StoreVideoItem,
+  UserRole,
+  UsernameLoginAuditLog,
+  VendorRecord,
   VoucherRecord,
   VoucherSchemeType,
+  WhatsAppEventType,
+  WhatsAppLogEntry,
 } from '../types';
 import type { SupabaseSyncStatus } from './posService';
 
@@ -49,11 +59,77 @@ export interface HydratedSupabaseData {
   redemptionLogs?: MemberRedemptionLog[];
   storeVideos?: StoreVideoItem[];
   vouchers?: VoucherRecord[];
+  vendors?: VendorRecord[];
+  restockRequests?: RestockRequestRecord[];
+  customNotifications?: AppNotification[];
+  whatsappLogs?: WhatsAppLogEntry[];
+  loginAuditLogs?: UsernameLoginAuditLog[];
+}
+
+function mapStoreSettingsRow(
+  s: Record<string, unknown>,
+  defaultSettings: StoreSettings
+): Partial<StoreSettings> {
+  return {
+    shopName: typeof s.shop_name === 'string' ? s.shop_name : defaultSettings.shopName,
+    address: typeof s.address === 'string' ? s.address : defaultSettings.address,
+    phone: typeof s.phone === 'string' ? s.phone : defaultSettings.phone,
+    customerServiceContact:
+      typeof s.customer_service_contact === 'string'
+        ? s.customer_service_contact
+        : defaultSettings.customerServiceContact,
+    shopLogoUrl: typeof s.shop_logo_url === 'string' ? s.shop_logo_url : null,
+    taxEnabled: typeof s.tax_enabled === 'boolean' ? s.tax_enabled : defaultSettings.taxEnabled,
+    taxPercent:
+      typeof s.tax_percent === 'number'
+        ? s.tax_percent
+        : Number(s.tax_percent) || defaultSettings.taxPercent,
+    taxLabel: typeof s.tax_label === 'string' ? s.tax_label : defaultSettings.taxLabel,
+    receiptPaperWidth: s.receipt_paper_width === '80mm' ? '80mm' : '58mm',
+    receiptHeaderText:
+      typeof s.receipt_header_text === 'string'
+        ? s.receipt_header_text
+        : defaultSettings.receiptHeaderText,
+    receiptFooterText:
+      typeof s.receipt_footer_text === 'string'
+        ? s.receipt_footer_text
+        : defaultSettings.receiptFooterText,
+    receiptShowLogo:
+      typeof s.receipt_show_logo === 'boolean'
+        ? s.receipt_show_logo
+        : defaultSettings.receiptShowLogo,
+    receiptShowCashierAndTable:
+      typeof s.receipt_show_cashier_and_table === 'boolean'
+        ? s.receipt_show_cashier_and_table
+        : defaultSettings.receiptShowCashierAndTable,
+    receiptShowMemberInfo:
+      typeof s.receipt_show_member_info === 'boolean'
+        ? s.receipt_show_member_info
+        : defaultSettings.receiptShowMemberInfo,
+    receiptShowCustomerService:
+      typeof s.receipt_show_customer_service === 'boolean'
+        ? s.receipt_show_customer_service
+        : defaultSettings.receiptShowCustomerService,
+    whatsappOwnerPhone:
+      typeof s.whatsapp_owner_phone === 'string'
+        ? s.whatsapp_owner_phone
+        : defaultSettings.whatsappOwnerPhone,
+    whatsappManagerPhone:
+      typeof s.whatsapp_manager_phone === 'string'
+        ? s.whatsapp_manager_phone
+        : defaultSettings.whatsappManagerPhone,
+    ownerLoginAlertEmail:
+      typeof s.owner_login_alert_email === 'string' && s.owner_login_alert_email.trim()
+        ? s.owner_login_alert_email
+        : defaultSettings.ownerLoginAlertEmail,
+  };
 }
 
 /**
  * Hydrates all operational BrewFlow POS tables from Supabase in parallel.
- * Tables that don't exist yet or return 0 rows are safely omitted so existing local state stays intact.
+ * - Returns `[]` for tables whose query succeeded with 0 rows (prevents demo seed data leakage!).
+ * - Falls back to safe RPCs (`get_pos_stock_levels`, `get_pos_store_settings`) for Cashier role
+ *   where strict RLS restricts direct access to cost/secret columns.
  */
 export async function hydrateAllTablesFromSupabase(
   defaultSettings: StoreSettings
@@ -78,37 +154,51 @@ export async function hydrateAllTablesFromSupabase(
     redemptionRes,
     videoRes,
     voucherRes,
+    vendorRes,
+    restockRes,
+    notifRes,
+    waLogRes,
+    loginAuditRes,
   ] = await Promise.allSettled([
     supabase.from('categories').select('*').order('sort_order', { ascending: true }),
     supabase.from('inventory_items').select('*').order('name', { ascending: true }),
     supabase.from('menus').select('*').order('name', { ascending: true }),
     supabase.from('menu_recipes').select('*'),
-    supabase.from('customers').select('*').order('created_at', { ascending: false }),
-    supabase.from('orders').select('*').order('created_at', { ascending: false }).limit(200),
-    supabase.from('order_items').select('*').limit(1000),
-    supabase.from('purchases').select('*').order('purchase_date', { ascending: false }).limit(200),
-    supabase.from('purchase_items').select('*').limit(1000),
+    supabase.from('customers').select('*').order('created_at', { ascending: false }).limit(2000),
+    supabase.from('orders').select('*').order('created_at', { ascending: false }).limit(1000),
+    supabase.from('order_items').select('*').limit(5000),
+    supabase.from('purchases').select('*').order('purchase_date', { ascending: false }).limit(500),
+    supabase.from('purchase_items').select('*').limit(2000),
     supabase.from('stock_opname_schedules').select('*').order('created_at', { ascending: false }),
     supabase
       .from('stock_opname_logs')
       .select('*')
       .order('completed_at', { ascending: false })
-      .limit(100),
-    supabase.from('stock_opname_details').select('*').limit(1500),
+      .limit(200),
+    supabase.from('stock_opname_details').select('*').limit(3000),
     supabase.from('store_settings').select('*').eq('id', 'default').maybeSingle(),
     supabase.from('membership_program_settings').select('*').eq('id', 'default').maybeSingle(),
     supabase
       .from('member_redemption_logs')
       .select('*')
       .order('redeemed_at', { ascending: false })
-      .limit(200),
+      .limit(300),
     supabase.from('store_videos').select('*').order('sort_order', { ascending: true }),
     supabase.from('vouchers').select('*').order('created_at', { ascending: false }),
+    supabase.from('vendors').select('*').order('created_at', { ascending: false }),
+    supabase.from('restock_requests').select('*').order('created_at', { ascending: false }).limit(200),
+    supabase
+      .from('operational_notifications')
+      .select('*')
+      .order('created_at', { ascending: false })
+      .limit(100),
+    supabase.from('whatsapp_logs').select('*').order('sent_at', { ascending: false }).limit(200),
+    supabase.from('login_audit_logs').select('*').order('logged_in_at', { ascending: false }).limit(100),
   ]);
 
   const result: HydratedSupabaseData = {};
 
-  if (catRes.status === 'fulfilled' && !catRes.value.error && Array.isArray(catRes.value.data) && catRes.value.data.length > 0) {
+  if (catRes.status === 'fulfilled' && !catRes.value.error && Array.isArray(catRes.value.data)) {
     result.categories = catRes.value.data.map((row) => ({
       id: String(row.id),
       name: String(row.name),
@@ -118,7 +208,12 @@ export async function hydrateAllTablesFromSupabase(
   }
 
   let inventoryMap = new Map<string, InventoryItem>();
-  if (invRes.status === 'fulfilled' && !invRes.value.error && Array.isArray(invRes.value.data) && invRes.value.data.length > 0) {
+  if (
+    invRes.status === 'fulfilled' &&
+    !invRes.value.error &&
+    Array.isArray(invRes.value.data) &&
+    invRes.value.data.length > 0
+  ) {
     const mappedInv: InventoryItem[] = invRes.value.data.map((row) => ({
       id: String(row.id),
       name: String(row.name),
@@ -134,9 +229,41 @@ export async function hydrateAllTablesFromSupabase(
     }));
     result.inventory = mappedInv;
     inventoryMap = new Map(mappedInv.map((item) => [item.id, item]));
+  } else {
+    // Fallback for Cashier role blocked by strict RLS on `inventory_items` (no cost/HPP exposed)
+    try {
+      const { data: safeStockRows, error: rpcErr } = await supabase.rpc('get_pos_stock_levels');
+      if (!rpcErr && Array.isArray(safeStockRows)) {
+        const mappedInv: InventoryItem[] = safeStockRows.map((row: Record<string, unknown>) => ({
+          id: String(row.id),
+          name: String(row.name),
+          sku: String(row.sku || ''),
+          category_type: (row.category_type as ItemCategoryType) || 'raw_material',
+          expense_category: (row.expense_category as ExpenseCategoryId) || undefined,
+          unit: String(row.unit || 'pcs'),
+          current_stock: Number(row.current_stock) || 0,
+          min_stock_threshold: Number(row.min_stock_threshold) || 0,
+          last_purchase_price: 0,
+          asset_condition: (row.asset_condition as AssetCondition) || undefined,
+          updated_at: String(row.updated_at || new Date().toISOString()),
+        }));
+        result.inventory = mappedInv;
+        inventoryMap = new Map(mappedInv.map((item) => [item.id, item]));
+      } else if (
+        invRes.status === 'fulfilled' &&
+        !invRes.value.error &&
+        Array.isArray(invRes.value.data)
+      ) {
+        result.inventory = [];
+      }
+    } catch {
+      if (invRes.status === 'fulfilled' && !invRes.value.error && Array.isArray(invRes.value.data)) {
+        result.inventory = [];
+      }
+    }
   }
 
-  if (menuRes.status === 'fulfilled' && !menuRes.value.error && Array.isArray(menuRes.value.data) && menuRes.value.data.length > 0) {
+  if (menuRes.status === 'fulfilled' && !menuRes.value.error && Array.isArray(menuRes.value.data)) {
     const recipeList: MenuRecipeItem[] =
       recipeRes.status === 'fulfilled' && !recipeRes.value.error && Array.isArray(recipeRes.value.data)
         ? recipeRes.value.data.map((r) => ({
@@ -167,7 +294,7 @@ export async function hydrateAllTablesFromSupabase(
     }));
   }
 
-  if (custRes.status === 'fulfilled' && !custRes.value.error && Array.isArray(custRes.value.data) && custRes.value.data.length > 0) {
+  if (custRes.status === 'fulfilled' && !custRes.value.error && Array.isArray(custRes.value.data)) {
     result.customers = custRes.value.data.map((row) => ({
       id: String(row.id),
       name: String(row.name),
@@ -180,7 +307,7 @@ export async function hydrateAllTablesFromSupabase(
     }));
   }
 
-  if (orderRes.status === 'fulfilled' && !orderRes.value.error && Array.isArray(orderRes.value.data) && orderRes.value.data.length > 0) {
+  if (orderRes.status === 'fulfilled' && !orderRes.value.error && Array.isArray(orderRes.value.data)) {
     const itemsByOrder = new Map<string, OrderItemRecord[]>();
     if (orderItemRes.status === 'fulfilled' && !orderItemRes.value.error && Array.isArray(orderItemRes.value.data)) {
       for (const row of orderItemRes.value.data) {
@@ -192,6 +319,8 @@ export async function hydrateAllTablesFromSupabase(
           menu_name: String(row.menu_name || 'Menu'),
           quantity: Number(row.quantity) || 1,
           unit_price: Number(row.unit_price) || 0,
+          unit_hpp:
+            row.unit_hpp !== null && row.unit_hpp !== undefined ? Number(row.unit_hpp) : undefined,
           subtotal: Number(row.subtotal) || 0,
           notes: row.notes ? String(row.notes) : undefined,
         });
@@ -214,15 +343,20 @@ export async function hydrateAllTablesFromSupabase(
       voucher_discount_amount: Number(row.voucher_discount_amount) || 0,
       tax_amount: Number(row.tax_amount) || 0,
       total_amount: Number(row.total_amount) || 0,
+      points_earned:
+        row.points_earned !== null && row.points_earned !== undefined
+          ? Number(row.points_earned)
+          : undefined,
       payment_method: (row.payment_method as PaymentMethod) || 'cash',
       status: (row.status as OrderStatus) || 'completed',
+      sync_status: 'synced',
       notes: String(row.notes || ''),
       items: itemsByOrder.get(String(row.id)) ?? [],
       created_at: String(row.created_at || new Date().toISOString()),
     }));
   }
 
-  if (purchaseRes.status === 'fulfilled' && !purchaseRes.value.error && Array.isArray(purchaseRes.value.data) && purchaseRes.value.data.length > 0) {
+  if (purchaseRes.status === 'fulfilled' && !purchaseRes.value.error && Array.isArray(purchaseRes.value.data)) {
     const itemsByPurchase = new Map<string, PurchaseItemRecord[]>();
     if (purchaseItemRes.status === 'fulfilled' && !purchaseItemRes.value.error && Array.isArray(purchaseItemRes.value.data)) {
       for (const row of purchaseItemRes.value.data) {
@@ -255,7 +389,7 @@ export async function hydrateAllTablesFromSupabase(
   }
 
   let scheduleTitleMap = new Map<string, string>();
-  if (scheduleRes.status === 'fulfilled' && !scheduleRes.value.error && Array.isArray(scheduleRes.value.data) && scheduleRes.value.data.length > 0) {
+  if (scheduleRes.status === 'fulfilled' && !scheduleRes.value.error && Array.isArray(scheduleRes.value.data)) {
     const mappedSchedules: StockOpnameSchedule[] = scheduleRes.value.data.map((row) => ({
       id: String(row.id),
       title: String(row.title),
@@ -272,7 +406,7 @@ export async function hydrateAllTablesFromSupabase(
     scheduleTitleMap = new Map(mappedSchedules.map((s) => [s.id, s.title]));
   }
 
-  if (opnameLogRes.status === 'fulfilled' && !opnameLogRes.value.error && Array.isArray(opnameLogRes.value.data) && opnameLogRes.value.data.length > 0) {
+  if (opnameLogRes.status === 'fulfilled' && !opnameLogRes.value.error && Array.isArray(opnameLogRes.value.data)) {
     const detailsByLog = new Map<string, StockOpnameDetailItem[]>();
     if (opnameDetailRes.status === 'fulfilled' && !opnameDetailRes.value.error && Array.isArray(opnameDetailRes.value.data)) {
       for (const row of opnameDetailRes.value.data) {
@@ -323,60 +457,23 @@ export async function hydrateAllTablesFromSupabase(
   }
 
   if (settingsRes.status === 'fulfilled' && !settingsRes.value.error && settingsRes.value.data) {
-    const s = settingsRes.value.data as Record<string, unknown>;
-    result.settings = {
-      shopName: typeof s.shop_name === 'string' ? s.shop_name : defaultSettings.shopName,
-      address: typeof s.address === 'string' ? s.address : defaultSettings.address,
-      phone: typeof s.phone === 'string' ? s.phone : defaultSettings.phone,
-      customerServiceContact:
-        typeof s.customer_service_contact === 'string'
-          ? s.customer_service_contact
-          : defaultSettings.customerServiceContact,
-      shopLogoUrl: typeof s.shop_logo_url === 'string' ? s.shop_logo_url : null,
-      taxEnabled: typeof s.tax_enabled === 'boolean' ? s.tax_enabled : defaultSettings.taxEnabled,
-      taxPercent:
-        typeof s.tax_percent === 'number'
-          ? s.tax_percent
-          : Number(s.tax_percent) || defaultSettings.taxPercent,
-      taxLabel: typeof s.tax_label === 'string' ? s.tax_label : defaultSettings.taxLabel,
-      receiptPaperWidth: s.receipt_paper_width === '80mm' ? '80mm' : '58mm',
-      receiptHeaderText:
-        typeof s.receipt_header_text === 'string'
-          ? s.receipt_header_text
-          : defaultSettings.receiptHeaderText,
-      receiptFooterText:
-        typeof s.receipt_footer_text === 'string'
-          ? s.receipt_footer_text
-          : defaultSettings.receiptFooterText,
-      receiptShowLogo:
-        typeof s.receipt_show_logo === 'boolean'
-          ? s.receipt_show_logo
-          : defaultSettings.receiptShowLogo,
-      receiptShowCashierAndTable:
-        typeof s.receipt_show_cashier_and_table === 'boolean'
-          ? s.receipt_show_cashier_and_table
-          : defaultSettings.receiptShowCashierAndTable,
-      receiptShowMemberInfo:
-        typeof s.receipt_show_member_info === 'boolean'
-          ? s.receipt_show_member_info
-          : defaultSettings.receiptShowMemberInfo,
-      receiptShowCustomerService:
-        typeof s.receipt_show_customer_service === 'boolean'
-          ? s.receipt_show_customer_service
-          : defaultSettings.receiptShowCustomerService,
-      whatsappOwnerPhone:
-        typeof s.whatsapp_owner_phone === 'string'
-          ? s.whatsapp_owner_phone
-          : defaultSettings.whatsappOwnerPhone,
-      whatsappManagerPhone:
-        typeof s.whatsapp_manager_phone === 'string'
-          ? s.whatsapp_manager_phone
-          : defaultSettings.whatsappManagerPhone,
-      ownerLoginAlertEmail:
-        typeof s.owner_login_alert_email === 'string' && s.owner_login_alert_email.trim()
-          ? s.owner_login_alert_email
-          : defaultSettings.ownerLoginAlertEmail,
-    };
+    result.settings = mapStoreSettingsRow(
+      settingsRes.value.data as Record<string, unknown>,
+      defaultSettings
+    );
+  } else {
+    // Fallback for Cashier role blocked by strict RLS on `store_settings`
+    try {
+      const { data: safeSettings, error: safeErr } = await supabase.rpc('get_pos_store_settings');
+      if (!safeErr && safeSettings && typeof safeSettings === 'object') {
+        result.settings = mapStoreSettingsRow(
+          safeSettings as Record<string, unknown>,
+          defaultSettings
+        );
+      }
+    } catch {
+      // Ignore if RPC not yet deployed
+    }
   }
 
   if (
@@ -391,8 +488,7 @@ export async function hydrateAllTablesFromSupabase(
   if (
     redemptionRes.status === 'fulfilled' &&
     !redemptionRes.value.error &&
-    Array.isArray(redemptionRes.value.data) &&
-    redemptionRes.value.data.length > 0
+    Array.isArray(redemptionRes.value.data)
   ) {
     result.redemptionLogs = redemptionRes.value.data.map((row) => ({
       id: String(row.id),
@@ -406,12 +502,7 @@ export async function hydrateAllTablesFromSupabase(
     }));
   }
 
-  if (
-    videoRes.status === 'fulfilled' &&
-    !videoRes.value.error &&
-    Array.isArray(videoRes.value.data) &&
-    videoRes.value.data.length > 0
-  ) {
+  if (videoRes.status === 'fulfilled' && !videoRes.value.error && Array.isArray(videoRes.value.data)) {
     result.storeVideos = videoRes.value.data.map((row) => ({
       id: String(row.id),
       title: String(row.title),
@@ -426,12 +517,7 @@ export async function hydrateAllTablesFromSupabase(
     }));
   }
 
-  if (
-    voucherRes.status === 'fulfilled' &&
-    !voucherRes.value.error &&
-    Array.isArray(voucherRes.value.data) &&
-    voucherRes.value.data.length > 0
-  ) {
+  if (voucherRes.status === 'fulfilled' && !voucherRes.value.error && Array.isArray(voucherRes.value.data)) {
     result.vouchers = voucherRes.value.data.map((row) => ({
       id: String(row.id),
       code: String(row.code || '').toUpperCase(),
@@ -464,6 +550,107 @@ export async function hydrateAllTablesFromSupabase(
       is_active: row.is_active !== false,
       created_by_name: row.created_by_name ? String(row.created_by_name) : undefined,
       created_at: String(row.created_at || new Date().toISOString()),
+    }));
+  }
+
+  // Multi-device operational tables (P1-1)
+  if (vendorRes.status === 'fulfilled' && !vendorRes.value.error && Array.isArray(vendorRes.value.data)) {
+    result.vendors = vendorRes.value.data.map((row) => ({
+      id: String(row.id),
+      name: String(row.name),
+      contact_person: String(row.contact_person || ''),
+      phone: String(row.phone || row.phone_number || ''),
+      email: row.email ? String(row.email) : undefined,
+      category_type: (row.category_type as ItemCategoryType) || 'raw_material',
+      supplied_items: Array.isArray(row.supplied_items)
+        ? row.supplied_items.map((item: unknown) => String(item))
+        : typeof row.supplied_items === 'string' && row.supplied_items.trim()
+          ? row.supplied_items.split(',').map((s: string) => s.trim()).filter(Boolean)
+          : [],
+      address: row.address ? String(row.address) : undefined,
+      payment_terms: row.payment_terms ? String(row.payment_terms) : undefined,
+      notes: row.notes ? String(row.notes) : undefined,
+      is_active: row.is_active !== false,
+      created_at: String(row.created_at || new Date().toISOString()),
+    }));
+  }
+
+  if (restockRes.status === 'fulfilled' && !restockRes.value.error && Array.isArray(restockRes.value.data)) {
+    result.restockRequests = restockRes.value.data.map((row) => ({
+      id: String(row.id),
+      inventory_item_id: String(row.inventory_item_id || ''),
+      item_name: String(row.item_name || ''),
+      unit: String(row.unit || 'pcs'),
+      current_stock: Number(row.current_stock) || 0,
+      requested_quantity: Number(row.requested_quantity) || 1,
+      urgency: row.urgency === 'urgent' ? 'urgent' : 'normal',
+      notes: row.notes ? String(row.notes) : undefined,
+      requested_by_id: String(row.requested_by_id || ''),
+      requested_by_name: String(row.requested_by_name || 'Kasir'),
+      requested_by_role: (row.requested_by_role as UserRole) || 'cashier',
+      status: (row.status as RestockRequestStatus) || 'pending',
+      handled_by_name: row.handled_by_name ? String(row.handled_by_name) : undefined,
+      created_at: String(row.created_at || new Date().toISOString()),
+      updated_at: String(row.updated_at || row.created_at || new Date().toISOString()),
+    }));
+  }
+
+  if (notifRes.status === 'fulfilled' && !notifRes.value.error && Array.isArray(notifRes.value.data)) {
+    result.customNotifications = notifRes.value.data.map((row) => {
+      const createdAt = String(row.created_at || new Date().toISOString());
+      return {
+        id: String(row.id),
+        type: (row.type as OperationalNotificationType) || 'info',
+        title: String(row.title || ''),
+        message: String(row.message || ''),
+        targetPage: (row.target_page as PageId) || 'dashboard',
+        targetRoles: Array.isArray(row.target_roles)
+          ? (row.target_roles.filter((r: unknown) =>
+              ['owner', 'manager', 'cashier'].includes(String(r))
+            ) as UserRole[])
+          : undefined,
+        senderName: row.sender_name ? String(row.sender_name) : undefined,
+        senderRole: row.sender_role ? (row.sender_role as UserRole) : undefined,
+        restockRequestId: row.restock_request_id ? String(row.restock_request_id) : undefined,
+        timestamp: new Date(createdAt).toLocaleTimeString('id-ID', {
+          hour: '2-digit',
+          minute: '2-digit',
+        }),
+        createdAt,
+        unread: row.unread !== false,
+      };
+    });
+  }
+
+  if (waLogRes.status === 'fulfilled' && !waLogRes.value.error && Array.isArray(waLogRes.value.data)) {
+    result.whatsappLogs = waLogRes.value.data.map((row) => ({
+      id: String(row.id),
+      event_type: (row.event_type as WhatsAppEventType) || 'pos_receipt',
+      targets: Array.isArray(row.targets) ? row.targets.map((t: unknown) => String(t)) : [],
+      preview: String(row.preview || ''),
+      mode: row.mode === 'local' ? 'local' : 'edge_function',
+      status: row.status === 'failed' ? 'failed' : 'sent',
+      error: row.error ? String(row.error) : undefined,
+      sent_at: String(row.sent_at || new Date().toISOString()),
+    }));
+  }
+
+  if (
+    loginAuditRes.status === 'fulfilled' &&
+    !loginAuditRes.value.error &&
+    Array.isArray(loginAuditRes.value.data)
+  ) {
+    result.loginAuditLogs = loginAuditRes.value.data.map((row) => ({
+      id: String(row.id),
+      employee_id: String(row.employee_id || ''),
+      employee_name: String(row.employee_name || ''),
+      username: String(row.username || ''),
+      role: (row.role as UserRole) || 'cashier',
+      owner_email: String(row.owner_email || ''),
+      email_status: 'sent',
+      email_provider: 'Supabase Auth Audit',
+      device_info: String(row.device_info || 'Perangkat Terverifikasi'),
+      logged_in_at: String(row.logged_in_at || new Date().toISOString()),
     }));
   }
 
@@ -729,6 +916,11 @@ export async function incrementVoucherUsageInSupabase(
   }
 }
 
+/**
+ * Cancels an order atomically in Supabase via `cancel_order_atomic` RPC
+ * (restoring recipe stock, reversing member points/spent, and restoring voucher quota),
+ * falling back to direct `orders` status update if RPC is not installed yet.
+ */
 export async function cancelOrderInSupabase(
   orderId: string,
   orderNumber: string,
@@ -738,6 +930,37 @@ export async function cancelOrderInSupabase(
     return { mode: 'local', synced: true };
   }
   try {
+    if (isUuid(orderId)) {
+      const { data: rpcData, error: rpcError } = await supabase.rpc('cancel_order_atomic', {
+        p_order_id: orderId,
+        p_reason: notes ?? null,
+      });
+
+      if (!rpcError && rpcData && typeof rpcData === 'object') {
+        const record = rpcData as { ok?: boolean; error?: string };
+        if (record.ok === true) {
+          return { mode: 'supabase', synced: true, id: orderId };
+        }
+        if (record.ok === false) {
+          return {
+            mode: 'supabase',
+            synced: false,
+            error: record.error || 'Pembatalan atomik ditolak oleh Supabase.',
+          };
+        }
+      }
+
+      const rpcMissing =
+        rpcError &&
+        (rpcError.code === 'PGRST202' ||
+          rpcError.code === '42883' ||
+          rpcError.message.toLowerCase().includes('could not find the function'));
+
+      if (rpcError && !rpcMissing) {
+        return { mode: 'supabase', synced: false, error: rpcError.message };
+      }
+    }
+
     const patch: Record<string, unknown> = { status: 'cancelled' };
     if (notes !== undefined) patch.notes = notes;
     const query = isUuid(orderId)
@@ -751,6 +974,203 @@ export async function cancelOrderInSupabase(
       mode: 'supabase',
       synced: false,
       error: err instanceof Error ? err.message : 'Gagal membatalkan pesanan di Supabase.',
+    };
+  }
+}
+
+// -----------------------------------------------------------------------------
+// Multi-Device Write Helpers (P1-1): Vendors, Restock Requests, Notifications, WA Logs
+// -----------------------------------------------------------------------------
+export async function upsertVendorToSupabase(
+  vendor: VendorRecord
+): Promise<SupabaseSyncStatus & { id?: string }> {
+  if (!isSupabaseConfigured || !supabase) return { mode: 'local', synced: true };
+  try {
+    const payload = {
+      name: vendor.name,
+      contact_person: vendor.contact_person,
+      phone: vendor.phone,
+      email: vendor.email ?? '',
+      category_type: vendor.category_type,
+      supplied_items: vendor.supplied_items ?? [],
+      address: vendor.address ?? '',
+      payment_terms: vendor.payment_terms ?? 'Cash / Transfer',
+      notes: vendor.notes ?? '',
+      is_active: vendor.is_active !== false,
+    };
+
+    if (isUuid(vendor.id)) {
+      const { error } = await supabase.from('vendors').update(payload).eq('id', vendor.id);
+      if (error) return { mode: 'supabase', synced: false, error: error.message };
+      return { mode: 'supabase', synced: true, id: vendor.id };
+    }
+
+    const { data, error } = await supabase.from('vendors').insert(payload).select('id').single();
+    if (error) return { mode: 'supabase', synced: false, error: error.message };
+    return { mode: 'supabase', synced: true, id: data?.id ? String(data.id) : undefined };
+  } catch (err) {
+    return {
+      mode: 'supabase',
+      synced: false,
+      error: err instanceof Error ? err.message : 'Gagal menyimpan data vendor ke Supabase.',
+    };
+  }
+}
+
+export async function deleteVendorFromSupabase(vendorId: string): Promise<SupabaseSyncStatus> {
+  if (!isSupabaseConfigured || !supabase || !isUuid(vendorId)) {
+    return { mode: 'local', synced: true };
+  }
+  try {
+    const { error } = await supabase.from('vendors').delete().eq('id', vendorId);
+    if (error) return { mode: 'supabase', synced: false, error: error.message };
+    return { mode: 'supabase', synced: true };
+  } catch (err) {
+    return {
+      mode: 'supabase',
+      synced: false,
+      error: err instanceof Error ? err.message : 'Gagal menghapus vendor dari Supabase.',
+    };
+  }
+}
+
+export async function insertRestockRequestToSupabase(
+  request: RestockRequestRecord
+): Promise<SupabaseSyncStatus & { id?: string }> {
+  if (!isSupabaseConfigured || !supabase) return { mode: 'local', synced: true };
+  try {
+    const { data, error } = await supabase
+      .from('restock_requests')
+      .insert({
+        inventory_item_id: isUuid(request.inventory_item_id) ? request.inventory_item_id : null,
+        item_name: request.item_name,
+        unit: request.unit,
+        current_stock: request.current_stock,
+        requested_quantity: request.requested_quantity,
+        urgency: request.urgency,
+        notes: request.notes ?? '',
+        requested_by_id: request.requested_by_id,
+        requested_by_name: request.requested_by_name,
+        requested_by_role: request.requested_by_role,
+        status: request.status,
+        handled_by_name: request.handled_by_name ?? null,
+      })
+      .select('id')
+      .single();
+
+    if (error) return { mode: 'supabase', synced: false, error: error.message };
+    return { mode: 'supabase', synced: true, id: data?.id ? String(data.id) : undefined };
+  } catch (err) {
+    return {
+      mode: 'supabase',
+      synced: false,
+      error: err instanceof Error ? err.message : 'Gagal mengirim permintaan restock ke Supabase.',
+    };
+  }
+}
+
+export async function updateRestockRequestStatusInSupabase(
+  requestId: string,
+  status: RestockRequestStatus,
+  handledByName: string
+): Promise<SupabaseSyncStatus> {
+  if (!isSupabaseConfigured || !supabase || !isUuid(requestId)) {
+    return { mode: 'local', synced: true };
+  }
+  try {
+    const { error } = await supabase
+      .from('restock_requests')
+      .update({
+        status,
+        handled_by_name: handledByName,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', requestId);
+    if (error) return { mode: 'supabase', synced: false, error: error.message };
+    return { mode: 'supabase', synced: true };
+  } catch (err) {
+    return {
+      mode: 'supabase',
+      synced: false,
+      error: err instanceof Error ? err.message : 'Gagal memperbarui status restock di Supabase.',
+    };
+  }
+}
+
+export async function insertOperationalNotificationToSupabase(
+  notif: AppNotification
+): Promise<SupabaseSyncStatus & { id?: string }> {
+  if (!isSupabaseConfigured || !supabase) return { mode: 'local', synced: true };
+  try {
+    const { data, error } = await supabase
+      .from('operational_notifications')
+      .insert({
+        type: notif.type,
+        title: notif.title,
+        message: notif.message,
+        target_page: notif.targetPage,
+        target_roles: notif.targetRoles ?? ['owner', 'manager', 'cashier'],
+        sender_name: notif.senderName ?? 'BrewFlow System',
+        sender_role: notif.senderRole ?? 'owner',
+        restock_request_id: notif.restockRequestId ?? null,
+        unread: notif.unread,
+      })
+      .select('id')
+      .single();
+    if (error) return { mode: 'supabase', synced: false, error: error.message };
+    return { mode: 'supabase', synced: true, id: data?.id ? String(data.id) : undefined };
+  } catch (err) {
+    return {
+      mode: 'supabase',
+      synced: false,
+      error: err instanceof Error ? err.message : 'Gagal menyimpan notifikasi ke Supabase.',
+    };
+  }
+}
+
+export async function markOperationalNotificationReadInSupabase(
+  notificationId: string
+): Promise<SupabaseSyncStatus> {
+  if (!isSupabaseConfigured || !supabase || !isUuid(notificationId)) {
+    return { mode: 'local', synced: true };
+  }
+  try {
+    const { error } = await supabase
+      .from('operational_notifications')
+      .update({ unread: false })
+      .eq('id', notificationId);
+    if (error) return { mode: 'supabase', synced: false, error: error.message };
+    return { mode: 'supabase', synced: true };
+  } catch (err) {
+    return {
+      mode: 'supabase',
+      synced: false,
+      error: err instanceof Error ? err.message : 'Gagal menandai notifikasi telah dibaca.',
+    };
+  }
+}
+
+export async function insertWhatsAppLogToSupabase(
+  log: WhatsAppLogEntry
+): Promise<SupabaseSyncStatus> {
+  if (!isSupabaseConfigured || !supabase) return { mode: 'local', synced: true };
+  try {
+    const { error } = await supabase.from('whatsapp_logs').insert({
+      event_type: log.event_type,
+      targets: log.targets,
+      preview: log.preview,
+      mode: log.mode,
+      status: log.status,
+      error: log.error ?? null,
+      sent_at: log.sent_at,
+    });
+    if (error) return { mode: 'supabase', synced: false, error: error.message };
+    return { mode: 'supabase', synced: true };
+  } catch (err) {
+    return {
+      mode: 'supabase',
+      synced: false,
+      error: err instanceof Error ? err.message : 'Gagal menyimpan log WhatsApp ke Supabase.',
     };
   }
 }

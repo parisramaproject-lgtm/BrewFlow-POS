@@ -1,3 +1,4 @@
+import { useMemo, useState } from 'react';
 import { AlertTriangle, ArrowRight, ClipboardCheck, TrendingUp } from 'lucide-react';
 import { useAuth } from '../context/AuthContext';
 import { useStore } from '../context/StoreContext';
@@ -10,24 +11,65 @@ interface DashboardPageProps {
   onNavigate: (page: PageId) => void;
 }
 
+type DashboardPeriod = 'today' | '7d' | '30d' | 'all';
+
+const PERIOD_OPTIONS: Array<{ id: DashboardPeriod; label: string; kpiTitle: string }> = [
+  { id: 'today', label: 'Hari Ini', kpiTitle: 'Penjualan Hari Ini' },
+  { id: '7d', label: '7 Hari', kpiTitle: 'Penjualan 7 Hari' },
+  { id: '30d', label: '30 Hari', kpiTitle: 'Penjualan 30 Hari' },
+  { id: 'all', label: 'Semua', kpiTitle: 'Total Penjualan' },
+];
+
+function toLocalDateKey(date: Date): string {
+  const y = date.getFullYear();
+  const m = String(date.getMonth() + 1).padStart(2, '0');
+  const d = String(date.getDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
+}
+
 export function DashboardPage({ onNavigate }: DashboardPageProps) {
   const { user } = useAuth();
   const { orders, menus, inventory, customers, lowStockItems, hasDueOpname, dueOpnameSchedules } =
     useStore();
+  const [period, setPeriod] = useState<DashboardPeriod>('today');
+
+  const completedOrders = useMemo(() => {
+    const now = new Date();
+    const todayKey = toLocalDateKey(now);
+    const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+    const msPerDay = 24 * 60 * 60 * 1000;
+
+    return orders.filter((o) => {
+      if (o.status !== 'completed') return false;
+      if (period === 'all') return true;
+      const created = new Date(o.created_at);
+      if (Number.isNaN(created.getTime())) return false;
+      if (period === 'today') {
+        return toLocalDateKey(created) === todayKey;
+      }
+      const lookbackDays = period === '7d' ? 6 : 29;
+      return created.getTime() >= startOfToday - lookbackDays * msPerDay;
+    });
+  }, [orders, period]);
 
   if (!user) return null;
 
-  const completedOrders = orders.filter((o) => o.status === 'completed');
+  const activePeriodMeta =
+    PERIOD_OPTIONS.find((opt) => opt.id === period) ?? PERIOD_OPTIONS[0];
   const totalRevenue = completedOrders.reduce((sum, o) => sum + o.total_amount, 0);
   const avgOrderValue = completedOrders.length > 0 ? totalRevenue / completedOrders.length : 0;
 
-  // Owner-only profit calculation based on BOM HPP
+  // Owner-only profit calculation preferring historical item.unit_hpp snapshot at checkout
   const canSeeProfit = canViewFinancialProfit(user.role);
   const menuById = new Map(menus.map((m) => [m.id, m]));
   let totalEstimatedHpp = 0;
   if (canSeeProfit) {
     for (const order of completedOrders) {
       for (const item of order.items) {
+        if (typeof item.unit_hpp === 'number' && Number.isFinite(item.unit_hpp) && item.unit_hpp > 0) {
+          totalEstimatedHpp += item.unit_hpp * item.quantity;
+          continue;
+        }
         const menu = menuById.get(item.menu_id);
         if (menu) {
           const hpp = calculateMenuHpp(menu.selling_price, menu.recipes, inventory);
@@ -51,14 +93,41 @@ export function DashboardPage({ onNavigate }: DashboardPageProps) {
             Pantau performa penjualan harian dan status operasional kedai Anda.
           </p>
         </div>
-        <button
-          type="button"
-          onClick={() => onNavigate('pos')}
-          className="inline-flex items-center gap-2 rounded-full bg-[#109A58] px-5 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-[#0D8A4E] whitespace-nowrap"
-        >
-          <span>Buka Layar Kasir</span>
-          <ArrowRight className="h-4 w-4" />
-        </button>
+        <div className="flex flex-wrap items-center gap-3">
+          <div
+            role="tablist"
+            aria-label="Filter Periode Ringkasan"
+            className="inline-flex items-center rounded-full border border-[#E5E7EB] bg-[#FFFFFF] p-1"
+          >
+            {PERIOD_OPTIONS.map((opt) => {
+              const active = period === opt.id;
+              return (
+                <button
+                  key={opt.id}
+                  type="button"
+                  role="tab"
+                  aria-selected={active}
+                  onClick={() => setPeriod(opt.id)}
+                  className={`rounded-full px-3 py-1.5 text-xs font-semibold transition-colors whitespace-nowrap ${
+                    active
+                      ? 'bg-[#109A58] text-white'
+                      : 'text-[#6B7280] hover:text-[#1A2E26]'
+                  }`}
+                >
+                  {opt.label}
+                </button>
+              );
+            })}
+          </div>
+          <button
+            type="button"
+            onClick={() => onNavigate('pos')}
+            className="inline-flex items-center gap-2 rounded-full bg-[#109A58] px-5 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-[#0D8A4E] whitespace-nowrap"
+          >
+            <span>Buka Layar Kasir</span>
+            <ArrowRight className="h-4 w-4" />
+          </button>
+        </div>
       </div>
 
       {/* Prominent Scheduled Stock Opname Alert Banner (Owner & Manager) */}
@@ -104,8 +173,11 @@ export function DashboardPage({ onNavigate }: DashboardPageProps) {
       {/* 4-Column KPI Strip */}
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
         <div className="rounded-2xl border border-[#E5E7EB] bg-[#FFFFFF] p-5">
-          <p className="text-xs font-medium text-[#6B7280]">Penjualan Hari Ini</p>
-          <p className="mt-2 text-2xl font-bold text-[#1A2E26] tabular-nums">
+          <p className="text-xs font-medium text-[#6B7280]">{activePeriodMeta.kpiTitle}</p>
+          <p
+            data-testid="dashboard-period-revenue"
+            className="mt-2 text-2xl font-bold text-[#1A2E26] tabular-nums"
+          >
             {formatRupiah(totalRevenue)}
           </p>
           <p className="mt-1.5 text-xs text-[#109A58]">

@@ -1,11 +1,17 @@
+import type { UserProfile } from '../types';
+
 /**
- * Username & password validation and salted PBKDF2 hashing helpers for
+ * Username & password validation and salted PBKDF2-SHA256 hashing helpers for
  * Owner-managed employee username login (non-OAuth).
+ * Uses OWASP-recommended 600,000 PBKDF2-SHA256 iterations with backward-compatible
+ * verification of legacy 100,000-iteration hashes.
  */
 
 const USERNAME_PATTERN = /^[a-z0-9][a-z0-9._-]{2,31}$/;
 const PBKDF2_PREFIX = 'pbkdf2_sha256$';
-const PBKDF2_ITERATIONS = 100_000;
+export const PBKDF2_ITERATIONS = 600_000;
+const LEGACY_PBKDF2_ITERATIONS = 100_000;
+export const MIN_PASSWORD_LENGTH = 8;
 
 export function normalizeUsername(raw: string | null | undefined): string {
   return (raw ?? '').trim().replace(/^@+/, '').toLowerCase();
@@ -34,13 +40,30 @@ export function validateUsername(raw: string): { valid: boolean; normalized: str
 }
 
 export function validatePassword(raw: string): { valid: boolean; error?: string } {
-  if (!raw || raw.trim().length < 6) {
+  if (!raw || raw.trim().length < MIN_PASSWORD_LENGTH) {
     return {
       valid: false,
-      error: 'Kata sandi minimal 6 karakter dan tidak boleh hanya berisi spasi.',
+      error: `Kata sandi minimal ${MIN_PASSWORD_LENGTH} karakter dan tidak boleh hanya berisi spasi.`,
     };
   }
   return { valid: true };
+}
+
+/**
+ * Strips sensitive fields (password_hash, payroll salary, emergency contact) before
+ * caching non-sensitive employee display metadata in browser localStorage.
+ */
+export function sanitizeEmployeeForLocalCache(employee: UserProfile): UserProfile {
+  const {
+    password_hash: _omitHash,
+    monthly_salary: _omitSalary,
+    emergency_contact: _omitEmergency,
+    ...safeFields
+  } = employee;
+  return {
+    ...safeFields,
+    has_password: Boolean(employee.has_password || employee.password_hash),
+  };
 }
 
 function bytesToHex(bytes: Uint8Array): string {
@@ -67,7 +90,11 @@ function constantTimeEqual(a: string, b: string): boolean {
   return diff === 0;
 }
 
-async function derivePbkdf2Hex(password: string, saltBytes: Uint8Array): Promise<string> {
+async function derivePbkdf2Hex(
+  password: string,
+  saltBytes: Uint8Array,
+  iterations: number = PBKDF2_ITERATIONS
+): Promise<string> {
   const subtle = globalThis.crypto?.subtle;
   if (!subtle) {
     throw new Error('Web Crypto API tidak tersedia di browser ini.');
@@ -85,7 +112,7 @@ async function derivePbkdf2Hex(password: string, saltBytes: Uint8Array): Promise
     {
       name: 'PBKDF2',
       salt: saltBuffer,
-      iterations: PBKDF2_ITERATIONS,
+      iterations,
       hash: 'SHA-256',
     },
     keyMaterial,
@@ -95,28 +122,47 @@ async function derivePbkdf2Hex(password: string, saltBytes: Uint8Array): Promise
 }
 
 /**
- * Hashes a password with a fresh 16-byte random salt using Web Crypto PBKDF2-SHA256.
+ * Hashes a password with a fresh 16-byte random salt using Web Crypto PBKDF2-SHA256 (600,000 iterations).
  * Plaintext passwords are never stored in browser state or localStorage.
  */
 export async function hashPasswordLocal(password: string): Promise<string> {
   const salt = new Uint8Array(16);
   globalThis.crypto.getRandomValues(salt);
-  const derivedHex = await derivePbkdf2Hex(password, salt);
-  return `${PBKDF2_PREFIX}${bytesToHex(salt)}$${derivedHex}`;
+  const derivedHex = await derivePbkdf2Hex(password, salt, PBKDF2_ITERATIONS);
+  return `${PBKDF2_PREFIX}${PBKDF2_ITERATIONS}$${bytesToHex(salt)}$${derivedHex}`;
 }
 
 /**
  * Verifies a plaintext password against a stored PBKDF2-SHA256 hash using constant-time comparison.
+ * Supports both current `pbkdf2_sha256$<iterations>$<salt>$<hash>` and legacy `pbkdf2_sha256$<salt>$<hash>`.
  */
 export async function verifyPasswordLocal(password: string, storedHash: string): Promise<boolean> {
   if (!storedHash || !storedHash.startsWith(PBKDF2_PREFIX)) return false;
   const parts = storedHash.slice(PBKDF2_PREFIX.length).split('$');
-  if (parts.length !== 2) return false;
-  const [saltHex, expectedHex] = parts;
+
+  let iterations = LEGACY_PBKDF2_ITERATIONS;
+  let saltHex = '';
+  let expectedHex = '';
+
+  if (parts.length === 3) {
+    const parsedIter = Number.parseInt(parts[0], 10);
+    if (!Number.isFinite(parsedIter) || parsedIter < 10_000 || parsedIter > 2_000_000) {
+      return false;
+    }
+    iterations = parsedIter;
+    saltHex = parts[1];
+    expectedHex = parts[2];
+  } else if (parts.length === 2) {
+    saltHex = parts[0];
+    expectedHex = parts[1];
+  } else {
+    return false;
+  }
+
   if (!saltHex || !expectedHex || saltHex.length % 2 !== 0) return false;
 
   try {
-    const derivedHex = await derivePbkdf2Hex(password, hexToBytes(saltHex));
+    const derivedHex = await derivePbkdf2Hex(password, hexToBytes(saltHex), iterations);
     return constantTimeEqual(derivedHex, expectedHex);
   } catch {
     return false;

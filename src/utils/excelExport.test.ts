@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import * as XLSX from 'xlsx';
+import { sanitizeSpreadsheetText } from './ooxmlWriter';
 import {
   buildInventoryExcelData,
   buildMenuHppExcelData,
@@ -73,13 +73,16 @@ test('buildOrdersExcelData filters orders by date period and generates valid .xl
   });
   assert.equal(emptyPeriod.recordCount, 0);
 
-  // Verify real XLSX binary output starts with PK zip signature
-  const wb = createExcelWorkbook(allData);
-  const raw = XLSX.write(wb, { type: 'array', bookType: 'xlsx' }) as ArrayBuffer;
-  const bytes = new Uint8Array(raw);
+  // Verify real XLSX binary output starts with PK zip signature & contains EOCD
+  const bytes = createExcelWorkbook(allData);
   assert.ok(bytes.byteLength > 500);
   assert.equal(bytes[0], 0x50); // 'P'
   assert.equal(bytes[1], 0x4b); // 'K'
+  const textView = new TextDecoder().decode(bytes);
+  assert.ok(textView.includes('xl/workbook.xml'));
+  assert.ok(textView.includes('xl/worksheets/sheet1.xml'));
+  assert.equal(sanitizeSpreadsheetText('=CMD|calc'), "'=CMD|calc");
+  assert.equal(sanitizeSpreadsheetText('Normal Kopi'), 'Normal Kopi');
 });
 
 test('buildMenuHppExcelData enforces Owner RBAC by stripping HPP & BOM sheets when includeHpp is false', () => {

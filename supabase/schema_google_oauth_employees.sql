@@ -1,6 +1,8 @@
 -- BrewFlow POS — Skema Daftar Karyawan (Google OAuth + Login Username & Password)
 -- Jalankan seluruh query ini di Supabase Dashboard -> SQL Editor.
 -- Aman dijalankan berulang kali (idempotent) dan kompatibel dengan tabel `profiles` bawaan.
+-- Pembaruan Keamanan: Rate-limiting login, verifikasi email_confirmed_at, pencabutan SELECT
+-- kolom password_hash, minimal kata sandi 8 karakter, serta RPC pencabutan semua sesi karyawan.
 
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
@@ -43,6 +45,16 @@ CREATE TABLE IF NOT EXISTS public.login_audit_logs (
   owner_email text NOT NULL DEFAULT 'parisramaproject@gmail.com',
   logged_in_at timestamptz NOT NULL DEFAULT now()
 );
+
+-- 1c. Tabel rate limiting percobaan login Username (maksimal 5 gagal -> kunci 15 menit)
+CREATE TABLE IF NOT EXISTS public.login_rate_limits (
+  username text PRIMARY KEY,
+  failed_attempts integer NOT NULL DEFAULT 0,
+  locked_until timestamptz,
+  last_attempt_at timestamptz NOT NULL DEFAULT now()
+);
+
+ALTER TABLE public.login_rate_limits ENABLE ROW LEVEL SECURITY;
 
 -- Normalisasi email & username otomatis ke huruf kecil + hapus spasi
 CREATE OR REPLACE FUNCTION public.normalize_employee_email()
@@ -97,6 +109,88 @@ AS $$
   );
 $$;
 
+-- Helper: mengembalikan role karyawan aktif saat ini ('owner', 'manager', 'cashier', atau NULL)
+-- Memverifikasi `email_confirmed_at IS NOT NULL` untuk sesi JWT Supabase Auth agar email tak terverifikasi tidak bisa mencocokkan karyawan.
+CREATE OR REPLACE FUNCTION public.get_current_employee_role()
+RETURNS text
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = public
+AS $$
+  SELECT coalesce(
+    (
+      SELECT lower(trim(e.role::text))
+      FROM public.app_sessions s
+      JOIN public.employees e ON e.id = s.employee_id
+      WHERE s.token = public.get_app_session_token()
+        AND s.expires_at > now()
+        AND e.is_active = true
+      LIMIT 1
+    ),
+    (
+      SELECT lower(trim(e.role::text))
+      FROM auth.users u
+      JOIN public.employees e
+        ON (e.auth_user_id = u.id OR lower(trim(e.email)) = lower(trim(coalesce(u.email, ''))))
+      WHERE u.id = auth.uid()
+        AND u.email_confirmed_at IS NOT NULL
+        AND e.is_active = true
+      LIMIT 1
+    )
+  );
+$$;
+
+CREATE OR REPLACE FUNCTION public.get_current_employee_id()
+RETURNS uuid
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = public
+AS $$
+  SELECT coalesce(
+    (
+      SELECT e.id
+      FROM public.app_sessions s
+      JOIN public.employees e ON e.id = s.employee_id
+      WHERE s.token = public.get_app_session_token()
+        AND s.expires_at > now()
+        AND e.is_active = true
+      LIMIT 1
+    ),
+    (
+      SELECT e.id
+      FROM auth.users u
+      JOIN public.employees e
+        ON (e.auth_user_id = u.id OR lower(trim(e.email)) = lower(trim(coalesce(u.email, ''))))
+      WHERE u.id = auth.uid()
+        AND u.email_confirmed_at IS NOT NULL
+        AND e.is_active = true
+      LIMIT 1
+    )
+  );
+$$;
+
+CREATE OR REPLACE FUNCTION public.is_active_employee()
+RETURNS boolean
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = public
+AS $$
+  SELECT public.get_current_employee_role() IN ('owner', 'manager', 'cashier');
+$$;
+
+CREATE OR REPLACE FUNCTION public.is_active_manager_or_owner()
+RETURNS boolean
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = public
+AS $$
+  SELECT public.get_current_employee_role() IN ('owner', 'manager');
+$$;
+
 CREATE OR REPLACE FUNCTION public.is_active_owner()
 RETURNS boolean
 LANGUAGE sql
@@ -104,24 +198,7 @@ STABLE
 SECURITY DEFINER
 SET search_path = public
 AS $$
-  SELECT (
-    EXISTS (
-      SELECT 1
-      FROM public.employees e
-      WHERE lower(trim(e.email)) = lower(trim(coalesce(auth.jwt() ->> 'email', '')))
-        AND lower(trim(e.role::text)) = 'owner'
-        AND e.is_active = true
-    )
-    OR EXISTS (
-      SELECT 1
-      FROM public.app_sessions s
-      JOIN public.employees e ON e.id = s.employee_id
-      WHERE s.token = public.get_app_session_token()
-        AND s.expires_at > now()
-        AND lower(trim(e.role::text)) = 'owner'
-        AND e.is_active = true
-    )
-  );
+  SELECT public.get_current_employee_role() = 'owner';
 $$;
 
 -- 2b. RPC SECURITY DEFINER untuk verifikasi login Google/Email (tidak pernah mengembalikan password_hash)
@@ -134,12 +211,22 @@ SET search_path = public
 AS $$
 DECLARE
   v_email text;
+  v_confirmed timestamptz;
   v_result jsonb;
 BEGIN
-  v_email := lower(trim(coalesce(
-    auth.jwt() ->> 'email',
-    (SELECT u.email FROM auth.users u WHERE u.id = auth.uid())
-  )));
+  IF auth.uid() IS NULL THEN
+    RETURN NULL;
+  END IF;
+
+  SELECT lower(trim(coalesce(u.email, ''))), u.email_confirmed_at
+  INTO v_email, v_confirmed
+  FROM auth.users u
+  WHERE u.id = auth.uid()
+  LIMIT 1;
+
+  IF v_confirmed IS NULL THEN
+    RETURN NULL;
+  END IF;
 
   IF v_email IS NOT NULL AND v_email <> '' THEN
     SELECT (to_jsonb(e) - 'password_hash') || jsonb_build_object('has_password', (e.password_hash IS NOT NULL AND e.password_hash <> ''))
@@ -150,7 +237,7 @@ BEGIN
     LIMIT 1;
   END IF;
 
-  IF v_result IS NULL AND auth.uid() IS NOT NULL AND to_regclass('public.profiles') IS NOT NULL THEN
+  IF v_result IS NULL AND to_regclass('public.profiles') IS NOT NULL THEN
     SELECT to_jsonb(p)
     INTO v_result
     FROM public.profiles p
@@ -162,8 +249,7 @@ BEGIN
 END;
 $$;
 
--- 2c. RPC SECURITY DEFINER untuk Login Username & Password (tanpa Google OAuth)
--- Memverifikasi bcrypt hash di sisi server (pgcrypto), menerbitkan token sesi 7 hari, dan mencatat log audit login.
+-- 2c. RPC SECURITY DEFINER untuk Login Username & Password (dengan rate limiting 5x / 15 menit)
 CREATE OR REPLACE FUNCTION public.authenticate_employee_username(
   p_username text,
   p_password text
@@ -176,6 +262,9 @@ AS $$
 DECLARE
   v_clean_username text;
   v_emp public.employees%ROWTYPE;
+  v_rl public.login_rate_limits%ROWTYPE;
+  v_next_attempts integer;
+  v_wait_minutes integer;
   v_token text;
 BEGIN
   v_clean_username := lower(trim(regexp_replace(coalesce(p_username, ''), '^@+', '')));
@@ -184,17 +273,53 @@ BEGIN
     RETURN jsonb_build_object('status', 'invalid', 'message', 'Username dan kata sandi wajib diisi.');
   END IF;
 
+  -- Periksa rate limit untuk username ini
+  SELECT * INTO v_rl
+  FROM public.login_rate_limits
+  WHERE username = v_clean_username
+  FOR UPDATE;
+
+  IF FOUND AND v_rl.locked_until IS NOT NULL AND v_rl.locked_until > now() THEN
+    v_wait_minutes := GREATEST(1, CEIL(EXTRACT(EPOCH FROM (v_rl.locked_until - now())) / 60.0)::integer);
+    RETURN jsonb_build_object(
+      'status', 'locked',
+      'message', format('Terlalu banyak percobaan gagal. Coba lagi dalam %s menit.', v_wait_minutes)
+    );
+  END IF;
+
   SELECT *
   INTO v_emp
   FROM public.employees e
   WHERE lower(trim(coalesce(e.username, ''))) = v_clean_username
   LIMIT 1;
 
-  IF NOT FOUND OR v_emp.password_hash IS NULL OR v_emp.password_hash = '' THEN
-    RETURN jsonb_build_object('status', 'invalid', 'message', 'Username atau kata sandi tidak sesuai.');
-  END IF;
+  IF NOT FOUND OR v_emp.password_hash IS NULL OR v_emp.password_hash = '' OR v_emp.password_hash <> crypt(p_password, v_emp.password_hash) THEN
+    v_next_attempts := CASE
+      WHEN v_rl.username IS NULL THEN 1
+      WHEN v_rl.locked_until IS NOT NULL AND v_rl.locked_until <= now() THEN 1
+      ELSE v_rl.failed_attempts + 1
+    END;
 
-  IF v_emp.password_hash <> crypt(p_password, v_emp.password_hash) THEN
+    INSERT INTO public.login_rate_limits (username, failed_attempts, locked_until, last_attempt_at)
+    VALUES (
+      v_clean_username,
+      v_next_attempts,
+      CASE WHEN v_next_attempts >= 5 THEN now() + interval '15 minutes' ELSE NULL END,
+      now()
+    )
+    ON CONFLICT (username) DO UPDATE
+    SET
+      failed_attempts = EXCLUDED.failed_attempts,
+      locked_until = EXCLUDED.locked_until,
+      last_attempt_at = now();
+
+    IF v_next_attempts >= 5 THEN
+      RETURN jsonb_build_object(
+        'status', 'locked',
+        'message', 'Terlalu banyak percobaan login gagal (5 kali). Akun dikunci sementara selama 15 menit.'
+      );
+    END IF;
+
     RETURN jsonb_build_object('status', 'invalid', 'message', 'Username atau kata sandi tidak sesuai.');
   END IF;
 
@@ -204,6 +329,9 @@ BEGIN
       'message', format('Akun karyawan "%s" (@%s) sedang berstatus Nonaktif. Hubungi Owner.', v_emp.full_name, v_emp.username)
     );
   END IF;
+
+  -- Reset counter percobaan gagal setelah berhasil login
+  DELETE FROM public.login_rate_limits WHERE username = v_clean_username;
 
   DELETE FROM public.app_sessions WHERE expires_at < now();
   v_token := encode(gen_random_bytes(32), 'hex');
@@ -285,6 +413,33 @@ BEGIN
 END;
 $$;
 
+-- 2c3. RPC bagi Owner untuk mencabut seluruh sesi aktif seorang karyawan (mis. saat perangkat hilang / resign)
+CREATE OR REPLACE FUNCTION public.revoke_all_employee_sessions(
+  p_employee_id uuid
+)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_deleted integer := 0;
+BEGIN
+  IF NOT public.is_active_owner() THEN
+    RETURN jsonb_build_object('ok', false, 'error', 'Hanya Owner aktif yang dapat mencabut sesi karyawan.');
+  END IF;
+
+  IF p_employee_id IS NULL THEN
+    RETURN jsonb_build_object('ok', false, 'error', 'ID karyawan tidak valid.');
+  END IF;
+
+  DELETE FROM public.app_sessions WHERE employee_id = p_employee_id;
+  GET DIAGNOSTICS v_deleted = ROW_COUNT;
+
+  RETURN jsonb_build_object('ok', true, 'revoked_count', v_deleted);
+END;
+$$;
+
 -- 2d. RPC SECURITY DEFINER bagi Owner untuk mengatur/mengubah Username & Password karyawan (hash bcrypt di server)
 CREATE OR REPLACE FUNCTION public.set_employee_username_credentials(
   p_email text,
@@ -299,6 +454,7 @@ AS $$
 DECLARE
   v_clean_email text;
   v_clean_username text;
+  v_emp_id uuid;
 BEGIN
   IF NOT public.is_active_owner() THEN
     RETURN jsonb_build_object('ok', false, 'error', 'Hanya Owner aktif yang dapat mengatur username & kata sandi karyawan.');
@@ -315,8 +471,8 @@ BEGIN
     RETURN jsonb_build_object('ok', false, 'error', 'Username minimal 3 karakter.');
   END IF;
 
-  IF p_password IS NOT NULL AND trim(p_password) <> '' AND length(trim(p_password)) < 6 THEN
-    RETURN jsonb_build_object('ok', false, 'error', 'Kata sandi minimal 6 karakter.');
+  IF p_password IS NOT NULL AND trim(p_password) <> '' AND length(trim(p_password)) < 8 THEN
+    RETURN jsonb_build_object('ok', false, 'error', 'Kata sandi minimal 8 karakter.');
   END IF;
 
   IF v_clean_username IS NOT NULL AND EXISTS (
@@ -336,10 +492,21 @@ BEGIN
       WHEN p_password IS NOT NULL AND trim(p_password) <> '' THEN crypt(p_password, gen_salt('bf', 10))
       ELSE password_hash
     END
-  WHERE lower(trim(email)) = v_clean_email;
+  WHERE lower(trim(email)) = v_clean_email
+  RETURNING id INTO v_emp_id;
 
-  IF NOT FOUND THEN
+  IF v_emp_id IS NULL THEN
     RETURN jsonb_build_object('ok', false, 'error', 'Data karyawan tidak ditemukan di tabel employees. Simpan data karyawan ke Supabase terlebih dahulu.');
+  END IF;
+
+  -- Jika password diubah atau username dicabut, cabut sesi lama perangkat lain & bersihkan rate limit
+  IF v_clean_username IS NULL OR (p_password IS NOT NULL AND trim(p_password) <> '') THEN
+    DELETE FROM public.app_sessions
+    WHERE employee_id = v_emp_id
+      AND token <> coalesce(public.get_app_session_token(), '');
+  END IF;
+  IF v_clean_username IS NOT NULL THEN
+    DELETE FROM public.login_rate_limits WHERE username = v_clean_username;
   END IF;
 
   RETURN jsonb_build_object('ok', true);
@@ -347,7 +514,6 @@ END;
 $$;
 
 -- 2e. RPC SECURITY DEFINER bagi Owner untuk membaca, menyimpan/mengedit, dan menghapus data karyawan
--- Bekerja penuh baik saat Owner login dengan Google OAuth maupun Username & Password.
 CREATE OR REPLACE FUNCTION public.get_all_employees_for_owner()
 RETURNS jsonb
 LANGUAGE plpgsql
@@ -453,6 +619,10 @@ BEGIN
       notes = coalesce(p_notes, '')
     WHERE id = v_existing_id
     RETURNING * INTO v_saved;
+
+    IF v_saved.is_active = false THEN
+      DELETE FROM public.app_sessions WHERE employee_id = v_saved.id;
+    END IF;
   ELSE
     INSERT INTO public.employees (
       full_name,
@@ -522,23 +692,42 @@ BEGIN
 END;
 $$;
 
+-- Hak akses kolom ketat: kolom `password_hash` TIDAK PERNAH bisa dibaca via REST API oleh anon/authenticated!
 GRANT USAGE ON SCHEMA public TO anon, authenticated;
-GRANT SELECT, INSERT, UPDATE, DELETE ON public.employees TO anon, authenticated;
+REVOKE ALL ON public.employees FROM anon, authenticated;
+GRANT SELECT (
+  id, auth_user_id, full_name, email, username, role, phone_number,
+  is_active, shift, position, employment_status, monthly_salary,
+  join_date, emergency_contact, notes, created_at
+) ON public.employees TO anon, authenticated;
+GRANT INSERT (
+  full_name, email, username, role, phone_number, is_active, shift,
+  position, employment_status, monthly_salary, join_date, emergency_contact, notes
+) ON public.employees TO anon, authenticated;
+GRANT UPDATE (
+  full_name, email, username, role, phone_number, is_active, shift,
+  position, employment_status, monthly_salary, join_date, emergency_contact, notes
+) ON public.employees TO anon, authenticated;
+GRANT DELETE ON public.employees TO anon, authenticated;
+
 GRANT SELECT ON public.login_audit_logs TO anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.get_app_session_token() TO anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.get_current_employee_role() TO anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.get_current_employee_id() TO anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.is_active_employee() TO anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.is_active_manager_or_owner() TO anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.is_active_owner() TO anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.get_my_employee_profile() TO authenticated;
 GRANT EXECUTE ON FUNCTION public.authenticate_employee_username(text, text) TO anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.get_app_session_profile() TO anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.revoke_app_session() TO anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.revoke_all_employee_sessions(uuid) TO anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.set_employee_username_credentials(text, text, text) TO anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.get_all_employees_for_owner() TO anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.upsert_employee_by_owner(uuid, text, text, text, text, text, text, boolean, text, text, text, numeric, date, text, text) TO anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.delete_employee_by_owner(text) TO anon, authenticated;
 
 -- 3. Aktifkan Row Level Security (RLS) pada tabel employees & login_audit_logs
--- PENTING: Menggunakan `TO anon, authenticated` agar sesi login Username (app_sessions)
--- tetap dapat dilayani oleh `public.is_active_owner()` tanpa membuka akses publik tanpa sesi.
 ALTER TABLE public.employees ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.login_audit_logs ENABLE ROW LEVEL SECURITY;
 
@@ -549,19 +738,16 @@ CREATE POLICY "Owner can read login audit logs"
   TO anon, authenticated
   USING (public.is_active_owner());
 
--- Karyawan yang login via Google/Email dapat membaca data dirinya sendiri; Owner aktif (Google maupun Username) dapat membaca semua karyawan
 DROP POLICY IF EXISTS "Employees read own or owner reads all" ON public.employees;
 CREATE POLICY "Employees read own or owner reads all"
   ON public.employees
   FOR SELECT
   TO anon, authenticated
   USING (
-    lower(trim(email)) = lower(trim(coalesce(auth.jwt() ->> 'email', '')))
-    OR auth_user_id = auth.uid()
+    id = public.get_current_employee_id()
     OR public.is_active_owner()
   );
 
--- Hanya Owner aktif yang boleh menambah, mengubah, atau menghapus data karyawan
 DROP POLICY IF EXISTS "Owner can insert employees" ON public.employees;
 CREATE POLICY "Owner can insert employees"
   ON public.employees
@@ -584,7 +770,7 @@ CREATE POLICY "Owner can delete employees"
   TO anon, authenticated
   USING (public.is_active_owner());
 
--- 4. Seed akun Owner utama (termasuk parisramaproject@gmail.com)
+-- 4. Seed akun Owner utama
 INSERT INTO public.employees (
   full_name,
   email,
@@ -621,7 +807,7 @@ SET
   role = 'owner',
   is_active = true;
 
--- 5. Sinkronisasi aman ke tabel `profiles` bawaan HANYA untuk user yang sudah pernah login di `auth.users`
+-- 5. Sinkronisasi aman ke tabel `profiles` bawaan HANYA untuk user yang sudah terkonfirmasi
 DO $$
 BEGIN
   IF to_regclass('public.profiles') IS NOT NULL THEN
@@ -633,6 +819,7 @@ BEGIN
       e.phone_number
     FROM auth.users u
     JOIN public.employees e ON lower(e.email) = lower(u.email)
+    WHERE u.email_confirmed_at IS NOT NULL
     ON CONFLICT (id) DO UPDATE
     SET
       full_name = EXCLUDED.full_name,
@@ -641,7 +828,6 @@ BEGIN
   END IF;
 EXCEPTION
   WHEN undefined_object THEN
-    -- Jika kolom profiles.role bertipe text (bukan enum user_role)
     INSERT INTO public.profiles (id, full_name, role, phone_number)
     SELECT
       u.id,
@@ -650,21 +836,10 @@ EXCEPTION
       e.phone_number
     FROM auth.users u
     JOIN public.employees e ON lower(e.email) = lower(u.email)
+    WHERE u.email_confirmed_at IS NOT NULL
     ON CONFLICT (id) DO UPDATE
     SET
       full_name = EXCLUDED.full_name,
       role = EXCLUDED.role,
       phone_number = EXCLUDED.phone_number;
 END $$;
-
--- =============================================================================
--- CARA CEPAT MENGATUR USERNAME & PASSWORD OWNER PERTAMA KALI (OPSIONAL):
--- Jalankan 1 query di bawah ini (ganti 'PasswordKuatAnda' sesuai keinginan Anda)
--- agar Anda bisa langsung login dengan Username tanpa menunggu Google OAuth:
---
--- UPDATE public.employees
--- SET
---   username = 'owner',
---   password_hash = crypt('PasswordKuatAnda', gen_salt('bf', 10))
--- WHERE email = 'parisramaproject@gmail.com';
--- =============================================================================

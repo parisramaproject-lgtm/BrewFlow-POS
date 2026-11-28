@@ -1,4 +1,4 @@
-import * as XLSX from 'xlsx';
+import { buildXlsxBytes } from './ooxmlWriter';
 import type {
   Category,
   ExpenseCategoryId,
@@ -742,35 +742,29 @@ export function buildStockOpnameExcelData(params: {
 // ============================================================================
 // WORKBOOK GENERATOR & BROWSER DOWNLOAD
 // ============================================================================
-export function createExcelWorkbook(payload: ExcelExportPayload): XLSX.WorkBook {
-  const wb = XLSX.utils.book_new();
-
-  for (const sheet of payload.sheets) {
-    const safeRows =
-      sheet.rows.length > 0
-        ? sheet.rows
-        : [{ Info: 'Tidak ada data pada periode yang dipilih.' }];
-    const ws = XLSX.utils.json_to_sheet(safeRows);
-
-    // Auto-size column widths for crisp readability in Excel / Google Sheets
-    const headers = Object.keys(safeRows[0] ?? {});
-    ws['!cols'] = headers.map((header) => {
-      let maxLen = header.length;
-      for (const row of safeRows) {
-        const val = row[header];
-        const str = val === null || val === undefined ? '' : String(val);
-        if (str.length > maxLen) maxLen = str.length;
-      }
-      return { wch: Math.max(12, Math.min(42, maxLen + 3)) };
-    });
-
-    XLSX.utils.book_append_sheet(wb, ws, sanitizeSheetName(sheet.name));
-  }
-
-  return wb;
+export function createExcelWorkbook(payload: ExcelExportPayload): Uint8Array {
+  return buildXlsxBytes(
+    payload.sheets.map((sheet) => ({
+      name: sanitizeSheetName(sheet.name),
+      rows:
+        sheet.rows.length > 0
+          ? sheet.rows
+          : [{ Info: 'Tidak ada data pada periode yang dipilih.' }],
+    }))
+  );
 }
 
 export function downloadExcelWorkbook(payload: ExcelExportPayload): void {
-  const wb = createExcelWorkbook(payload);
-  XLSX.writeFile(wb, payload.fileName);
+  const bytes = createExcelWorkbook(payload);
+  const blob = new Blob([bytes.buffer as ArrayBuffer], {
+    type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = payload.fileName;
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
 }

@@ -1,27 +1,100 @@
 -- =============================================================================
--- BrewFlow POS — Skema Database Lengkap (100% Supabase + RLS Aman)
+-- BrewFlow POS — Skema Database Lengkap (Standalone, Idempotent, RLS Per-Role)
 -- =============================================================================
 -- Jalankan SELURUH isi file ini di Supabase Dashboard -> SQL Editor.
--- 100% IDEMPOTENT (aman dijalankan berulang kali, tidak menghapus data lama).
--- Mendukung login Google OAuth, Email/Password, DAN Username/Password Owner!
+-- 100% STANDALONE & IDEMPOTENT: aman dijalankan pada proyek Supabase baru
+-- maupun proyek yang sudah berjalan (tidak menghapus data lama).
+--
+-- Mencakup:
+--   1. Karyawan, Google OAuth, Login Username (rate-limiting 5x/15 mnt), Sesi 7 Hari
+--   2. Strict RLS Per-Role (Owner vs Manager vs Cashier) + proteksi kolom password_hash
+--   3. RPC Atomik POS: `checkout_order_atomic` (nomor urut harian, unit_hpp historis,
+--      potong stok relatif, poin member relatif, kuota voucher atomik)
+--   4. RPC Atomik Pembatalan: `cancel_order_atomic` (pulihkan stok, poin, kuota voucher)
+--   5. RPC Aman untuk Kasir: `get_pos_stock_levels()` & `get_pos_store_settings()`
+--   6. Tabel Multi-Perangkat: `vendors`, `restock_requests`, `operational_notifications`, `whatsapp_logs`
 -- =============================================================================
 
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
 -- -----------------------------------------------------------------------------
--- 1. SESI LOGIN USERNAME (AMAN, BERMASA BERLAKU 24 JAM) & HELPER RLS
+-- 1. TABEL KARYAWAN, AUDIT LOGIN, RATE LIMIT, DAN SESI (STANDALONE)
 -- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS public.employees (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  auth_user_id uuid UNIQUE REFERENCES auth.users(id) ON DELETE SET NULL,
+  full_name text NOT NULL,
+  email text NOT NULL UNIQUE,
+  username text UNIQUE,
+  password_hash text,
+  role text NOT NULL CHECK (role IN ('owner', 'manager', 'cashier')) DEFAULT 'cashier',
+  phone_number text DEFAULT '-',
+  is_active boolean NOT NULL DEFAULT true,
+  shift text DEFAULT 'Shift Pagi (07:00 - 15:00)',
+  position text DEFAULT 'Barista & Kasir',
+  employment_status text DEFAULT 'Kontrak',
+  monthly_salary numeric(12,2) DEFAULT 0,
+  join_date date DEFAULT current_date,
+  emergency_contact text DEFAULT '',
+  notes text DEFAULT '',
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+ALTER TABLE public.employees ADD COLUMN IF NOT EXISTS username text;
+ALTER TABLE public.employees ADD COLUMN IF NOT EXISTS password_hash text;
+
+CREATE UNIQUE INDEX IF NOT EXISTS employees_username_lower_unique_idx
+  ON public.employees (lower(trim(username)))
+  WHERE username IS NOT NULL AND trim(username) <> '';
+
+CREATE TABLE IF NOT EXISTS public.login_audit_logs (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  employee_id uuid REFERENCES public.employees(id) ON DELETE SET NULL,
+  username text NOT NULL,
+  employee_name text NOT NULL,
+  role text NOT NULL,
+  owner_email text NOT NULL DEFAULT 'parisramaproject@gmail.com',
+  logged_in_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS public.login_rate_limits (
+  username text PRIMARY KEY,
+  failed_attempts integer NOT NULL DEFAULT 0,
+  locked_until timestamptz,
+  last_attempt_at timestamptz NOT NULL DEFAULT now()
+);
+
+ALTER TABLE public.login_rate_limits ENABLE ROW LEVEL SECURITY;
+
 CREATE TABLE IF NOT EXISTS public.app_sessions (
   token text PRIMARY KEY,
   employee_id uuid NOT NULL REFERENCES public.employees(id) ON DELETE CASCADE,
   role text NOT NULL,
-  expires_at timestamptz NOT NULL DEFAULT (now() + interval '24 hours'),
+  expires_at timestamptz NOT NULL DEFAULT (now() + interval '7 days'),
   created_at timestamptz NOT NULL DEFAULT now()
 );
 
 ALTER TABLE public.app_sessions ENABLE ROW LEVEL SECURITY;
 
--- Ekstrak token sesi 64-hex dari header `x-client-info` (CORS-safe di Supabase Cloud)
+CREATE OR REPLACE FUNCTION public.normalize_employee_email()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  NEW.email := lower(trim(NEW.email));
+  IF NEW.username IS NOT NULL THEN
+    NEW.username := nullif(lower(trim(regexp_replace(NEW.username, '^@+', ''))), '');
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_normalize_employee_email ON public.employees;
+CREATE TRIGGER trg_normalize_employee_email
+  BEFORE INSERT OR UPDATE OF email, username ON public.employees
+  FOR EACH ROW
+  EXECUTE FUNCTION public.normalize_employee_email();
+
 CREATE OR REPLACE FUNCTION public.get_app_session_token()
 RETURNS text
 LANGUAGE sql
@@ -36,7 +109,66 @@ AS $$
   );
 $$;
 
--- Helper RLS: true jika pemanggil adalah karyawan aktif (baik lewat Google/Email Auth ATAU sesi Username)
+CREATE OR REPLACE FUNCTION public.get_current_employee_role()
+RETURNS text
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = public
+AS $$
+  SELECT coalesce(
+    (
+      SELECT lower(trim(e.role::text))
+      FROM public.app_sessions s
+      JOIN public.employees e ON e.id = s.employee_id
+      WHERE s.token = public.get_app_session_token()
+        AND s.expires_at > now()
+        AND e.is_active = true
+      LIMIT 1
+    ),
+    (
+      SELECT lower(trim(e.role::text))
+      FROM auth.users u
+      JOIN public.employees e
+        ON (e.auth_user_id = u.id OR lower(trim(e.email)) = lower(trim(coalesce(u.email, ''))))
+      WHERE u.id = auth.uid()
+        AND u.email_confirmed_at IS NOT NULL
+        AND e.is_active = true
+      LIMIT 1
+    )
+  );
+$$;
+
+CREATE OR REPLACE FUNCTION public.get_current_employee_id()
+RETURNS uuid
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = public
+AS $$
+  SELECT coalesce(
+    (
+      SELECT e.id
+      FROM public.app_sessions s
+      JOIN public.employees e ON e.id = s.employee_id
+      WHERE s.token = public.get_app_session_token()
+        AND s.expires_at > now()
+        AND e.is_active = true
+      LIMIT 1
+    ),
+    (
+      SELECT e.id
+      FROM auth.users u
+      JOIN public.employees e
+        ON (e.auth_user_id = u.id OR lower(trim(e.email)) = lower(trim(coalesce(u.email, ''))))
+      WHERE u.id = auth.uid()
+        AND u.email_confirmed_at IS NOT NULL
+        AND e.is_active = true
+      LIMIT 1
+    )
+  );
+$$;
+
 CREATE OR REPLACE FUNCTION public.is_active_employee()
 RETURNS boolean
 LANGUAGE sql
@@ -44,25 +176,19 @@ STABLE
 SECURITY DEFINER
 SET search_path = public
 AS $$
-  SELECT (
-    EXISTS (
-      SELECT 1
-      FROM public.employees e
-      WHERE lower(trim(e.email)) = lower(trim(coalesce(auth.jwt() ->> 'email', '')))
-        AND e.is_active = true
-    )
-    OR EXISTS (
-      SELECT 1
-      FROM public.app_sessions s
-      JOIN public.employees e ON e.id = s.employee_id
-      WHERE s.token = public.get_app_session_token()
-        AND s.expires_at > now()
-        AND e.is_active = true
-    )
-  );
+  SELECT public.get_current_employee_role() IN ('owner', 'manager', 'cashier');
 $$;
 
--- Perbarui helper Owner agar bekerja untuk Google OAuth, Email, MAUPUN sesi Username Owner
+CREATE OR REPLACE FUNCTION public.is_active_manager_or_owner()
+RETURNS boolean
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = public
+AS $$
+  SELECT public.get_current_employee_role() IN ('owner', 'manager');
+$$;
+
 CREATE OR REPLACE FUNCTION public.is_active_owner()
 RETURNS boolean
 LANGUAGE sql
@@ -70,27 +196,48 @@ STABLE
 SECURITY DEFINER
 SET search_path = public
 AS $$
-  SELECT (
-    EXISTS (
-      SELECT 1
-      FROM public.employees e
-      WHERE lower(trim(e.email)) = lower(trim(coalesce(auth.jwt() ->> 'email', '')))
-        AND lower(trim(e.role::text)) = 'owner'
-        AND e.is_active = true
-    )
-    OR EXISTS (
-      SELECT 1
-      FROM public.app_sessions s
-      JOIN public.employees e ON e.id = s.employee_id
-      WHERE s.token = public.get_app_session_token()
-        AND s.expires_at > now()
-        AND lower(trim(e.role::text)) = 'owner'
-        AND e.is_active = true
-    )
-  );
+  SELECT public.get_current_employee_role() = 'owner';
 $$;
 
--- Perbarui RPC Login Username agar menerbitkan `session_token` 24 jam di `app_sessions`
+CREATE OR REPLACE FUNCTION public.get_my_employee_profile()
+RETURNS jsonb
+LANGUAGE plpgsql
+STABLE
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_email text;
+  v_confirmed timestamptz;
+  v_result jsonb;
+BEGIN
+  IF auth.uid() IS NULL THEN
+    RETURN NULL;
+  END IF;
+
+  SELECT lower(trim(coalesce(u.email, ''))), u.email_confirmed_at
+  INTO v_email, v_confirmed
+  FROM auth.users u
+  WHERE u.id = auth.uid()
+  LIMIT 1;
+
+  IF v_confirmed IS NULL THEN
+    RETURN NULL;
+  END IF;
+
+  IF v_email IS NOT NULL AND v_email <> '' THEN
+    SELECT (to_jsonb(e) - 'password_hash') || jsonb_build_object('has_password', (e.password_hash IS NOT NULL AND e.password_hash <> ''))
+    INTO v_result
+    FROM public.employees e
+    WHERE lower(trim(e.email)) = v_email
+       OR e.auth_user_id = auth.uid()
+    LIMIT 1;
+  END IF;
+
+  RETURN v_result;
+END;
+$$;
+
 CREATE OR REPLACE FUNCTION public.authenticate_employee_username(
   p_username text,
   p_password text
@@ -103,6 +250,9 @@ AS $$
 DECLARE
   v_clean_username text;
   v_emp public.employees%ROWTYPE;
+  v_rl public.login_rate_limits%ROWTYPE;
+  v_next_attempts integer;
+  v_wait_minutes integer;
   v_token text;
 BEGIN
   v_clean_username := lower(trim(regexp_replace(coalesce(p_username, ''), '^@+', '')));
@@ -111,17 +261,52 @@ BEGIN
     RETURN jsonb_build_object('status', 'invalid', 'message', 'Username dan kata sandi wajib diisi.');
   END IF;
 
+  SELECT * INTO v_rl
+  FROM public.login_rate_limits
+  WHERE username = v_clean_username
+  FOR UPDATE;
+
+  IF FOUND AND v_rl.locked_until IS NOT NULL AND v_rl.locked_until > now() THEN
+    v_wait_minutes := GREATEST(1, CEIL(EXTRACT(EPOCH FROM (v_rl.locked_until - now())) / 60.0)::integer);
+    RETURN jsonb_build_object(
+      'status', 'locked',
+      'message', format('Terlalu banyak percobaan gagal. Coba lagi dalam %s menit.', v_wait_minutes)
+    );
+  END IF;
+
   SELECT *
   INTO v_emp
   FROM public.employees e
   WHERE lower(trim(coalesce(e.username, ''))) = v_clean_username
   LIMIT 1;
 
-  IF NOT FOUND OR v_emp.password_hash IS NULL OR v_emp.password_hash = '' THEN
-    RETURN jsonb_build_object('status', 'invalid', 'message', 'Username atau kata sandi tidak sesuai.');
-  END IF;
+  IF NOT FOUND OR v_emp.password_hash IS NULL OR v_emp.password_hash = '' OR v_emp.password_hash <> crypt(p_password, v_emp.password_hash) THEN
+    v_next_attempts := CASE
+      WHEN v_rl.username IS NULL THEN 1
+      WHEN v_rl.locked_until IS NOT NULL AND v_rl.locked_until <= now() THEN 1
+      ELSE v_rl.failed_attempts + 1
+    END;
 
-  IF v_emp.password_hash <> crypt(p_password, v_emp.password_hash) THEN
+    INSERT INTO public.login_rate_limits (username, failed_attempts, locked_until, last_attempt_at)
+    VALUES (
+      v_clean_username,
+      v_next_attempts,
+      CASE WHEN v_next_attempts >= 5 THEN now() + interval '15 minutes' ELSE NULL END,
+      now()
+    )
+    ON CONFLICT (username) DO UPDATE
+    SET
+      failed_attempts = EXCLUDED.failed_attempts,
+      locked_until = EXCLUDED.locked_until,
+      last_attempt_at = now();
+
+    IF v_next_attempts >= 5 THEN
+      RETURN jsonb_build_object(
+        'status', 'locked',
+        'message', 'Terlalu banyak percobaan login gagal (5 kali). Akun dikunci sementara selama 15 menit.'
+      );
+    END IF;
+
     RETURN jsonb_build_object('status', 'invalid', 'message', 'Username atau kata sandi tidak sesuai.');
   END IF;
 
@@ -132,16 +317,15 @@ BEGIN
     );
   END IF;
 
-  -- Hapus sesi kadaluarsa & terbitkan token sesi acak baru (7 hari)
+  DELETE FROM public.login_rate_limits WHERE username = v_clean_username;
   DELETE FROM public.app_sessions WHERE expires_at < now();
+
   v_token := encode(gen_random_bytes(32), 'hex');
   INSERT INTO public.app_sessions (token, employee_id, role, expires_at)
   VALUES (v_token, v_emp.id, v_emp.role::text, now() + interval '7 days');
 
-  IF to_regclass('public.login_audit_logs') IS NOT NULL THEN
-    INSERT INTO public.login_audit_logs (employee_id, username, employee_name, role, owner_email)
-    VALUES (v_emp.id, v_emp.username, v_emp.full_name, v_emp.role::text, 'parisramaproject@gmail.com');
-  END IF;
+  INSERT INTO public.login_audit_logs (employee_id, username, employee_name, role, owner_email)
+  VALUES (v_emp.id, v_emp.username, v_emp.full_name, v_emp.role::text, 'parisramaproject@gmail.com');
 
   RETURN jsonb_build_object(
     'status', 'ok',
@@ -151,7 +335,6 @@ BEGIN
 END;
 $$;
 
--- RPC untuk memulihkan sesi login Username secara aman setelah browser di-reload (F5)
 CREATE OR REPLACE FUNCTION public.get_app_session_profile()
 RETURNS jsonb
 LANGUAGE plpgsql
@@ -188,7 +371,6 @@ BEGIN
     );
   END IF;
 
-  -- Perpanjang masa berlaku sesi aktif (sliding 7 hari)
   UPDATE public.app_sessions
   SET expires_at = now() + interval '7 days'
   WHERE token = v_token;
@@ -200,7 +382,6 @@ BEGIN
 END;
 $$;
 
--- RPC untuk mencabut sesi saat Logout
 CREATE OR REPLACE FUNCTION public.revoke_app_session()
 RETURNS void
 LANGUAGE plpgsql
@@ -217,34 +398,297 @@ BEGIN
 END;
 $$;
 
--- Izinkan anon + authenticated menjalankan RPC & fungsi helper
-GRANT EXECUTE ON FUNCTION public.get_app_session_token() TO anon, authenticated;
-GRANT EXECUTE ON FUNCTION public.is_active_employee() TO anon, authenticated;
-GRANT EXECUTE ON FUNCTION public.is_active_owner() TO anon, authenticated;
-GRANT EXECUTE ON FUNCTION public.authenticate_employee_username(text, text) TO anon, authenticated;
-GRANT EXECUTE ON FUNCTION public.get_app_session_profile() TO anon, authenticated;
-GRANT EXECUTE ON FUNCTION public.set_employee_username_credentials(text, text, text) TO anon, authenticated;
-GRANT EXECUTE ON FUNCTION public.revoke_app_session() TO anon, authenticated;
+CREATE OR REPLACE FUNCTION public.revoke_all_employee_sessions(
+  p_employee_id uuid
+)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_deleted integer := 0;
+BEGIN
+  IF NOT public.is_active_owner() THEN
+    RETURN jsonb_build_object('ok', false, 'error', 'Hanya Owner aktif yang dapat mencabut sesi karyawan.');
+  END IF;
 
--- Perbarui policy employees agar Owner & karyawan aktif (Google/Email/Username) dapat membaca data yang berhak diakses
-GRANT SELECT, INSERT, UPDATE, DELETE ON public.employees TO anon, authenticated;
+  IF p_employee_id IS NULL THEN
+    RETURN jsonb_build_object('ok', false, 'error', 'ID karyawan tidak valid.');
+  END IF;
+
+  DELETE FROM public.app_sessions WHERE employee_id = p_employee_id;
+  GET DIAGNOSTICS v_deleted = ROW_COUNT;
+
+  RETURN jsonb_build_object('ok', true, 'revoked_count', v_deleted);
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION public.set_employee_username_credentials(
+  p_email text,
+  p_username text,
+  p_password text DEFAULT NULL
+)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, extensions
+AS $$
+DECLARE
+  v_clean_email text;
+  v_clean_username text;
+  v_emp_id uuid;
+BEGIN
+  IF NOT public.is_active_owner() THEN
+    RETURN jsonb_build_object('ok', false, 'error', 'Hanya Owner aktif yang dapat mengatur username & kata sandi karyawan.');
+  END IF;
+
+  v_clean_email := lower(trim(coalesce(p_email, '')));
+  v_clean_username := nullif(lower(trim(regexp_replace(coalesce(p_username, ''), '^@+', ''))), '');
+
+  IF v_clean_email = '' THEN
+    RETURN jsonb_build_object('ok', false, 'error', 'Email karyawan wajib diisi.');
+  END IF;
+
+  IF v_clean_username IS NOT NULL AND length(v_clean_username) < 3 THEN
+    RETURN jsonb_build_object('ok', false, 'error', 'Username minimal 3 karakter.');
+  END IF;
+
+  IF p_password IS NOT NULL AND trim(p_password) <> '' AND length(trim(p_password)) < 8 THEN
+    RETURN jsonb_build_object('ok', false, 'error', 'Kata sandi minimal 8 karakter.');
+  END IF;
+
+  IF v_clean_username IS NOT NULL AND EXISTS (
+    SELECT 1
+    FROM public.employees e
+    WHERE lower(trim(coalesce(e.username, ''))) = v_clean_username
+      AND lower(trim(e.email)) <> v_clean_email
+  ) THEN
+    RETURN jsonb_build_object('ok', false, 'error', format('Username "@%s" sudah dipakai karyawan lain.', v_clean_username));
+  END IF;
+
+  UPDATE public.employees
+  SET
+    username = v_clean_username,
+    password_hash = CASE
+      WHEN v_clean_username IS NULL THEN NULL
+      WHEN p_password IS NOT NULL AND trim(p_password) <> '' THEN crypt(p_password, gen_salt('bf', 10))
+      ELSE password_hash
+    END
+  WHERE lower(trim(email)) = v_clean_email
+  RETURNING id INTO v_emp_id;
+
+  IF v_emp_id IS NULL THEN
+    RETURN jsonb_build_object('ok', false, 'error', 'Data karyawan tidak ditemukan di tabel employees. Simpan data karyawan ke Supabase terlebih dahulu.');
+  END IF;
+
+  IF v_clean_username IS NULL OR (p_password IS NOT NULL AND trim(p_password) <> '') THEN
+    DELETE FROM public.app_sessions
+    WHERE employee_id = v_emp_id
+      AND token <> coalesce(public.get_app_session_token(), '');
+  END IF;
+  IF v_clean_username IS NOT NULL THEN
+    DELETE FROM public.login_rate_limits WHERE username = v_clean_username;
+  END IF;
+
+  RETURN jsonb_build_object('ok', true);
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION public.get_all_employees_for_owner()
+RETURNS jsonb
+LANGUAGE plpgsql
+STABLE
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_rows jsonb;
+BEGIN
+  IF NOT public.is_active_owner() THEN
+    RETURN jsonb_build_object('ok', false, 'error', 'Hanya Owner aktif yang dapat membaca seluruh daftar karyawan.');
+  END IF;
+
+  SELECT coalesce(
+    jsonb_agg(
+      (to_jsonb(e) - 'password_hash')
+      || jsonb_build_object('has_password', (e.password_hash IS NOT NULL AND e.password_hash <> ''))
+      ORDER BY e.created_at ASC
+    ),
+    '[]'::jsonb
+  )
+  INTO v_rows
+  FROM public.employees e;
+
+  RETURN jsonb_build_object('ok', true, 'employees', v_rows);
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION public.upsert_employee_by_owner(
+  p_id uuid DEFAULT NULL,
+  p_previous_email text DEFAULT NULL,
+  p_full_name text DEFAULT 'Karyawan',
+  p_email text DEFAULT '',
+  p_username text DEFAULT NULL,
+  p_role text DEFAULT 'cashier',
+  p_phone_number text DEFAULT '-',
+  p_is_active boolean DEFAULT true,
+  p_shift text DEFAULT 'Shift Pagi (07:00 - 15:00)',
+  p_position text DEFAULT 'Barista & Kasir',
+  p_employment_status text DEFAULT 'Kontrak',
+  p_monthly_salary numeric DEFAULT 0,
+  p_join_date date DEFAULT current_date,
+  p_emergency_contact text DEFAULT '',
+  p_notes text DEFAULT ''
+)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_clean_email text;
+  v_clean_prev_email text;
+  v_clean_username text;
+  v_clean_role text;
+  v_existing_id uuid;
+  v_saved public.employees%ROWTYPE;
+BEGIN
+  IF NOT public.is_active_owner() THEN
+    RETURN jsonb_build_object('ok', false, 'error', 'Hanya Owner aktif yang dapat menambah atau mengubah data karyawan.');
+  END IF;
+
+  v_clean_email := lower(trim(coalesce(p_email, '')));
+  v_clean_prev_email := nullif(lower(trim(coalesce(p_previous_email, ''))), '');
+  v_clean_username := nullif(lower(trim(regexp_replace(coalesce(p_username, ''), '^@+', ''))), '');
+  v_clean_role := CASE
+    WHEN lower(trim(coalesce(p_role, ''))) IN ('owner', 'manager', 'cashier') THEN lower(trim(p_role))
+    ELSE 'cashier'
+  END;
+
+  IF v_clean_email = '' THEN
+    RETURN jsonb_build_object('ok', false, 'error', 'Email karyawan wajib diisi.');
+  END IF;
+
+  IF p_id IS NOT NULL THEN
+    SELECT id INTO v_existing_id FROM public.employees WHERE id = p_id LIMIT 1;
+  END IF;
+  IF v_existing_id IS NULL AND v_clean_prev_email IS NOT NULL THEN
+    SELECT id INTO v_existing_id FROM public.employees WHERE lower(trim(email)) = v_clean_prev_email LIMIT 1;
+  END IF;
+  IF v_existing_id IS NULL THEN
+    SELECT id INTO v_existing_id FROM public.employees WHERE lower(trim(email)) = v_clean_email LIMIT 1;
+  END IF;
+
+  IF v_existing_id IS NOT NULL THEN
+    UPDATE public.employees
+    SET
+      full_name = coalesce(nullif(trim(p_full_name), ''), full_name),
+      email = v_clean_email,
+      username = CASE WHEN p_username IS NULL THEN username ELSE v_clean_username END,
+      role = v_clean_role,
+      phone_number = coalesce(nullif(trim(p_phone_number), ''), '-'),
+      is_active = coalesce(p_is_active, true),
+      shift = coalesce(p_shift, shift),
+      position = coalesce(p_position, position),
+      employment_status = coalesce(p_employment_status, employment_status),
+      monthly_salary = coalesce(p_monthly_salary, 0),
+      join_date = coalesce(p_join_date, join_date),
+      emergency_contact = coalesce(p_emergency_contact, ''),
+      notes = coalesce(p_notes, '')
+    WHERE id = v_existing_id
+    RETURNING * INTO v_saved;
+
+    IF v_saved.is_active = false THEN
+      DELETE FROM public.app_sessions WHERE employee_id = v_saved.id;
+    END IF;
+  ELSE
+    INSERT INTO public.employees (
+      full_name, email, username, role, phone_number, is_active, shift,
+      position, employment_status, monthly_salary, join_date, emergency_contact, notes
+    )
+    VALUES (
+      coalesce(nullif(trim(p_full_name), ''), 'Karyawan'),
+      v_clean_email,
+      v_clean_username,
+      v_clean_role,
+      coalesce(nullif(trim(p_phone_number), ''), '-'),
+      coalesce(p_is_active, true),
+      coalesce(p_shift, 'Shift Pagi (07:00 - 15:00)'),
+      coalesce(p_position, 'Barista & Kasir'),
+      coalesce(p_employment_status, 'Kontrak'),
+      coalesce(p_monthly_salary, 0),
+      coalesce(p_join_date, current_date),
+      coalesce(p_emergency_contact, ''),
+      coalesce(p_notes, '')
+    )
+    RETURNING * INTO v_saved;
+  END IF;
+
+  RETURN jsonb_build_object(
+    'ok', true,
+    'employee', (to_jsonb(v_saved) - 'password_hash') || jsonb_build_object('has_password', (v_saved.password_hash IS NOT NULL AND v_saved.password_hash <> ''))
+  );
+EXCEPTION
+  WHEN unique_violation THEN
+    RETURN jsonb_build_object('ok', false, 'error', 'Email atau username sudah digunakan karyawan lain di Supabase.');
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION public.delete_employee_by_owner(p_email text)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_clean_email text;
+BEGIN
+  IF NOT public.is_active_owner() THEN
+    RETURN jsonb_build_object('ok', false, 'error', 'Hanya Owner aktif yang dapat menghapus karyawan.');
+  END IF;
+
+  v_clean_email := lower(trim(coalesce(p_email, '')));
+  IF v_clean_email = '' THEN
+    RETURN jsonb_build_object('ok', false, 'error', 'Email karyawan tidak valid.');
+  END IF;
+
+  DELETE FROM public.employees WHERE lower(trim(email)) = v_clean_email;
+  RETURN jsonb_build_object('ok', true);
+END;
+$$;
+
+-- Proteksi kolom `password_hash` di level PostgreSQL privilege
+GRANT USAGE ON SCHEMA public TO anon, authenticated;
+REVOKE ALL ON public.employees FROM anon, authenticated;
+GRANT SELECT (
+  id, auth_user_id, full_name, email, username, role, phone_number,
+  is_active, shift, position, employment_status, monthly_salary,
+  join_date, emergency_contact, notes, created_at
+) ON public.employees TO anon, authenticated;
+GRANT INSERT (
+  full_name, email, username, role, phone_number, is_active, shift,
+  position, employment_status, monthly_salary, join_date, emergency_contact, notes
+) ON public.employees TO anon, authenticated;
+GRANT UPDATE (
+  full_name, email, username, role, phone_number, is_active, shift,
+  position, employment_status, monthly_salary, join_date, emergency_contact, notes
+) ON public.employees TO anon, authenticated;
+GRANT DELETE ON public.employees TO anon, authenticated;
+
+GRANT SELECT ON public.login_audit_logs TO anon, authenticated;
+ALTER TABLE public.employees ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.login_audit_logs ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS "Owner can read login audit logs" ON public.login_audit_logs;
+CREATE POLICY "Owner can read login audit logs"
+  ON public.login_audit_logs FOR SELECT TO anon, authenticated
+  USING (public.is_active_owner());
+
 DROP POLICY IF EXISTS "Employees read own or owner reads all" ON public.employees;
 CREATE POLICY "Employees read own or owner reads all"
-  ON public.employees
-  FOR SELECT
-  TO anon, authenticated
-  USING (
-    lower(trim(email)) = lower(trim(coalesce(auth.jwt() ->> 'email', '')))
-    OR auth_user_id = auth.uid()
-    OR public.is_active_owner()
-    OR EXISTS (
-      SELECT 1
-      FROM public.app_sessions s
-      WHERE s.token = public.get_app_session_token()
-        AND s.employee_id = employees.id
-        AND s.expires_at > now()
-    )
-  );
+  ON public.employees FOR SELECT TO anon, authenticated
+  USING (id = public.get_current_employee_id() OR public.is_active_owner());
 
 DROP POLICY IF EXISTS "Owner can insert employees" ON public.employees;
 CREATE POLICY "Owner can insert employees"
@@ -260,6 +704,12 @@ DROP POLICY IF EXISTS "Owner can delete employees" ON public.employees;
 CREATE POLICY "Owner can delete employees"
   ON public.employees FOR DELETE TO anon, authenticated
   USING (public.is_active_owner());
+
+-- Seed akun Owner default (hanya jika belum ada)
+INSERT INTO public.employees (full_name, email, role, phone_number, is_active, shift, position, employment_status)
+VALUES
+  ('Owner BrewFlow', 'parisramaproject@gmail.com', 'owner', '0812-8800-1101', true, 'Full Access', 'Owner & Founder', 'Tetap')
+ON CONFLICT (email) DO NOTHING;
 
 -- -----------------------------------------------------------------------------
 -- 2. TABEL KATEGORI MENU
@@ -339,8 +789,14 @@ ALTER TABLE public.customers ADD COLUMN IF NOT EXISTS tier text NOT NULL DEFAULT
 ALTER TABLE public.customers ADD COLUMN IF NOT EXISTS total_spent numeric(14,2) NOT NULL DEFAULT 0;
 
 -- -----------------------------------------------------------------------------
--- 6. TABEL TRANSAKSI POS (ORDERS & ORDER_ITEMS)
+-- 6. TABEL TRANSAKSI POS (ORDERS, ORDER_ITEMS, DAILY SEQUENCE)
 -- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS public.daily_order_counters (
+  order_date date PRIMARY KEY,
+  last_seq integer NOT NULL DEFAULT 0
+);
+ALTER TABLE public.daily_order_counters ENABLE ROW LEVEL SECURITY;
+
 CREATE TABLE IF NOT EXISTS public.orders (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   order_number text NOT NULL UNIQUE,
@@ -352,8 +808,11 @@ CREATE TABLE IF NOT EXISTS public.orders (
   table_number text DEFAULT '',
   subtotal numeric(14,2) NOT NULL DEFAULT 0,
   discount_amount numeric(14,2) NOT NULL DEFAULT 0,
+  voucher_code text,
+  voucher_discount_amount numeric(14,2) NOT NULL DEFAULT 0,
   tax_amount numeric(14,2) NOT NULL DEFAULT 0,
   total_amount numeric(14,2) NOT NULL DEFAULT 0,
+  points_earned integer NOT NULL DEFAULT 0,
   payment_method text NOT NULL DEFAULT 'cash',
   status text NOT NULL DEFAULT 'completed',
   notes text DEFAULT '',
@@ -362,6 +821,9 @@ CREATE TABLE IF NOT EXISTS public.orders (
 ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS cashier_name text DEFAULT '';
 ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS customer_name text;
 ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS notes text DEFAULT '';
+ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS voucher_code text;
+ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS voucher_discount_amount numeric(14,2) NOT NULL DEFAULT 0;
+ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS points_earned integer NOT NULL DEFAULT 0;
 
 CREATE TABLE IF NOT EXISTS public.order_items (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -370,10 +832,12 @@ CREATE TABLE IF NOT EXISTS public.order_items (
   menu_name text DEFAULT '',
   quantity integer NOT NULL DEFAULT 1,
   unit_price numeric(14,2) NOT NULL DEFAULT 0,
+  unit_hpp numeric(14,2) NOT NULL DEFAULT 0,
   subtotal numeric(14,2) NOT NULL DEFAULT 0,
   notes text
 );
 ALTER TABLE public.order_items ADD COLUMN IF NOT EXISTS menu_name text DEFAULT '';
+ALTER TABLE public.order_items ADD COLUMN IF NOT EXISTS unit_hpp numeric(14,2) NOT NULL DEFAULT 0;
 ALTER TABLE public.order_items ADD COLUMN IF NOT EXISTS notes text;
 
 -- -----------------------------------------------------------------------------
@@ -445,7 +909,7 @@ ALTER TABLE public.stock_opname_logs ADD COLUMN IF NOT EXISTS total_items_checke
 ALTER TABLE public.stock_opname_logs ADD COLUMN IF NOT EXISTS discrepancy_count integer NOT NULL DEFAULT 0;
 ALTER TABLE public.stock_opname_logs ADD COLUMN IF NOT EXISTS whatsapp_sent boolean NOT NULL DEFAULT false;
 
--- Lepas FK ketat pada performed_by / cashier_id / purchased_by jika ada (agar karyawan login username/Google yang belum punya baris di profiles tetap bisa submit opname, POS, dan pembelian)
+-- Lepas FK ketat pada performed_by / cashier_id / purchased_by jika berasal dari skema lama
 DO $$
 DECLARE
   v_rec record;
@@ -488,7 +952,7 @@ ALTER TABLE public.stock_opname_details ADD COLUMN IF NOT EXISTS unit_price nume
 ALTER TABLE public.stock_opname_details ADD COLUMN IF NOT EXISTS reason text;
 
 -- -----------------------------------------------------------------------------
--- 9. PENGATURAN TOKO, PROGRAM MEMBERSHIP & DISPLAY TV STORE
+-- 9. PENGATURAN TOKO, PROGRAM MEMBERSHIP, DISPLAY TV STORE, VOUCHER
 -- -----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS public.store_settings (
   id text PRIMARY KEY DEFAULT 'default',
@@ -563,9 +1027,6 @@ CREATE TABLE IF NOT EXISTS public.store_videos (
   created_at timestamptz NOT NULL DEFAULT now()
 );
 
--- -----------------------------------------------------------------------------
--- 9B. TABEL VOUCHER & PROMO RUSH HOUR
--- -----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS public.vouchers (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   code text NOT NULL UNIQUE,
@@ -597,12 +1058,495 @@ CREATE TABLE IF NOT EXISTS public.vouchers (
   created_at timestamptz NOT NULL DEFAULT now()
 );
 
--- Kolom voucher opsional pada tabel orders
-ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS voucher_code text;
-ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS voucher_discount_amount numeric(14,2) NOT NULL DEFAULT 0;
+-- -----------------------------------------------------------------------------
+-- 9B. TABEL MULTI-PERANGKAT: VENDOR, RESTOCK REQUEST, NOTIFIKASI, WHATSAPP LOGS
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS public.vendors (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  name text NOT NULL,
+  contact_person text DEFAULT '',
+  phone text DEFAULT '',
+  email text DEFAULT '',
+  category_type text NOT NULL DEFAULT 'raw_material',
+  supplied_items jsonb NOT NULL DEFAULT '[]'::jsonb,
+  address text DEFAULT '',
+  payment_terms text DEFAULT 'Cash / Transfer',
+  notes text DEFAULT '',
+  is_active boolean NOT NULL DEFAULT true,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+ALTER TABLE public.vendors ADD COLUMN IF NOT EXISTS phone text DEFAULT '';
+ALTER TABLE public.vendors ADD COLUMN IF NOT EXISTS category_type text NOT NULL DEFAULT 'raw_material';
+
+CREATE TABLE IF NOT EXISTS public.restock_requests (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  inventory_item_id uuid REFERENCES public.inventory_items(id) ON DELETE SET NULL,
+  item_name text NOT NULL,
+  unit text DEFAULT 'pcs',
+  current_stock numeric(14,2) NOT NULL DEFAULT 0,
+  requested_quantity numeric(14,2) NOT NULL DEFAULT 1,
+  urgency text NOT NULL DEFAULT 'normal' CHECK (urgency IN ('normal', 'urgent')),
+  notes text DEFAULT '',
+  requested_by_id text DEFAULT '',
+  requested_by_name text NOT NULL DEFAULT 'Kasir',
+  requested_by_role text NOT NULL DEFAULT 'cashier',
+  status text NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'ordered', 'completed')),
+  handled_by_name text,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+ALTER TABLE public.restock_requests ADD COLUMN IF NOT EXISTS handled_by_name text;
+ALTER TABLE public.restock_requests ADD COLUMN IF NOT EXISTS updated_at timestamptz NOT NULL DEFAULT now();
+
+CREATE TABLE IF NOT EXISTS public.operational_notifications (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  type text NOT NULL DEFAULT 'owner_message',
+  title text NOT NULL,
+  message text NOT NULL,
+  target_page text DEFAULT 'dashboard',
+  target_roles jsonb NOT NULL DEFAULT '["owner","manager","cashier"]'::jsonb,
+  sender_name text DEFAULT 'BrewFlow System',
+  sender_role text DEFAULT 'owner',
+  restock_request_id text,
+  unread boolean NOT NULL DEFAULT true,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS public.whatsapp_logs (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  event_type text NOT NULL,
+  targets jsonb NOT NULL DEFAULT '[]'::jsonb,
+  preview text NOT NULL DEFAULT '',
+  mode text NOT NULL DEFAULT 'edge_function',
+  status text NOT NULL DEFAULT 'sent',
+  error text,
+  sent_at timestamptz NOT NULL DEFAULT now()
+);
 
 -- -----------------------------------------------------------------------------
--- 10. AKTIFKAN RLS & HAK AKSES AMAN PADA SELURUH TABEL OPERASIONAL
+-- 10. RPC AMAN UNTUK KASIR & OPERASI POS ATOMIK (ANTI RACE-CONDITION)
+-- -----------------------------------------------------------------------------
+
+-- 10a. Stok aman untuk Kasir (tanpa kolom harga modal `last_purchase_price`)
+CREATE OR REPLACE FUNCTION public.get_pos_stock_levels()
+RETURNS TABLE (
+  id uuid,
+  name text,
+  sku text,
+  category_type text,
+  expense_category text,
+  unit text,
+  current_stock numeric,
+  min_stock_threshold numeric,
+  asset_condition text,
+  updated_at timestamptz
+)
+LANGUAGE plpgsql
+STABLE
+SECURITY DEFINER
+SET search_path = public
+AS $$
+BEGIN
+  IF NOT public.is_active_employee() THEN
+    RAISE EXCEPTION 'Unauthorized';
+  END IF;
+
+  RETURN QUERY
+  SELECT
+    i.id,
+    i.name,
+    i.sku,
+    i.category_type,
+    i.expense_category,
+    i.unit,
+    i.current_stock,
+    i.min_stock_threshold,
+    i.asset_condition,
+    i.updated_at
+  FROM public.inventory_items i
+  ORDER BY i.name ASC;
+END;
+$$;
+
+-- 10b. Pengaturan toko aman untuk Kasir (tanpa nomor WA privat Owner / email alert / URL gateway)
+CREATE OR REPLACE FUNCTION public.get_pos_store_settings()
+RETURNS jsonb
+LANGUAGE plpgsql
+STABLE
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_row public.store_settings%ROWTYPE;
+BEGIN
+  IF NOT public.is_active_employee() THEN
+    RETURN NULL;
+  END IF;
+
+  SELECT * INTO v_row FROM public.store_settings WHERE id = 'default' LIMIT 1;
+  IF NOT FOUND THEN
+    RETURN NULL;
+  END IF;
+
+  RETURN jsonb_build_object(
+    'shop_name', v_row.shop_name,
+    'address', v_row.address,
+    'phone', v_row.phone,
+    'customer_service_contact', v_row.customer_service_contact,
+    'shop_logo_url', v_row.shop_logo_url,
+    'tax_enabled', v_row.tax_enabled,
+    'tax_percent', v_row.tax_percent,
+    'tax_label', v_row.tax_label,
+    'receipt_paper_width', v_row.receipt_paper_width,
+    'receipt_header_text', v_row.receipt_header_text,
+    'receipt_footer_text', v_row.receipt_footer_text,
+    'receipt_show_logo', v_row.receipt_show_logo,
+    'receipt_show_cashier_and_table', v_row.receipt_show_cashier_and_table,
+    'receipt_show_member_info', v_row.receipt_show_member_info,
+    'receipt_show_customer_service', v_row.receipt_show_customer_service
+  );
+END;
+$$;
+
+-- 10c. Generator nomor pesanan harian atomik: BF-YYMMDD-NNN (zona waktu WIB / Asia/Jakarta)
+CREATE OR REPLACE FUNCTION public.next_order_number()
+RETURNS text
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_today date;
+  v_prefix text;
+  v_existing_max integer := 0;
+  v_seq integer;
+BEGIN
+  v_today := (now() AT TIME ZONE 'Asia/Jakarta')::date;
+  v_prefix := 'BF-' || to_char(v_today, 'YYMMDD') || '-';
+
+  INSERT INTO public.daily_order_counters (order_date, last_seq)
+  VALUES (v_today, 0)
+  ON CONFLICT (order_date) DO NOTHING;
+
+  SELECT last_seq INTO v_seq
+  FROM public.daily_order_counters
+  WHERE order_date = v_today
+  FOR UPDATE;
+
+  SELECT coalesce(max(substring(o.order_number FROM '([0-9]+)$')::integer), 0)
+  INTO v_existing_max
+  FROM public.orders o
+  WHERE o.order_number LIKE (v_prefix || '%');
+
+  v_seq := GREATEST(coalesce(v_seq, 0), v_existing_max) + 1;
+
+  UPDATE public.daily_order_counters
+  SET last_seq = v_seq
+  WHERE order_date = v_today;
+
+  RETURN v_prefix || lpad(v_seq::text, 3, '0');
+END;
+$$;
+
+-- 10d. Checkout Atomik: 1 transaksi penuh untuk orders + order_items (unit_hpp historis) + potong stok relatif + poin member + kuota voucher
+CREATE OR REPLACE FUNCTION public.checkout_order_atomic(
+  p_payload jsonb
+)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_emp_id uuid;
+  v_order_number text;
+  v_order_id uuid;
+  v_status text;
+  v_customer_id uuid;
+  v_voucher_code text;
+  v_points_earned integer;
+  v_total_amount numeric(14,2);
+  v_next_tier text;
+  v_item jsonb;
+  v_menu_uuid uuid;
+  v_qty integer;
+  v_unit_hpp numeric(14,2);
+  v_deduction jsonb;
+  v_inv_uuid uuid;
+  v_used_qty numeric(14,2);
+  v_voucher_updated integer := 0;
+BEGIN
+  IF NOT public.is_active_employee() THEN
+    RETURN jsonb_build_object('ok', false, 'error', 'Sesi tidak valid atau karyawan tidak aktif.');
+  END IF;
+
+  v_emp_id := public.get_current_employee_id();
+  v_status := coalesce(nullif(trim(p_payload->>'status'), ''), 'completed');
+  IF v_status NOT IN ('completed', 'draft', 'cancelled') THEN
+    v_status := 'completed';
+  END IF;
+
+  v_order_number := public.next_order_number();
+  v_total_amount := coalesce((p_payload->>'total_amount')::numeric, 0);
+  v_points_earned := GREATEST(0, coalesce((p_payload->>'points_earned')::integer, 0));
+  v_voucher_code := nullif(upper(trim(coalesce(p_payload->>'voucher_code', ''))), '');
+  v_next_tier := nullif(trim(coalesce(p_payload->>'next_tier', '')), '');
+
+  BEGIN
+    v_customer_id := nullif(trim(coalesce(p_payload->>'customer_id', '')), '')::uuid;
+  EXCEPTION WHEN invalid_text_representation THEN
+    v_customer_id := NULL;
+  END;
+
+  -- Jika ada voucher pada transaksi completed, validasi & naikkan kuota atomik sebelum insert order
+  IF v_status = 'completed' AND v_voucher_code IS NOT NULL THEN
+    UPDATE public.vouchers
+    SET used_count = used_count + 1
+    WHERE upper(trim(code)) = v_voucher_code
+      AND is_active = true
+      AND (max_usage_quota = 0 OR used_count < max_usage_quota);
+    GET DIAGNOSTICS v_voucher_updated = ROW_COUNT;
+
+    IF v_voucher_updated = 0 AND EXISTS (SELECT 1 FROM public.vouchers WHERE upper(trim(code)) = v_voucher_code) THEN
+      RETURN jsonb_build_object('ok', false, 'error', format('Kuota voucher %s sudah habis atau tidak aktif.', v_voucher_code));
+    END IF;
+  END IF;
+
+  INSERT INTO public.orders (
+    order_number,
+    cashier_id,
+    cashier_name,
+    customer_id,
+    customer_name,
+    order_type,
+    table_number,
+    subtotal,
+    discount_amount,
+    voucher_code,
+    voucher_discount_amount,
+    tax_amount,
+    total_amount,
+    points_earned,
+    payment_method,
+    status,
+    notes
+  )
+  VALUES (
+    v_order_number,
+    v_emp_id,
+    coalesce(p_payload->>'cashier_name', 'Kasir'),
+    v_customer_id,
+    nullif(p_payload->>'customer_name', ''),
+    coalesce(nullif(p_payload->>'order_type', ''), 'dine_in'),
+    coalesce(p_payload->>'table_number', ''),
+    coalesce((p_payload->>'subtotal')::numeric, 0),
+    coalesce((p_payload->>'discount_amount')::numeric, 0),
+    v_voucher_code,
+    coalesce((p_payload->>'voucher_discount_amount')::numeric, 0),
+    coalesce((p_payload->>'tax_amount')::numeric, 0),
+    v_total_amount,
+    v_points_earned,
+    coalesce(nullif(p_payload->>'payment_method', ''), 'cash'),
+    v_status,
+    coalesce(p_payload->>'notes', '')
+  )
+  RETURNING id INTO v_order_id;
+
+  -- Insert order_items + hitung unit_hpp historis langsung dari resep di server (aman untuk role Kasir)
+  FOR v_item IN SELECT * FROM jsonb_array_elements(coalesce(p_payload->'items', '[]'::jsonb))
+  LOOP
+    v_qty := GREATEST(1, coalesce((v_item->>'quantity')::integer, 1));
+    v_menu_uuid := NULL;
+    BEGIN
+      v_menu_uuid := nullif(trim(coalesce(v_item->>'menu_id', '')), '')::uuid;
+    EXCEPTION WHEN invalid_text_representation THEN
+      v_menu_uuid := NULL;
+    END;
+
+    v_unit_hpp := coalesce((v_item->>'unit_hpp')::numeric, 0);
+    IF v_menu_uuid IS NOT NULL THEN
+      SELECT coalesce(round(sum(mr.quantity_needed * coalesce(ii.last_purchase_price, 0))::numeric, 2), v_unit_hpp)
+      INTO v_unit_hpp
+      FROM public.menu_recipes mr
+      JOIN public.inventory_items ii ON ii.id = mr.inventory_item_id
+      WHERE mr.menu_id = v_menu_uuid;
+    END IF;
+
+    INSERT INTO public.order_items (
+      order_id, menu_id, menu_name, quantity, unit_price, unit_hpp, subtotal, notes
+    )
+    VALUES (
+      v_order_id,
+      v_menu_uuid,
+      coalesce(v_item->>'menu_name', 'Menu'),
+      v_qty,
+      coalesce((v_item->>'unit_price')::numeric, 0),
+      coalesce(v_unit_hpp, 0),
+      coalesce((v_item->>'subtotal')::numeric, 0),
+      nullif(v_item->>'notes', '')
+    );
+
+    -- Potong stok bahan baku secara relatif (anti lost-update) jika pesanan completed
+    IF v_status = 'completed' AND v_menu_uuid IS NOT NULL THEN
+      UPDATE public.inventory_items ii
+      SET
+        current_stock = GREATEST(0, round((ii.current_stock - (mr.quantity_needed * v_qty))::numeric, 2)),
+        updated_at = now()
+      FROM public.menu_recipes mr
+      WHERE mr.menu_id = v_menu_uuid
+        AND ii.id = mr.inventory_item_id;
+    END IF;
+  END LOOP;
+
+  -- Fallback potongan stok eksplisit jika item tidak punya menu_id UUID di DB
+  IF v_status = 'completed' AND jsonb_array_length(coalesce(p_payload->'fallback_deductions', '[]'::jsonb)) > 0 THEN
+    FOR v_deduction IN SELECT * FROM jsonb_array_elements(p_payload->'fallback_deductions')
+    LOOP
+      BEGIN
+        v_inv_uuid := (v_deduction->>'inventory_item_id')::uuid;
+        v_used_qty := GREATEST(0, coalesce((v_deduction->>'quantity_deducted')::numeric, 0));
+        IF v_used_qty > 0 THEN
+          UPDATE public.inventory_items
+          SET
+            current_stock = GREATEST(0, round((current_stock - v_used_qty)::numeric, 2)),
+            updated_at = now()
+          WHERE id = v_inv_uuid;
+        END IF;
+      EXCEPTION WHEN invalid_text_representation THEN
+        NULL;
+      END;
+    END LOOP;
+  END IF;
+
+  -- Perbarui poin & total belanja member secara relatif
+  IF v_status = 'completed' AND v_customer_id IS NOT NULL THEN
+    UPDATE public.customers
+    SET
+      points = GREATEST(0, points + v_points_earned),
+      total_spent = GREATEST(0, total_spent + v_total_amount),
+      tier = coalesce(v_next_tier, tier)
+    WHERE id = v_customer_id;
+  END IF;
+
+  RETURN jsonb_build_object(
+    'ok', true,
+    'id', v_order_id,
+    'order_number', v_order_number
+  );
+EXCEPTION
+  WHEN OTHERS THEN
+    RETURN jsonb_build_object('ok', false, 'error', SQLERRM);
+END;
+$$;
+
+-- 10e. Pembatalan Pesanan Atomik: ubah status -> pulihkan stok resep -> balikkan poin/belanja member -> pulihkan kuota voucher
+CREATE OR REPLACE FUNCTION public.cancel_order_atomic(
+  p_order_id uuid,
+  p_reason text DEFAULT NULL
+)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_order public.orders%ROWTYPE;
+  v_next_notes text;
+  v_item record;
+BEGIN
+  IF NOT public.is_active_employee() THEN
+    RETURN jsonb_build_object('ok', false, 'error', 'Sesi tidak valid atau karyawan tidak aktif.');
+  END IF;
+
+  SELECT * INTO v_order
+  FROM public.orders
+  WHERE id = p_order_id
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('ok', false, 'error', 'Pesanan tidak ditemukan.');
+  END IF;
+
+  IF v_order.status = 'cancelled' THEN
+    RETURN jsonb_build_object('ok', true, 'already_cancelled', true);
+  END IF;
+
+  v_next_notes := CASE
+    WHEN p_reason IS NOT NULL AND trim(p_reason) <> '' THEN trim(p_reason)
+    ELSE v_order.notes
+  END;
+
+  UPDATE public.orders
+  SET
+    status = 'cancelled',
+    notes = coalesce(v_next_notes, notes)
+  WHERE id = p_order_id;
+
+  IF v_order.status = 'completed' THEN
+    -- 1. Pulihkan stok bahan baku sesuai resep setiap item pesanan
+    FOR v_item IN
+      SELECT oi.menu_id, oi.quantity
+      FROM public.order_items oi
+      WHERE oi.order_id = p_order_id
+        AND oi.menu_id IS NOT NULL
+    LOOP
+      UPDATE public.inventory_items ii
+      SET
+        current_stock = round((ii.current_stock + (mr.quantity_needed * v_item.quantity))::numeric, 2),
+        updated_at = now()
+      FROM public.menu_recipes mr
+      WHERE mr.menu_id = v_item.menu_id
+        AND ii.id = mr.inventory_item_id;
+    END LOOP;
+
+    -- 2. Balikkan poin & total belanja member
+    IF v_order.customer_id IS NOT NULL THEN
+      UPDATE public.customers
+      SET
+        points = GREATEST(0, points - coalesce(v_order.points_earned, 0)),
+        total_spent = GREATEST(0, total_spent - coalesce(v_order.total_amount, 0))
+      WHERE id = v_order.customer_id;
+    END IF;
+
+    -- 3. Pulihkan kuota voucher jika ada
+    IF v_order.voucher_code IS NOT NULL AND trim(v_order.voucher_code) <> '' THEN
+      UPDATE public.vouchers
+      SET used_count = GREATEST(0, used_count - 1)
+      WHERE upper(trim(code)) = upper(trim(v_order.voucher_code));
+    END IF;
+  END IF;
+
+  RETURN jsonb_build_object('ok', true, 'order_id', p_order_id, 'restored_stock', v_order.status = 'completed');
+EXCEPTION
+  WHEN OTHERS THEN
+    RETURN jsonb_build_object('ok', false, 'error', SQLERRM);
+END;
+$$;
+
+-- Izinkan eksekusi fungsi helper & RPC oleh anon/authenticated (validasi role dilakukan di dalam fungsi)
+GRANT EXECUTE ON FUNCTION public.get_app_session_token() TO anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.get_current_employee_role() TO anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.get_current_employee_id() TO anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.is_active_employee() TO anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.is_active_manager_or_owner() TO anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.is_active_owner() TO anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.get_my_employee_profile() TO authenticated;
+GRANT EXECUTE ON FUNCTION public.authenticate_employee_username(text, text) TO anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.get_app_session_profile() TO anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.revoke_app_session() TO anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.revoke_all_employee_sessions(uuid) TO anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.set_employee_username_credentials(text, text, text) TO anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.get_all_employees_for_owner() TO anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.upsert_employee_by_owner(uuid, text, text, text, text, text, text, boolean, text, text, text, numeric, date, text, text) TO anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.delete_employee_by_owner(text) TO anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.get_pos_stock_levels() TO anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.get_pos_store_settings() TO anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.next_order_number() TO anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.checkout_order_atomic(jsonb) TO anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.cancel_order_atomic(uuid, text) TO anon, authenticated;
+
+-- -----------------------------------------------------------------------------
+-- 11. STRICT RLS PER-ROLE (OWNER vs MANAGER vs CASHIER)
 -- -----------------------------------------------------------------------------
 DO $$
 DECLARE
@@ -625,18 +1569,205 @@ BEGIN
     'membership_program_settings',
     'member_redemption_logs',
     'store_videos',
-    'vouchers'
+    'vouchers',
+    'vendors',
+    'restock_requests',
+    'operational_notifications',
+    'whatsapp_logs'
   ]
   LOOP
     EXECUTE format('GRANT SELECT, INSERT, UPDATE, DELETE ON public.%I TO anon, authenticated', t);
     EXECUTE format('ALTER TABLE public.%I ENABLE ROW LEVEL SECURITY', t);
     EXECUTE format('DROP POLICY IF EXISTS "Active staff full access" ON public.%I', t);
-    EXECUTE format(
-      'CREATE POLICY "Active staff full access" ON public.%I FOR ALL TO anon, authenticated USING (public.is_active_employee()) WITH CHECK (public.is_active_employee())',
-      t
-    );
   END LOOP;
 END $$;
+
+-- A. Master katalog & promo: semua staf baca; hanya Owner/Manager ubah
+DO $$
+DECLARE
+  t text;
+BEGIN
+  FOREACH t IN ARRAY ARRAY[
+    'categories',
+    'menus',
+    'menu_recipes',
+    'vouchers',
+    'membership_program_settings',
+    'store_videos',
+    'stock_opname_schedules'
+  ]
+  LOOP
+    EXECUTE format('DROP POLICY IF EXISTS "Staff read catalog" ON public.%I', t);
+    EXECUTE format('CREATE POLICY "Staff read catalog" ON public.%I FOR SELECT TO anon, authenticated USING (public.is_active_employee())', t);
+
+    EXECUTE format('DROP POLICY IF EXISTS "Manager/Owner manage catalog" ON public.%I', t);
+    EXECUTE format('CREATE POLICY "Manager/Owner manage catalog" ON public.%I FOR ALL TO anon, authenticated USING (public.is_active_manager_or_owner()) WITH CHECK (public.is_active_manager_or_owner())', t);
+  END LOOP;
+END $$;
+
+-- B. Data biaya sensitif (Inventori penuh termasuk HPP/harga beli, Pembelian, Vendor): HANYA Owner & Manager!
+--    Kasir membaca ketersediaan stok lewat RPC aman `get_pos_stock_levels()` (tanpa last_purchase_price).
+DO $$
+DECLARE
+  t text;
+BEGIN
+  FOREACH t IN ARRAY ARRAY[
+    'inventory_items',
+    'purchases',
+    'purchase_items',
+    'vendors'
+  ]
+  LOOP
+    EXECUTE format('DROP POLICY IF EXISTS "Manager/Owner manage cost data" ON public.%I', t);
+    EXECUTE format('CREATE POLICY "Manager/Owner manage cost data" ON public.%I FOR ALL TO anon, authenticated USING (public.is_active_manager_or_owner()) WITH CHECK (public.is_active_manager_or_owner())', t);
+  END LOOP;
+END $$;
+
+-- C. Pengaturan Toko (memuat nomor WA Owner/Manager & email alert): baca/ubah terbatas!
+--    Kasir membaca konfigurasi struk & pajak lewat RPC aman `get_pos_store_settings()`.
+DROP POLICY IF EXISTS "Manager/Owner read store_settings" ON public.store_settings;
+CREATE POLICY "Manager/Owner read store_settings"
+  ON public.store_settings FOR SELECT TO anon, authenticated
+  USING (public.is_active_manager_or_owner());
+
+DROP POLICY IF EXISTS "Owner manage store_settings" ON public.store_settings;
+CREATE POLICY "Owner manage store_settings"
+  ON public.store_settings FOR ALL TO anon, authenticated
+  USING (public.is_active_owner()) WITH CHECK (public.is_active_owner());
+
+-- D. Transaksi POS (orders & order_items): Kasir boleh baca & buat transaksi; edit/hapus hanya draft atau Manager/Owner
+DROP POLICY IF EXISTS "Staff read orders" ON public.orders;
+CREATE POLICY "Staff read orders"
+  ON public.orders FOR SELECT TO anon, authenticated
+  USING (public.is_active_employee());
+
+DROP POLICY IF EXISTS "Staff insert orders" ON public.orders;
+CREATE POLICY "Staff insert orders"
+  ON public.orders FOR INSERT TO anon, authenticated
+  WITH CHECK (public.is_active_employee());
+
+DROP POLICY IF EXISTS "Manager/Owner or draft update orders" ON public.orders;
+CREATE POLICY "Manager/Owner or draft update orders"
+  ON public.orders FOR UPDATE TO anon, authenticated
+  USING (public.is_active_manager_or_owner() OR (public.is_active_employee() AND status = 'draft'))
+  WITH CHECK (public.is_active_employee());
+
+DROP POLICY IF EXISTS "Manager/Owner or draft delete orders" ON public.orders;
+CREATE POLICY "Manager/Owner or draft delete orders"
+  ON public.orders FOR DELETE TO anon, authenticated
+  USING (public.is_active_manager_or_owner() OR (public.is_active_employee() AND status = 'draft'));
+
+DROP POLICY IF EXISTS "Staff read order_items" ON public.order_items;
+CREATE POLICY "Staff read order_items"
+  ON public.order_items FOR SELECT TO anon, authenticated
+  USING (public.is_active_employee());
+
+DROP POLICY IF EXISTS "Staff insert order_items" ON public.order_items;
+CREATE POLICY "Staff insert order_items"
+  ON public.order_items FOR INSERT TO anon, authenticated
+  WITH CHECK (public.is_active_employee());
+
+DROP POLICY IF EXISTS "Manager/Owner modify order_items" ON public.order_items;
+CREATE POLICY "Manager/Owner modify order_items"
+  ON public.order_items FOR ALL TO anon, authenticated
+  USING (public.is_active_manager_or_owner()) WITH CHECK (public.is_active_manager_or_owner());
+
+-- E. Pelanggan & Penukaran Poin: Kasir boleh baca/tambah/edit; hapus hanya Owner/Manager
+DROP POLICY IF EXISTS "Staff read customers" ON public.customers;
+CREATE POLICY "Staff read customers"
+  ON public.customers FOR SELECT TO anon, authenticated USING (public.is_active_employee());
+DROP POLICY IF EXISTS "Staff insert customers" ON public.customers;
+CREATE POLICY "Staff insert customers"
+  ON public.customers FOR INSERT TO anon, authenticated WITH CHECK (public.is_active_employee());
+DROP POLICY IF EXISTS "Staff update customers" ON public.customers;
+CREATE POLICY "Staff update customers"
+  ON public.customers FOR UPDATE TO anon, authenticated USING (public.is_active_employee()) WITH CHECK (public.is_active_employee());
+DROP POLICY IF EXISTS "Manager/Owner delete customers" ON public.customers;
+CREATE POLICY "Manager/Owner delete customers"
+  ON public.customers FOR DELETE TO anon, authenticated USING (public.is_active_manager_or_owner());
+
+DROP POLICY IF EXISTS "Staff read redemptions" ON public.member_redemption_logs;
+CREATE POLICY "Staff read redemptions"
+  ON public.member_redemption_logs FOR SELECT TO anon, authenticated USING (public.is_active_employee());
+DROP POLICY IF EXISTS "Staff insert redemptions" ON public.member_redemption_logs;
+CREATE POLICY "Staff insert redemptions"
+  ON public.member_redemption_logs FOR INSERT TO anon, authenticated WITH CHECK (public.is_active_employee());
+DROP POLICY IF EXISTS "Manager/Owner manage redemptions" ON public.member_redemption_logs;
+CREATE POLICY "Manager/Owner manage redemptions"
+  ON public.member_redemption_logs FOR DELETE TO anon, authenticated USING (public.is_active_manager_or_owner());
+
+-- F. Log Stock Opname: staf boleh baca & kirim hasil hitung; edit/hapus hanya Owner/Manager
+DROP POLICY IF EXISTS "Staff read opname logs" ON public.stock_opname_logs;
+CREATE POLICY "Staff read opname logs"
+  ON public.stock_opname_logs FOR SELECT TO anon, authenticated USING (public.is_active_employee());
+DROP POLICY IF EXISTS "Staff insert opname logs" ON public.stock_opname_logs;
+CREATE POLICY "Staff insert opname logs"
+  ON public.stock_opname_logs FOR INSERT TO anon, authenticated WITH CHECK (public.is_active_employee());
+DROP POLICY IF EXISTS "Manager/Owner modify opname logs" ON public.stock_opname_logs;
+CREATE POLICY "Manager/Owner modify opname logs"
+  ON public.stock_opname_logs FOR UPDATE TO anon, authenticated USING (public.is_active_manager_or_owner()) WITH CHECK (public.is_active_manager_or_owner());
+DROP POLICY IF EXISTS "Manager/Owner delete opname logs" ON public.stock_opname_logs;
+CREATE POLICY "Manager/Owner delete opname logs"
+  ON public.stock_opname_logs FOR DELETE TO anon, authenticated USING (public.is_active_manager_or_owner());
+
+DROP POLICY IF EXISTS "Staff read opname details" ON public.stock_opname_details;
+CREATE POLICY "Staff read opname details"
+  ON public.stock_opname_details FOR SELECT TO anon, authenticated USING (public.is_active_employee());
+DROP POLICY IF EXISTS "Staff insert opname details" ON public.stock_opname_details;
+CREATE POLICY "Staff insert opname details"
+  ON public.stock_opname_details FOR INSERT TO anon, authenticated WITH CHECK (public.is_active_employee());
+DROP POLICY IF EXISTS "Manager/Owner manage opname details" ON public.stock_opname_details;
+CREATE POLICY "Manager/Owner manage opname details"
+  ON public.stock_opname_details FOR DELETE TO anon, authenticated USING (public.is_active_manager_or_owner());
+
+-- G. Pengajuan Restock: Kasir boleh baca & mengajukan; hanya Owner/Manager yang menyetujui/menolak
+DROP POLICY IF EXISTS "Staff read restock_requests" ON public.restock_requests;
+CREATE POLICY "Staff read restock_requests"
+  ON public.restock_requests FOR SELECT TO anon, authenticated USING (public.is_active_employee());
+DROP POLICY IF EXISTS "Staff insert restock_requests" ON public.restock_requests;
+CREATE POLICY "Staff insert restock_requests"
+  ON public.restock_requests FOR INSERT TO anon, authenticated WITH CHECK (public.is_active_employee());
+DROP POLICY IF EXISTS "Manager/Owner update restock_requests" ON public.restock_requests;
+CREATE POLICY "Manager/Owner update restock_requests"
+  ON public.restock_requests FOR UPDATE TO anon, authenticated USING (public.is_active_manager_or_owner()) WITH CHECK (public.is_active_manager_or_owner());
+DROP POLICY IF EXISTS "Manager/Owner delete restock_requests" ON public.restock_requests;
+CREATE POLICY "Manager/Owner delete restock_requests"
+  ON public.restock_requests FOR DELETE TO anon, authenticated USING (public.is_active_manager_or_owner());
+
+-- H. Notifikasi Operasional: staf membaca notifikasi untuk role-nya (atau Owner melihat semua)
+DROP POLICY IF EXISTS "Staff read operational_notifications" ON public.operational_notifications;
+CREATE POLICY "Staff read operational_notifications"
+  ON public.operational_notifications FOR SELECT TO anon, authenticated
+  USING (
+    public.is_active_owner()
+    OR (
+      public.is_active_employee()
+      AND (
+        target_roles ? public.get_current_employee_role()
+        OR target_roles ? 'all'
+      )
+    )
+  );
+DROP POLICY IF EXISTS "Staff insert operational_notifications" ON public.operational_notifications;
+CREATE POLICY "Staff insert operational_notifications"
+  ON public.operational_notifications FOR INSERT TO anon, authenticated WITH CHECK (public.is_active_employee());
+DROP POLICY IF EXISTS "Staff update operational_notifications" ON public.operational_notifications;
+CREATE POLICY "Staff update operational_notifications"
+  ON public.operational_notifications FOR UPDATE TO anon, authenticated USING (public.is_active_employee()) WITH CHECK (public.is_active_employee());
+DROP POLICY IF EXISTS "Manager/Owner delete operational_notifications" ON public.operational_notifications;
+CREATE POLICY "Manager/Owner delete operational_notifications"
+  ON public.operational_notifications FOR DELETE TO anon, authenticated USING (public.is_active_manager_or_owner());
+
+-- I. Log WhatsApp: staf boleh mencatat log struk; baca & hapus hanya Owner/Manager
+DROP POLICY IF EXISTS "Manager/Owner read whatsapp_logs" ON public.whatsapp_logs;
+CREATE POLICY "Manager/Owner read whatsapp_logs"
+  ON public.whatsapp_logs FOR SELECT TO anon, authenticated USING (public.is_active_manager_or_owner());
+DROP POLICY IF EXISTS "Staff insert whatsapp_logs" ON public.whatsapp_logs;
+CREATE POLICY "Staff insert whatsapp_logs"
+  ON public.whatsapp_logs FOR INSERT TO anon, authenticated WITH CHECK (public.is_active_employee());
+DROP POLICY IF EXISTS "Manager/Owner delete whatsapp_logs" ON public.whatsapp_logs;
+CREATE POLICY "Manager/Owner delete whatsapp_logs"
+  ON public.whatsapp_logs FOR DELETE TO anon, authenticated USING (public.is_active_manager_or_owner());
 
 -- Pastikan enum lama `item_category_type` (jika ada) mendukung nilai 'operational'
 DO $$
@@ -651,8 +1782,7 @@ BEGIN
 END $$;
 
 -- -----------------------------------------------------------------------------
--- 11. DATA AWAL OTOMATIS (HANYA DIISI JIKA TABEL MASIH KOSONG)
--- Menggunakan INSERT ... VALUES langsung agar kompatibel dengan kolom text, time, maupun ENUM lama
+-- 12. DATA AWAL OTOMATIS (HANYA DIISI JIKA TABEL MASIH KOSONG)
 -- -----------------------------------------------------------------------------
 DO $$
 BEGIN
@@ -685,32 +1815,5 @@ BEGIN
       ('Opname Harian Bahan Baku & Susu', 'daily', '21:00', NULL, NULL, 'raw_material', true, true),
       ('Opname Mingguan Kemasan & Cup', 'weekly', '20:00', 0, NULL, 'packaging', true, false),
       ('Audit Aset & Mesin Bulanan', 'monthly', '10:00', NULL, 1, 'asset', true, false);
-  END IF;
-
-  IF NOT EXISTS (SELECT 1 FROM public.vouchers) THEN
-    INSERT INTO public.vouchers (
-      code, title, description, scheme_type, discount_percent, max_discount_amount, discount_amount,
-      special_price, buy_quantity, free_quantity, bundle_quantity, bundle_price, target_menu_ids,
-      min_purchase_amount, valid_from_date, valid_until_date, start_time, end_time, active_days,
-      max_usage_quota, used_count, stackable_with_member_discount, is_rush_hour, is_active, created_by_name
-    ) VALUES
-      (
-        'RUSHPAGI20', 'Rush Hour Kopi Pagi', 'Potongan 20% maksimal Rp 15.000 untuk jam berangkat kerja.',
-        'percentage_discount', 20, 15000, 0, 0, 1, 1, 2, 0, '[]'::jsonb,
-        25000, current_date, (current_date + interval '60 days')::date, '07:00', '10:00', '[1,2,3,4,5]'::jsonb,
-        100, 0, false, true, true, 'Owner BrewFlow'
-      ),
-      (
-        'SIANG18K', 'Rush Hour Siang Harga Spesial', 'Harga spesial Rp 18.000 per cup saat jam istirahat siang.',
-        'special_item_price', 0, 0, 0, 18000, 1, 1, 2, 0, '[]'::jsonb,
-        0, current_date, (current_date + interval '60 days')::date, '11:30', '14:00', '[0,1,2,3,4,5,6]'::jsonb,
-        80, 0, false, true, true, 'Owner BrewFlow'
-      ),
-      (
-        'B1G1SORE', 'Happy Hour Sore Beli 1 Gratis 1', 'Beli 1 gratis 1 untuk item termurah setiap sore jam santai.',
-        'buy_x_get_y', 0, 0, 0, 0, 1, 1, 2, 0, '[]'::jsonb,
-        0, current_date, (current_date + interval '60 days')::date, '15:00', '18:00', '[0,1,2,3,4,5,6]'::jsonb,
-        50, 0, false, true, true, 'Owner BrewFlow'
-      );
   END IF;
 END $$;

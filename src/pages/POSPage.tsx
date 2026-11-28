@@ -41,6 +41,7 @@ import {
   formatMissingIngredientsLabel,
 } from '../utils/menuStockAvailability';
 import { calculateCartSummary } from '../utils/posCalculations';
+import { generateNextOrderNumber } from '../utils/orderNumber';
 import {
   evaluateVoucherOnCart,
   formatVoucherSchemeSummary,
@@ -164,8 +165,8 @@ export function POSPage({ searchQuery }: POSPageProps) {
   );
 
   const nextOrderNumber = useMemo(
-    () => `BF-261125-${String(orders.length + 2).padStart(3, '0')}`,
-    [orders.length]
+    () => generateNextOrderNumber(orders.map((order) => order.order_number)),
+    [orders]
   );
 
   const menuAvailabilityMap = useMemo(() => {
@@ -325,9 +326,21 @@ export function POSPage({ searchQuery }: POSPageProps) {
       replacesDraftId: activeDraftId,
       enableSupabaseSync: liveSupabaseEnabled,
     });
-    resetCart();
-    setFeedbackBanner(`Draft pesanan ${result.order.order_number} berhasil disimpan.`);
-    window.setTimeout(() => setFeedbackBanner(null), 4500);
+    if (result.syncStatus.synced || result.syncStatus.queuedOffline) {
+      resetCart();
+      setFeedbackBanner(
+        result.syncStatus.queuedOffline
+          ? `Draft pesanan ${result.order.order_number} disimpan ke antrean offline dan akan disinkronkan saat koneksi kembali.`
+          : `Draft pesanan ${result.order.order_number} berhasil disimpan.`
+      );
+      window.setTimeout(() => setFeedbackBanner(null), 4500);
+    } else {
+      setFeedbackBanner(
+        result.syncStatus.error ||
+          'Gagal menyimpan draft ke server. Keranjang tetap dipertahankan agar Anda dapat mencoba ulang.'
+      );
+      window.setTimeout(() => setFeedbackBanner(null), 6000);
+    }
   };
 
   const handleLoadDraft = (draft: OrderRecord) => {
@@ -366,7 +379,8 @@ export function POSPage({ searchQuery }: POSPageProps) {
   };
 
   const handleConfirmPayment = async (
-    paymentMethod: PaymentMethod
+    paymentMethod: PaymentMethod,
+    options?: { forceOfflineQueue?: boolean }
   ): Promise<CreateOrderResult | null> => {
     if (!user || cart.length === 0) return null;
     const result = await createOrder({
@@ -381,14 +395,20 @@ export function POSPage({ searchQuery }: POSPageProps) {
       cashier: user,
       replacesDraftId: activeDraftId,
       enableSupabaseSync: liveSupabaseEnabled,
+      forceOfflineQueue: options?.forceOfflineQueue,
     });
-    resetCart();
-    setFeedbackBanner(
-      result.pointsEarned > 0
-        ? `Transaksi ${result.order.order_number} selesai · +${result.pointsEarned} poin member & stok otomatis diperbarui.`
-        : `Transaksi ${result.order.order_number} selesai · Stok bahan baku otomatis terpotong sesuai resep.`
-    );
-    window.setTimeout(() => setFeedbackBanner(null), 5000);
+
+    if (result.syncStatus.synced || result.syncStatus.queuedOffline) {
+      resetCart();
+      setFeedbackBanner(
+        result.syncStatus.queuedOffline
+          ? `Transaksi ${result.order.order_number} tersimpan di antrean offline. Akan otomatis disinkronkan saat internet aktif.`
+          : result.pointsEarned > 0
+            ? `Transaksi ${result.order.order_number} selesai · +${result.pointsEarned} poin member & stok otomatis diperbarui.`
+            : `Transaksi ${result.order.order_number} selesai · Stok bahan baku otomatis terpotong sesuai resep.`
+      );
+      window.setTimeout(() => setFeedbackBanner(null), 5000);
+    }
     return result;
   };
 

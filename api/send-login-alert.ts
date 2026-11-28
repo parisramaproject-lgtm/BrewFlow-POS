@@ -189,6 +189,86 @@ async function readJsonBody(req: IncomingMessage): Promise<LoginAlertPayload | n
   });
 }
 
+const APP_SESSION_TOKEN_REGEX = /^[a-f0-9]{64}$/i;
+
+function resolveServerSupabaseConfig(env: Record<string, string | undefined>): {
+  url: string;
+  anonKey: string;
+} | null {
+  const url = (
+    env.SUPABASE_URL ??
+    env.VITE_SUPABASE_URL ??
+    env.NEXT_PUBLIC_SUPABASE_URL ??
+    ''
+  )
+    .trim()
+    .replace(/\/+$/, '');
+  const anonKey = (
+    env.SUPABASE_ANON_KEY ??
+    env.VITE_SUPABASE_ANON_KEY ??
+    env.NEXT_PUBLIC_SUPABASE_ANON_KEY ??
+    env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY ??
+    ''
+  ).trim();
+  if (!url || !anonKey) return null;
+  return { url, anonKey };
+}
+
+async function verifyCallerSessionWithSupabase(params: {
+  sessionToken?: string | null;
+  bearerToken?: string | null;
+  env: Record<string, string | undefined>;
+}): Promise<boolean> {
+  const sbConfig = resolveServerSupabaseConfig(params.env);
+  const candidateAppToken =
+    params.sessionToken && APP_SESSION_TOKEN_REGEX.test(params.sessionToken)
+      ? params.sessionToken
+      : params.bearerToken && APP_SESSION_TOKEN_REGEX.test(params.bearerToken)
+        ? params.bearerToken
+        : null;
+
+  // When Supabase env is configured on the server, cryptographically verify the session token / JWT
+  if (sbConfig) {
+    try {
+      if (candidateAppToken) {
+        const res = await fetch(`${sbConfig.url}/rest/v1/rpc/get_app_session_profile`, {
+          method: 'POST',
+          headers: {
+            apikey: sbConfig.anonKey,
+            Authorization: `Bearer ${sbConfig.anonKey}`,
+            'Content-Type': 'application/json',
+            'x-client-info': `brewflow-server bf-sess=${candidateAppToken.toLowerCase()}`,
+          },
+          body: '{}',
+        });
+        if (res.ok) {
+          const data = (await res.json().catch(() => null)) as { status?: string } | null;
+          if (data?.status === 'ok') return true;
+        }
+      }
+
+      if (params.bearerToken && !APP_SESSION_TOKEN_REGEX.test(params.bearerToken)) {
+        const userRes = await fetch(`${sbConfig.url}/auth/v1/user`, {
+          method: 'GET',
+          headers: {
+            apikey: sbConfig.anonKey,
+            Authorization: `Bearer ${params.bearerToken}`,
+          },
+        });
+        if (userRes.ok) {
+          return true;
+        }
+      }
+      return false;
+    } catch {
+      return false;
+    }
+  }
+
+  // Fallback only when server has no Supabase URL/key configured (local dev without Supabase env)
+  return Boolean(candidateAppToken);
+}
+
 export default async function handleSendLoginAlertRequest(
   req: IncomingMessage,
   res: ServerResponse
@@ -205,11 +285,28 @@ export default async function handleSendLoginAlertRequest(
     return;
   }
 
-  // Require an active app session cookie or Bearer token so anonymous bots cannot spam emails
+  // Verify active app_sessions cookie OR authentic Bearer token against Supabase
   const sessionCookie = parseSessionCookieHeader(getHeaderValue(req.headers, 'cookie'));
   const authHeader = (getHeaderValue(req.headers, 'authorization') ?? '').trim();
-  if (!sessionCookie && !authHeader.toLowerCase().startsWith('bearer ')) {
+  const bearerToken = authHeader.toLowerCase().startsWith('bearer ')
+    ? authHeader.slice(7).trim()
+    : null;
+
+  if (!sessionCookie && !bearerToken) {
     sendJson(res, 401, { sent: false, error: 'Sesi aktif diperlukan untuk mengirim notifikasi email.' });
+    return;
+  }
+
+  const verified = await verifyCallerSessionWithSupabase({
+    sessionToken: sessionCookie?.token ?? null,
+    bearerToken,
+    env: process.env,
+  });
+  if (!verified) {
+    sendJson(res, 401, {
+      sent: false,
+      error: 'Token sesi tidak valid atau sudah kedaluwarsa.',
+    });
     return;
   }
 

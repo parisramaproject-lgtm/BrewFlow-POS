@@ -771,6 +771,12 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
                 setAppSessionToken(payload.session_token);
                 await persistAppSessionCookie(payload.session_token, authenticatedUser.username);
               }
+            } else if (payload.status === 'locked') {
+              return {
+                error:
+                  payload.message ||
+                  'Terlalu banyak percobaan login gagal. Coba lagi dalam 15 menit.',
+              };
             } else if (payload.status === 'inactive') {
               return {
                 error:

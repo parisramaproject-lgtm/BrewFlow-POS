@@ -7,11 +7,85 @@
 
 import { serve } from 'https://deno.land/std@0.224.0/http/server.ts';
 
-const corsHeaders = {
-  'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
-  'Access-Control-Allow-Methods': 'POST, OPTIONS',
-};
+function buildCorsHeaders(req: Request): Record<string, string> {
+  const requestOrigin = req.headers.get('origin') || '';
+  const configuredOrigins = (
+    Deno.env.get('ALLOWED_ORIGINS') ||
+    Deno.env.get('SITE_URL') ||
+    'https://brewflow-pos.vercel.app'
+  )
+    .split(',')
+    .map((o) => o.trim().replace(/\/+$/, ''))
+    .filter(Boolean);
+
+  const isLocalDev =
+    requestOrigin === 'http://localhost:3000' || requestOrigin === 'http://127.0.0.1:3000';
+  const isAllowed =
+    Boolean(requestOrigin) &&
+    (isLocalDev || configuredOrigins.includes(requestOrigin.replace(/\/+$/, '')));
+
+  return {
+    'Access-Control-Allow-Origin': isAllowed ? requestOrigin : configuredOrigins[0] || 'https://brewflow-pos.vercel.app',
+    Vary: 'Origin',
+    'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
+    'Access-Control-Allow-Methods': 'POST, OPTIONS',
+  };
+}
+
+async function verifyCallerRole(req: Request): Promise<{ ok: boolean; role: string | null }> {
+  const supabaseUrl = Deno.env.get('SUPABASE_URL') || '';
+  const supabaseAnonKey = Deno.env.get('SUPABASE_ANON_KEY') || '';
+  if (!supabaseUrl || !supabaseAnonKey) {
+    return { ok: false, role: null };
+  }
+
+  const authHeader = req.headers.get('authorization') || '';
+  const clientInfo = req.headers.get('x-client-info') || '';
+  const hasAppSession = /bf-sess=[a-f0-9]{64}/i.test(clientInfo);
+  const hasBearer = authHeader.toLowerCase().startsWith('bearer ') && authHeader.length > 20;
+
+  if (!hasAppSession && !hasBearer) {
+    return { ok: false, role: null };
+  }
+
+  try {
+    const rpcRes = await fetch(`${supabaseUrl}/rest/v1/rpc/get_current_employee_role`, {
+      method: 'POST',
+      headers: {
+        apikey: supabaseAnonKey,
+        Authorization: hasBearer ? authHeader : `Bearer ${supabaseAnonKey}`,
+        'Content-Type': 'application/json',
+        ...(clientInfo ? { 'x-client-info': clientInfo } : {}),
+      },
+      body: '{}',
+    });
+
+    if (rpcRes.ok) {
+      const roleVal = await rpcRes.json().catch(() => null);
+      if (typeof roleVal === 'string' && ['owner', 'manager', 'cashier'].includes(roleVal)) {
+        return { ok: true, role: roleVal };
+      }
+    }
+
+    // Fallback to is_active_employee() if schema is mid-upgrade
+    const empRes = await fetch(`${supabaseUrl}/rest/v1/rpc/is_active_employee`, {
+      method: 'POST',
+      headers: {
+        apikey: supabaseAnonKey,
+        Authorization: hasBearer ? authHeader : `Bearer ${supabaseAnonKey}`,
+        'Content-Type': 'application/json',
+        ...(clientInfo ? { 'x-client-info': clientInfo } : {}),
+      },
+      body: '{}',
+    });
+    if (empRes.ok && (await empRes.json().catch(() => false)) === true) {
+      return { ok: true, role: 'cashier' };
+    }
+    return { ok: false, role: null };
+  } catch {
+    return { ok: false, role: null };
+  }
+}
 
 type NotificationEventType =
   | 'opname_reminder'
@@ -226,6 +300,8 @@ async function dispatchToGateway(params: {
 }
 
 serve(async (req: Request) => {
+  const corsHeaders = buildCorsHeaders(req);
+
   if (req.method === 'OPTIONS') {
     return new Response('ok', { headers: corsHeaders });
   }
@@ -237,6 +313,17 @@ serve(async (req: Request) => {
     });
   }
 
+  const caller = await verifyCallerRole(req);
+  if (!caller.ok) {
+    return new Response(
+      JSON.stringify({ error: 'Akses ditolak: sesi karyawan aktif diperlukan.' }),
+      {
+        status: 401,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      }
+    );
+  }
+
   try {
     const payload = (await req.json()) as WhatsAppRequestPayload;
     if (!payload?.eventType || !Array.isArray(payload.targets) || payload.targets.length === 0) {
@@ -244,6 +331,26 @@ serve(async (req: Request) => {
         JSON.stringify({ error: 'eventType dan minimal 1 nomor tujuan (targets) wajib diisi.' }),
         {
           status: 400,
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+        }
+      );
+    }
+
+    // Restrict management-only WhatsApp alerts to Owner/Manager
+    const managementOnlyEvents: NotificationEventType[] = [
+      'test_message',
+      'opname_reminder',
+      'opname_report',
+    ];
+    if (
+      managementOnlyEvents.includes(payload.eventType) &&
+      caller.role !== 'owner' &&
+      caller.role !== 'manager'
+    ) {
+      return new Response(
+        JSON.stringify({ error: 'Akses ditolak: jenis notifikasi ini khusus Owner/Manager.' }),
+        {
+          status: 403,
           headers: { ...corsHeaders, 'Content-Type': 'application/json' },
         }
       );

@@ -137,6 +137,7 @@ export interface OrderItemRecord {
   menu_name: string;
   quantity: number;
   unit_price: number;
+  unit_hpp?: number;
   subtotal: number;
   notes?: string;
 }
@@ -156,8 +157,10 @@ export interface OrderRecord {
   voucher_discount_amount?: number;
   tax_amount: number;
   total_amount: number;
+  points_earned?: number;
   payment_method: PaymentMethod;
   status: OrderStatus;
+  sync_status?: 'synced' | 'pending_sync' | 'local';
   notes: string;
   items: OrderItemRecord[];
   created_at: string;

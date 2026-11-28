@@ -8,6 +8,7 @@ import type {
   OrderRecord,
 } from '../types';
 import { computeTierBySpend } from '../utils/membershipProgram';
+import { generateCollisionRetryOrderNumber } from '../utils/orderNumber';
 
 export interface StockDeductionSummary {
   inventoryItemId: string;
@@ -87,8 +88,10 @@ export function computeUpdatedMember(
 export interface SupabaseSyncStatus {
   mode: 'supabase' | 'local';
   synced: boolean;
+  queuedOffline?: boolean;
   error?: string;
   id?: string;
+  orderNumber?: string;
 }
 
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -96,13 +99,24 @@ function isUuid(value: string | null | undefined): boolean {
   return typeof value === 'string' && UUID_REGEX.test(value.trim());
 }
 
+function isRpcMissingError(error: { code?: string; message?: string } | null | undefined): boolean {
+  if (!error) return false;
+  const msg = (error.message || '').toLowerCase();
+  return (
+    error.code === 'PGRST202' ||
+    error.code === '42883' ||
+    msg.includes('could not find the function') ||
+    msg.includes('does not exist')
+  );
+}
+
 /**
  * Persists a completed or draft POS order to Supabase:
- * 1. Inserts into `orders`
- * 2. Inserts line items into `order_items`
- * 3. When status === 'completed':
- *    - Adds points & total_spent to `customers` (if member selected)
- *    - Deducts stock in `inventory_items` according to `menu_recipes`
+ * - Primary path: calls atomic Postgres RPC `checkout_order_atomic` (single transaction for
+ *   daily order number, `orders`, `order_items` with historical `unit_hpp`, relative stock
+ *   deduction, relative member points/spent, and atomic voucher quota increment).
+ * - Fallback path (only if RPC is not installed yet): multi-step insert with automatic
+ *   order-number collision retry (PostgreSQL 23505).
  */
 export async function persistOrderToSupabase(params: {
   order: OrderRecord;
@@ -112,16 +126,25 @@ export async function persistOrderToSupabase(params: {
   enableSupabaseSync?: boolean;
 }): Promise<SupabaseSyncStatus> {
   if (!params.enableSupabaseSync || !isSupabaseConfigured || !supabase) {
-    return { mode: 'local', synced: true };
+    return { mode: 'local', synced: true, orderNumber: params.order.order_number };
   }
 
   const { order, updatedCustomer, deductions } = params;
 
   try {
-    // 1. Insert header row into `orders`
-    const baseOrderPayload = {
+    // Primary path: atomic Postgres checkout RPC
+    const nonUuidMenuDeductions =
+      order.items.some((item) => !isUuid(item.menu_id))
+        ? deductions
+            .filter((d) => isUuid(d.inventoryItemId))
+            .map((d) => ({
+              inventory_item_id: d.inventoryItemId,
+              quantity_deducted: d.quantityDeducted,
+            }))
+        : [];
+
+    const atomicPayload = {
       order_number: order.order_number,
-      cashier_id: isUuid(order.cashier_id) ? order.cashier_id : null,
       cashier_name: order.cashier_name,
       customer_id: isUuid(order.customer_id) ? order.customer_id : null,
       customer_name: order.customer_name,
@@ -129,36 +152,122 @@ export async function persistOrderToSupabase(params: {
       table_number: order.table_number,
       subtotal: order.subtotal,
       discount_amount: order.discount_amount,
+      voucher_code: order.voucher_code ?? null,
+      voucher_discount_amount: order.voucher_discount_amount ?? 0,
       tax_amount: order.tax_amount,
       total_amount: order.total_amount,
+      points_earned: order.points_earned ?? 0,
       payment_method: order.payment_method,
       status: order.status,
       notes: order.notes,
+      next_tier: updatedCustomer?.tier ?? null,
+      items: order.items.map((item) => ({
+        menu_id: isUuid(item.menu_id) ? item.menu_id : null,
+        menu_name: item.menu_name,
+        quantity: item.quantity,
+        unit_price: item.unit_price,
+        unit_hpp: item.unit_hpp ?? 0,
+        subtotal: item.subtotal,
+        notes: item.notes ?? null,
+      })),
+      fallback_deductions: nonUuidMenuDeductions,
     };
 
-    let { data: insertedOrder, error: orderError } = await supabase
-      .from('orders')
-      .insert({
-        ...baseOrderPayload,
-        voucher_code: order.voucher_code ?? null,
-        voucher_discount_amount: order.voucher_discount_amount ?? 0,
-      })
-      .select('id')
-      .single();
+    const { data: rpcData, error: rpcError } = await supabase.rpc('checkout_order_atomic', {
+      p_payload: atomicPayload,
+    });
 
-    if (
-      orderError &&
-      (orderError.code === 'PGRST204' ||
-        orderError.code === '42703' ||
-        orderError.message.toLowerCase().includes('voucher_'))
-    ) {
-      const retry = await supabase
+    if (!rpcError && rpcData && typeof rpcData === 'object') {
+      const record = rpcData as { ok?: boolean; id?: string; order_number?: string; error?: string };
+      if (record.ok === true && record.id) {
+        return {
+          mode: 'supabase',
+          synced: true,
+          id: String(record.id),
+          orderNumber: record.order_number ? String(record.order_number) : order.order_number,
+        };
+      }
+      if (record.ok === false) {
+        return {
+          mode: 'supabase',
+          synced: false,
+          error: record.error || 'Checkout atomik ditolak oleh server Supabase.',
+        };
+      }
+    }
+
+    // Only fall back to multi-step client insert if the RPC function is not deployed yet
+    if (rpcError && !isRpcMissingError(rpcError)) {
+      return {
+        mode: 'supabase',
+        synced: false,
+        error: rpcError.message || 'Gagal menjalankan checkout atomik di Supabase.',
+      };
+    }
+
+    // Fallback path: direct insert with collision retry (PostgreSQL 23505 unique_violation)
+    let currentOrderNumber = order.order_number;
+    let insertedOrder: { id: string } | null = null;
+    let orderError: { code?: string; message: string } | null = null;
+
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      const baseOrderPayload = {
+        order_number: currentOrderNumber,
+        cashier_id: isUuid(order.cashier_id) ? order.cashier_id : null,
+        cashier_name: order.cashier_name,
+        customer_id: isUuid(order.customer_id) ? order.customer_id : null,
+        customer_name: order.customer_name,
+        order_type: order.order_type,
+        table_number: order.table_number,
+        subtotal: order.subtotal,
+        discount_amount: order.discount_amount,
+        tax_amount: order.tax_amount,
+        total_amount: order.total_amount,
+        payment_method: order.payment_method,
+        status: order.status,
+        notes: order.notes,
+      };
+
+      const res = await supabase
         .from('orders')
-        .insert(baseOrderPayload)
+        .insert({
+          ...baseOrderPayload,
+          voucher_code: order.voucher_code ?? null,
+          voucher_discount_amount: order.voucher_discount_amount ?? 0,
+          points_earned: order.points_earned ?? 0,
+        })
         .select('id')
         .single();
-      insertedOrder = retry.data;
-      orderError = retry.error;
+
+      insertedOrder = res.data as { id: string } | null;
+      orderError = res.error;
+
+      if (
+        orderError &&
+        (orderError.code === 'PGRST204' ||
+          orderError.code === '42703' ||
+          orderError.message.toLowerCase().includes('voucher_') ||
+          orderError.message.toLowerCase().includes('points_earned'))
+      ) {
+        const retry = await supabase
+          .from('orders')
+          .insert(baseOrderPayload)
+          .select('id')
+          .single();
+        insertedOrder = retry.data as { id: string } | null;
+        orderError = retry.error;
+      }
+
+      if (!orderError && insertedOrder) {
+        break;
+      }
+
+      if (orderError?.code === '23505' || orderError?.message.toLowerCase().includes('duplicate key')) {
+        currentOrderNumber = generateCollisionRetryOrderNumber(currentOrderNumber, attempt);
+        continue;
+      }
+
+      break;
     }
 
     if (orderError || !insertedOrder) {
@@ -171,11 +280,12 @@ export async function persistOrderToSupabase(params: {
 
     // 2. Insert line items into `order_items`
     const itemRows = order.items.map((item) => ({
-      order_id: insertedOrder.id,
+      order_id: insertedOrder!.id,
       menu_id: isUuid(item.menu_id) ? item.menu_id : null,
       menu_name: item.menu_name,
       quantity: item.quantity,
       unit_price: item.unit_price,
+      unit_hpp: item.unit_hpp ?? 0,
       subtotal: item.subtotal,
       notes: item.notes ?? null,
     }));
@@ -183,9 +293,19 @@ export async function persistOrderToSupabase(params: {
     let { error: itemsError } = await supabase.from('order_items').insert(itemRows);
     if (
       itemsError &&
+      (itemsError.code === 'PGRST204' ||
+        itemsError.code === '42703' ||
+        itemsError.message.toLowerCase().includes('unit_hpp'))
+    ) {
+      const withoutHpp = itemRows.map(({ unit_hpp: _omit, ...rest }) => rest);
+      const retryRes = await supabase.from('order_items').insert(withoutHpp);
+      itemsError = retryRes.error;
+    }
+    if (
+      itemsError &&
       (itemsError.code === '428C9' || itemsError.message.toLowerCase().includes('non-default'))
     ) {
-      const retryRows = itemRows.map(({ subtotal: _omit, ...rest }) => rest);
+      const retryRows = itemRows.map(({ subtotal: _omit, unit_hpp: _omitHpp, ...rest }) => rest);
       const retryRes = await supabase.from('order_items').insert(retryRows);
       itemsError = retryRes.error;
     }
@@ -199,7 +319,6 @@ export async function persistOrderToSupabase(params: {
 
     // 3. Post-payment updates when completed
     if (order.status === 'completed') {
-      // 3a. Update loyalty points & tier on `customers`
       if (updatedCustomer && isUuid(updatedCustomer.id)) {
         const { error: custErr } = await supabase
           .from('customers')
@@ -215,12 +334,12 @@ export async function persistOrderToSupabase(params: {
             mode: 'supabase',
             synced: false,
             id: String(insertedOrder.id),
+            orderNumber: currentOrderNumber,
             error: `Transaksi tersimpan, tetapi gagal memperbarui poin member: ${custErr.message}`,
           };
         }
       }
 
-      // 3b. Deduct `inventory_items` stock based on `menu_recipes`
       const stockUpdateResults = await Promise.all(
         deductions
           .filter((entry) => isUuid(entry.inventoryItemId))
@@ -241,12 +360,18 @@ export async function persistOrderToSupabase(params: {
           mode: 'supabase',
           synced: false,
           id: String(insertedOrder.id),
+          orderNumber: currentOrderNumber,
           error: `Transaksi tersimpan, tetapi pengurangan stok gagal: ${failedStock.error.message}`,
         };
       }
     }
 
-    return { mode: 'supabase', synced: true, id: String(insertedOrder.id) };
+    return {
+      mode: 'supabase',
+      synced: true,
+      id: String(insertedOrder.id),
+      orderNumber: currentOrderNumber,
+    };
   } catch (err) {
     return {
       mode: 'supabase',

@@ -57,7 +57,22 @@ import type {
   WhatsAppLogEntry,
 } from '../types';
 import { DEFAULT_OWNER_ALERT_EMAIL } from '../services/loginAlertService';
-import { hashPasswordLocal, normalizeUsername, validatePassword, validateUsername } from '../utils/usernameAuth';
+import {
+  hashPasswordLocal,
+  normalizeUsername,
+  sanitizeEmployeeForLocalCache,
+  validatePassword,
+  validateUsername,
+} from '../utils/usernameAuth';
+import { generateNextOrderNumber } from '../utils/orderNumber';
+import { computeOrderReversal } from '../utils/orderReversal';
+import {
+  enqueuePendingOrder,
+  getPendingOrders,
+  isLikelyNetworkFailure,
+  markPendingOrderFailed,
+  removePendingOrder,
+} from '../services/offlineQueueService';
 import { getDefaultExpenseCategoryForInventory } from '../utils/expenseCategories';
 import {
   DEFAULT_MEMBERSHIP_PROGRAM,
@@ -107,14 +122,21 @@ import {
   cancelOrderInSupabase,
   deleteOrderFromSupabase,
   deleteStoreVideoFromSupabase,
+  deleteVendorFromSupabase,
   deleteVoucherFromSupabase,
   hydrateAllTablesFromSupabase,
   incrementVoucherUsageInSupabase,
+  insertOperationalNotificationToSupabase,
+  insertRestockRequestToSupabase,
+  insertWhatsAppLogToSupabase,
   isUuid,
+  markOperationalNotificationReadInSupabase,
   persistMemberRedemptionToSupabase,
   persistMembershipProgramToSupabase,
   updateCustomerPointsInSupabase,
+  updateRestockRequestStatusInSupabase,
   upsertStoreVideoToSupabase,
+  upsertVendorToSupabase,
   upsertVoucherToSupabase,
 } from '../services/supabaseHydrationService';
 import { evaluateVoucherOnCart, normalizeVoucherCode } from '../utils/vouchers';
@@ -140,6 +162,7 @@ interface CreateOrderInput {
   replacesDraftId?: string | null;
   appliedVoucher?: VoucherRecord | null;
   enableSupabaseSync?: boolean;
+  forceOfflineQueue?: boolean;
 }
 
 export interface CreateOrderResult {
@@ -216,6 +239,9 @@ interface StoreContextValue {
   notifications: AppNotification[];
   hasDueOpname: boolean;
   lowStockItems: InventoryItem[];
+  pendingOfflineOrdersCount: number;
+  isSyncingOfflineQueue: boolean;
+  syncOfflineQueueNow: () => Promise<{ syncedCount: number; remainingCount: number }>;
   addVendor: (input: Omit<VendorRecord, 'id' | 'created_at'>) => VendorRecord;
   updateVendor: (vendorId: string, patch: Partial<Omit<VendorRecord, 'id' | 'created_at'>>) => void;
   deleteVendor: (vendorId: string) => void;
@@ -377,6 +403,9 @@ interface StoreContextValue {
   ) => Promise<{ ok: boolean; error?: string }>;
   recordUsernameLoginLog: (entry: UsernameLoginAuditLog) => void;
   deleteEmployee: (employeeId: string) => Promise<{ ok: boolean; error?: string }>;
+  revokeAllEmployeeSessions: (
+    employeeId: string
+  ) => Promise<{ ok: boolean; revokedCount?: number; error?: string }>;
   updateEmployeeRole: (
     employeeId: string,
     role: UserRole
@@ -607,6 +636,8 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   const [employeesSyncError, setEmployeesSyncError] = useState<string | null>(null);
   const [settings, setSettings] = useState<StoreSettings>(loadInitialSettings);
   const [watcherNow, setWatcherNow] = useState<Date>(() => new Date());
+  const [pendingOfflineOrdersCount, setPendingOfflineOrdersCount] = useState<number>(0);
+  const [isSyncingOfflineQueue, setIsSyncingOfflineQueue] = useState<boolean>(false);
 
   const persistVouchers = useCallback((next: VoucherRecord[]) => {
     try {
@@ -656,6 +687,15 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         return next;
       });
       broadcastOperationalEvent(created);
+      void insertOperationalNotificationToSupabase(created).then((sync) => {
+        if (sync.synced && sync.id) {
+          setCustomNotifications((prev) => {
+            const next = prev.map((n) => (n.id === created.id ? { ...n, id: sync.id! } : n));
+            persistOpsNotifications(next);
+            return next;
+          });
+        }
+      });
       return created;
     },
     [persistOpsNotifications]
@@ -724,6 +764,15 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         persistVendors(next);
         return next;
       });
+      void upsertVendorToSupabase(created).then((sync) => {
+        if (sync.synced && sync.id) {
+          setVendors((prev) => {
+            const next = prev.map((v) => (v.id === created.id ? { ...v, id: sync.id! } : v));
+            persistVendors(next);
+            return next;
+          });
+        }
+      });
       return created;
     },
     [persistVendors]
@@ -731,28 +780,32 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
 
   const updateVendor = useCallback(
     (vendorId: string, patch: Partial<Omit<VendorRecord, 'id' | 'created_at'>>) => {
+      let updatedTarget: VendorRecord | null = null;
       setVendors((prev) => {
-        const next = prev.map((v) =>
-          v.id === vendorId
-            ? {
-                ...v,
-                ...patch,
-                name: patch.name !== undefined ? patch.name.trim() : v.name,
-                contact_person:
-                  patch.contact_person !== undefined
-                    ? patch.contact_person.trim()
-                    : v.contact_person,
-                phone: patch.phone !== undefined ? patch.phone.trim() : v.phone,
-                supplied_items:
-                  patch.supplied_items !== undefined
-                    ? patch.supplied_items.map((s) => s.trim()).filter(Boolean)
-                    : v.supplied_items,
-              }
-            : v
-        );
+        const next = prev.map((v) => {
+          if (v.id !== vendorId) return v;
+          updatedTarget = {
+            ...v,
+            ...patch,
+            name: patch.name !== undefined ? patch.name.trim() : v.name,
+            contact_person:
+              patch.contact_person !== undefined
+                ? patch.contact_person.trim()
+                : v.contact_person,
+            phone: patch.phone !== undefined ? patch.phone.trim() : v.phone,
+            supplied_items:
+              patch.supplied_items !== undefined
+                ? patch.supplied_items.map((s) => s.trim()).filter(Boolean)
+                : v.supplied_items,
+          };
+          return updatedTarget;
+        });
         persistVendors(next);
         return next;
       });
+      if (updatedTarget) {
+        void upsertVendorToSupabase(updatedTarget);
+      }
     },
     [persistVendors]
   );
@@ -764,6 +817,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         persistVendors(next);
         return next;
       });
+      void deleteVendorFromSupabase(vendorId);
     },
     [persistVendors]
   );
@@ -802,6 +856,15 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         persistRestockRequests(next);
         return next;
       });
+      void insertRestockRequestToSupabase(created).then((sync) => {
+        if (sync.synced && sync.id) {
+          setRestockRequests((prev) => {
+            const next = prev.map((r) => (r.id === created.id ? { ...r, id: sync.id! } : r));
+            persistRestockRequests(next);
+            return next;
+          });
+        }
+      });
 
       const urgencyTag = input.urgency === 'urgent' ? 'Mendesak' : 'Normal';
       pushOperationalNotification({
@@ -832,6 +895,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         persistRestockRequests(next);
         return next;
       });
+      void updateRestockRequestStatusInSupabase(requestId, status, handledByName);
       if (target) {
         const label =
           status === 'ordered'
@@ -891,6 +955,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         persistOpsNotifications(next);
         return next;
       });
+      void markOperationalNotificationReadInSupabase(notificationId);
     },
     [persistOpsNotifications]
   );
@@ -973,11 +1038,97 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         customMessage: input.customMessage,
         enableSupabaseSync: input.enableSupabaseSync ?? false,
       });
-      setWhatsappLogs((prev) => [log, ...prev].slice(0, 30));
+      setWhatsappLogs((prev) => [log, ...prev].slice(0, 50));
+      void insertWhatsAppLogToSupabase(log);
       return log;
     },
     [settings.shopName]
   );
+
+  const syncOfflineQueueNow = useCallback(async (): Promise<{
+    syncedCount: number;
+    remainingCount: number;
+  }> => {
+    const queue = await getPendingOrders();
+    setPendingOfflineOrdersCount(queue.length);
+    if (queue.length === 0) {
+      return { syncedCount: 0, remainingCount: 0 };
+    }
+    if (typeof navigator !== 'undefined' && !navigator.onLine) {
+      return { syncedCount: 0, remainingCount: queue.length };
+    }
+
+    setIsSyncingOfflineQueue(true);
+    let syncedCount = 0;
+
+    try {
+      for (const entry of queue) {
+        const res = await persistOrderToSupabase({
+          order: entry.order,
+          cartItems: entry.cartItems ?? [],
+          updatedCustomer: entry.updatedCustomer,
+          deductions: entry.deductions,
+          enableSupabaseSync: true,
+        });
+
+        if (res.synced) {
+          await removePendingOrder(entry.localId);
+          syncedCount += 1;
+          setOrders((prev) =>
+            prev.map((o) =>
+              o.id === entry.order.id
+                ? {
+                    ...o,
+                    id: res.id || o.id,
+                    order_number: res.orderNumber || o.order_number,
+                    sync_status: 'synced',
+                  }
+                : o
+            )
+          );
+        } else {
+          await markPendingOrderFailed(entry.localId, res.error || 'Sinkronisasi tertunda.');
+        }
+      }
+    } finally {
+      const remaining = await getPendingOrders();
+      setPendingOfflineOrdersCount(remaining.length);
+      setIsSyncingOfflineQueue(false);
+    }
+
+    const latest = await getPendingOrders();
+    return { syncedCount, remainingCount: latest.length };
+  }, []);
+
+  // Load any pending offline transactions from IndexedDB on startup & auto-flush when online
+  useEffect(() => {
+    let active = true;
+    void getPendingOrders().then((pending) => {
+      if (!active) return;
+      setPendingOfflineOrdersCount(pending.length);
+      if (pending.length > 0) {
+        setOrders((prev) => {
+          const existingIds = new Set(prev.map((o) => o.id));
+          const missing = pending
+            .map((p) => ({ ...p.order, sync_status: 'pending_sync' as const }))
+            .filter((o) => !existingIds.has(o.id));
+          return missing.length > 0 ? [...missing, ...prev] : prev;
+        });
+        if (typeof navigator === 'undefined' || navigator.onLine) {
+          void syncOfflineQueueNow();
+        }
+      }
+    });
+
+    const handleOnline = () => {
+      void syncOfflineQueueNow();
+    };
+    window.addEventListener('online', handleOnline);
+    return () => {
+      active = false;
+      window.removeEventListener('online', handleOnline);
+    };
+  }, [syncOfflineQueueNow]);
 
   const refreshOpnameWatcher = useCallback(async (enableSupabaseSync = false) => {
     setWatcherNow(new Date());
@@ -991,8 +1142,9 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
 
   const createOrder = useCallback(
     async (input: CreateOrderInput): Promise<CreateOrderResult> => {
+      const now = new Date();
       const voucherEval = input.appliedVoucher
-        ? evaluateVoucherOnCart(input.appliedVoucher, input.items, new Date(), menus)
+        ? evaluateVoucherOnCart(input.appliedVoucher, input.items, now, menus)
         : null;
       const appliedVoucherValid = Boolean(input.appliedVoucher && voucherEval?.valid);
       const voucherDiscount = appliedVoucherValid ? voucherEval!.discountAmount : 0;
@@ -1006,16 +1158,21 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         voucherCode: appliedVoucherValid ? input.appliedVoucher!.code : null,
         voucherStackableWithMember: input.appliedVoucher?.stackable_with_member_discount ?? true,
       });
-      const sequence = String(orders.length + 2).padStart(3, '0');
+
+      const orderNumber = generateNextOrderNumber(
+        orders.map((o) => o.order_number),
+        now
+      );
       const voucherNoteSuffix =
         appliedVoucherValid && input.appliedVoucher
           ? `[Voucher ${input.appliedVoucher.code}: -Rp ${summary.voucherDiscountAmount.toLocaleString('id-ID')}]`
           : '';
       const combinedNotes = [input.notes.trim(), voucherNoteSuffix].filter(Boolean).join(' · ');
 
+      const invPriceMap = new Map(inventory.map((inv) => [inv.id, inv.last_purchase_price]));
       const newOrder: OrderRecord = {
         id: `ord-${Date.now()}`,
-        order_number: `BF-261125-${sequence}`,
+        order_number: orderNumber,
         cashier_id: input.cashier.id,
         cashier_name: input.cashier.full_name,
         customer_id: input.customer?.id ?? null,
@@ -1033,31 +1190,152 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         voucher_discount_amount: summary.voucherDiscountAmount,
         tax_amount: summary.taxAmount,
         total_amount: summary.totalAmount,
+        points_earned: input.status === 'completed' ? summary.pointsEarned : 0,
         payment_method: input.paymentMethod,
         status: input.status,
+        sync_status: input.enableSupabaseSync ? 'pending_sync' : 'local',
         notes: combinedNotes,
-        items: input.items.map((cartItem, idx) => ({
-          id: `oi-${Date.now()}-${idx}`,
-          menu_id: cartItem.menu.id,
-          menu_name: cartItem.menu.name,
-          quantity: cartItem.quantity,
-          unit_price: cartItem.menu.selling_price,
-          subtotal: cartItem.menu.selling_price * cartItem.quantity,
-          notes: cartItem.note,
-        })),
-        created_at: new Date().toISOString(),
+        items: input.items.map((cartItem, idx) => {
+          const unitHpp = Math.round(
+            cartItem.menu.recipes.reduce(
+              (sum, recipe) =>
+                sum + recipe.quantity_needed * (invPriceMap.get(recipe.inventory_item_id) ?? 0),
+              0
+            )
+          );
+          return {
+            id: `oi-${Date.now()}-${idx}`,
+            menu_id: cartItem.menu.id,
+            menu_name: cartItem.menu.name,
+            quantity: cartItem.quantity,
+            unit_price: cartItem.menu.selling_price,
+            unit_hpp: unitHpp,
+            subtotal: cartItem.menu.selling_price * cartItem.quantity,
+            notes: cartItem.note,
+          };
+        }),
+        created_at: now.toISOString(),
+      };
+
+      // Pre-compute stock & member deltas before committing state so failed online syncs don't corrupt local state
+      const stockCalc =
+        input.status === 'completed'
+          ? computeRecipeStockDeductions(input.items, inventory)
+          : { summary: [] as StockDeductionSummary[], updatedInventory: inventory };
+      const deductions = stockCalc.summary;
+      const touchedIds = new Set(deductions.map((d) => d.inventoryItemId));
+      const newlyLowStock =
+        input.status === 'completed' && deductions.length > 0
+          ? stockCalc.updatedInventory.filter(
+              (inv) =>
+                touchedIds.has(inv.id) &&
+                inv.category_type !== 'asset' &&
+                inv.current_stock <= inv.min_stock_threshold
+            )
+          : [];
+
+      const updatedCustomer: Customer | null =
+        input.status === 'completed' && input.customer
+          ? computeUpdatedMember(
+              input.customer,
+              summary.totalAmount,
+              summary.pointsEarned,
+              membershipProgram.tiers
+            )
+          : null;
+
+      const enableSync = input.enableSupabaseSync ?? false;
+      const isOfflineNow = typeof navigator !== 'undefined' && !navigator.onLine;
+      let syncStatus: SupabaseSyncStatus;
+
+      if (enableSync && (input.forceOfflineQueue || isOfflineNow)) {
+        await enqueuePendingOrder({
+          localId: newOrder.id,
+          order: { ...newOrder, sync_status: 'pending_sync' },
+          cartItems: input.items,
+          updatedCustomer,
+          deductions,
+          voucherId: input.appliedVoucher?.id ?? null,
+          voucherCode: newOrder.voucher_code ?? null,
+          pointsEarned: summary.pointsEarned,
+          queuedAt: now.toISOString(),
+          retryCount: 0,
+        });
+        const pending = await getPendingOrders();
+        setPendingOfflineOrdersCount(pending.length);
+        syncStatus = {
+          mode: 'supabase',
+          synced: false,
+          queuedOffline: true,
+          orderNumber: newOrder.order_number,
+          error: isOfflineNow
+            ? 'Perangkat sedang offline. Transaksi disimpan di antrean lokal dan akan tersinkron otomatis saat online.'
+            : 'Disimpan ke antrean offline lokal.',
+        };
+      } else {
+        syncStatus = await persistOrderToSupabase({
+          order: newOrder,
+          cartItems: input.items,
+          updatedCustomer,
+          deductions,
+          enableSupabaseSync: enableSync,
+        });
+
+        // If online Supabase sync failed due to network interruption, queue safely to IndexedDB
+        if (enableSync && !syncStatus.synced && isLikelyNetworkFailure(syncStatus.error)) {
+          await enqueuePendingOrder({
+            localId: newOrder.id,
+            order: { ...newOrder, sync_status: 'pending_sync' },
+            cartItems: input.items,
+            updatedCustomer,
+            deductions,
+            voucherId: input.appliedVoucher?.id ?? null,
+            voucherCode: newOrder.voucher_code ?? null,
+            pointsEarned: summary.pointsEarned,
+            queuedAt: now.toISOString(),
+            retryCount: 1,
+            lastError: syncStatus.error,
+          });
+          const pending = await getPendingOrders();
+          setPendingOfflineOrdersCount(pending.length);
+          syncStatus = {
+            ...syncStatus,
+            queuedOffline: true,
+          };
+        }
+      }
+
+      // P0-1: Do NOT mutate local store or falsely mark completed if online Supabase rejected the transaction
+      if (enableSync && !syncStatus.synced && !syncStatus.queuedOffline) {
+        return {
+          order: newOrder,
+          pointsEarned: summary.pointsEarned,
+          deductions,
+          syncStatus,
+          whatsappReceiptLog: null,
+        };
+      }
+
+      const finalOrder: OrderRecord = {
+        ...newOrder,
+        id: syncStatus.synced && syncStatus.id ? syncStatus.id : newOrder.id,
+        order_number:
+          syncStatus.synced && syncStatus.orderNumber
+            ? syncStatus.orderNumber
+            : newOrder.order_number,
+        sync_status: !enableSync
+          ? 'local'
+          : syncStatus.synced
+            ? 'synced'
+            : 'pending_sync',
       };
 
       setOrders((prev) => {
         const filtered = input.replacesDraftId
           ? prev.filter((o) => o.id !== input.replacesDraftId)
           : prev;
-        return [newOrder, ...filtered];
+        return [finalOrder, ...filtered];
       });
-
-      let deductions: StockDeductionSummary[] = [];
-      let updatedCustomer: Customer | null = null;
-      let newlyLowStock: InventoryItem[] = [];
 
       if (input.status === 'completed') {
         if (appliedVoucherValid && input.appliedVoucher) {
@@ -1070,7 +1348,8 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
             persistVouchers(next);
             return next;
           });
-          if (input.enableSupabaseSync ?? false) {
+          // Note: atomic RPC already increments voucher quota in Supabase; fallback only if not synced via RPC
+          if (enableSync && !syncStatus.synced && !syncStatus.queuedOffline) {
             void incrementVoucherUsageInSupabase(
               targetVoucher.id,
               targetVoucher.code,
@@ -1079,32 +1358,16 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
           }
         }
 
-        const stockCalc = computeRecipeStockDeductions(input.items, inventory);
-        deductions = stockCalc.summary;
         if (deductions.length > 0) {
           setInventory(stockCalc.updatedInventory);
-          const touchedIds = new Set(deductions.map((d) => d.inventoryItemId));
-          newlyLowStock = stockCalc.updatedInventory.filter(
-            (inv) =>
-              touchedIds.has(inv.id) &&
-              inv.category_type !== 'asset' &&
-              inv.current_stock <= inv.min_stock_threshold
-          );
         }
 
-        if (input.customer) {
-          updatedCustomer = computeUpdatedMember(
-            input.customer,
-            summary.totalAmount,
-            summary.pointsEarned,
-            membershipProgram.tiers
-          );
+        if (input.customer && updatedCustomer) {
           const customerId = input.customer.id;
           const nextCustomer = updatedCustomer;
           setCustomers((prev) => prev.map((c) => (c.id === customerId ? nextCustomer : c)));
         }
 
-        // Dispatch live operational notification for Owner & Manager on incoming completed order
         const itemsPreview = input.items
           .slice(0, 2)
           .map((it) => `${it.quantity}x ${it.menu.name}`)
@@ -1113,7 +1376,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
           input.items.length > 2 ? ` +${input.items.length - 2} menu lainnya` : '';
         pushOperationalNotification({
           type: 'new_order',
-          title: `Orderan Masuk ${newOrder.order_number}`,
+          title: `Orderan Masuk ${finalOrder.order_number}`,
           message: `Rp ${summary.totalAmount.toLocaleString('id-ID')} (${input.paymentMethod.toUpperCase()}) · ${itemsPreview}${extraItemSuffix} · Kasir: ${input.cashier.full_name}`,
           targetPage: 'orders',
           targetRoles: ['owner', 'manager'],
@@ -1139,45 +1402,26 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         }
       }
 
-      const syncStatus = await persistOrderToSupabase({
-        order: newOrder,
-        cartItems: input.items,
-        updatedCustomer,
-        deductions,
-        enableSupabaseSync: input.enableSupabaseSync ?? false,
-      });
-
-      const finalOrder: OrderRecord =
-        syncStatus.synced && syncStatus.id ? { ...newOrder, id: syncStatus.id } : newOrder;
-
-      if (syncStatus.synced && syncStatus.id) {
-        setOrders((prev) =>
-          prev.map((o) => (o.id === newOrder.id ? { ...o, id: syncStatus.id! } : o))
-        );
-      }
-
-      if (input.replacesDraftId && (input.enableSupabaseSync ?? false)) {
+      if (input.replacesDraftId && enableSync) {
         void deleteOrderFromSupabase(input.replacesDraftId);
       }
 
       let whatsappReceiptLog: WhatsAppLogEntry | null = null;
       if (input.status === 'completed') {
-        // Auto-send digital WhatsApp receipt & points to member customer
         if (settings.whatsappAutoReceipt && input.customer?.phone_number) {
           whatsappReceiptLog = await sendWhatsAppMessage({
             eventType: 'pos_receipt',
             targets: [input.customer.phone_number],
             data: buildPosReceiptPayload({
-              order: newOrder,
+              order: finalOrder,
               pointsEarned: summary.pointsEarned,
               totalPoints: updatedCustomer?.points,
               memberTier: updatedCustomer?.tier,
             }),
-            enableSupabaseSync: input.enableSupabaseSync ?? false,
+            enableSupabaseSync: enableSync,
           });
         }
 
-        // Auto-send low-stock alert if recipe deduction pushed items below threshold
         if (settings.whatsappAutoLowStock && newlyLowStock.length > 0) {
           const targets = [settings.whatsappOwnerPhone, settings.whatsappManagerPhone].filter(
             Boolean
@@ -1187,7 +1431,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
               eventType: 'low_stock_alert',
               targets,
               data: buildLowStockPayload(newlyLowStock),
-              enableSupabaseSync: input.enableSupabaseSync ?? false,
+              enableSupabaseSync: enableSync,
             });
           }
         }
@@ -1202,7 +1446,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       };
     },
     [
-      orders.length,
+      orders,
       menus,
       inventory,
       persistVouchers,
@@ -1215,6 +1459,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       settings.whatsappOwnerPhone,
       settings.whatsappManagerPhone,
       sendWhatsAppMessage,
+      pushOperationalNotification,
     ]
   );
 
@@ -1243,6 +1488,39 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         : `[DIBATALKAN oleh ${input.cancelledByName}]`;
       const nextNotes = target.notes ? `${target.notes} · ${cancelTag}` : cancelTag;
 
+      // P0-5: Atomic reversal in Supabase (`cancel_order_atomic`) + mirrored local state reversal
+      const syncRes = await cancelOrderInSupabase(target.id, target.order_number, nextNotes);
+      if (syncRes.mode === 'supabase' && !syncRes.synced && syncRes.error) {
+        return { ok: false, error: syncRes.error };
+      }
+
+      const reversal = computeOrderReversal({
+        order: target,
+        menus,
+        inventory,
+        customers,
+        tierRules: membershipProgram.tiers,
+        pointEarningStepRupiah: membershipProgram.limits.point_earning_step_rupiah,
+      });
+
+      if (reversal.restoredStock.length > 0) {
+        setInventory(reversal.updatedInventory);
+      }
+      if (reversal.updatedCustomer) {
+        const reversed = reversal.updatedCustomer;
+        setCustomers((prev) => prev.map((c) => (c.id === reversed.id ? reversed : c)));
+      }
+      if (reversal.voucherCodeToRestore) {
+        const normalizedTarget = normalizeVoucherCode(reversal.voucherCodeToRestore);
+        const nextVouchers = vouchers.map((v) =>
+          normalizeVoucherCode(v.code) === normalizedTarget
+            ? { ...v, used_count: Math.max(0, v.used_count - 1) }
+            : v
+        );
+        setVouchers(nextVouchers);
+        persistVouchers(nextVouchers);
+      }
+
       setOrders((prev) =>
         prev.map((o) =>
           o.id === input.orderId ? { ...o, status: 'cancelled', notes: nextNotes } : o
@@ -1252,20 +1530,26 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       pushOperationalNotification({
         type: 'info',
         title: `Pesanan ${target.order_number} Dibatalkan`,
-        message: `${input.cancelledByName} membatalkan pesanan senilai Rp ${target.total_amount.toLocaleString('id-ID')}${cleanReason ? ` · Alasan: ${cleanReason}` : ''}.`,
+        message: `${input.cancelledByName} membatalkan pesanan senilai Rp ${target.total_amount.toLocaleString('id-ID')}${reversal.restoredStock.length > 0 ? ` · Stok ${reversal.restoredStock.length} bahan dipulihkan` : ''}${cleanReason ? ` · Alasan: ${cleanReason}` : ''}.`,
         targetPage: 'orders',
         targetRoles: ['owner', 'manager'],
         senderName: input.cancelledByName,
         senderRole: input.cancelledByRole,
       });
 
-      const syncRes = await cancelOrderInSupabase(target.id, target.order_number, nextNotes);
-      if (!syncRes.synced && syncRes.error) {
-        return { ok: true, error: syncRes.error };
-      }
       return { ok: true };
     },
-    [orders, pushOperationalNotification]
+    [
+      orders,
+      menus,
+      inventory,
+      customers,
+      vouchers,
+      membershipProgram.tiers,
+      membershipProgram.limits.point_earning_step_rupiah,
+      persistVouchers,
+      pushOperationalNotification,
+    ]
   );
 
   const persistProgram = useCallback((next: MembershipProgramConfig) => {
@@ -2165,9 +2449,11 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     []
   );
 
+  // P1-6: Never persist sensitive fields (password_hash, monthly_salary, emergency_contact) to localStorage
   const persistEmployees = useCallback((next: UserProfile[]) => {
     try {
-      window.localStorage.setItem(EMPLOYEES_STORAGE_KEY, JSON.stringify(next));
+      const sanitized = next.map((emp) => sanitizeEmployeeForLocalCache(emp));
+      window.localStorage.setItem(EMPLOYEES_STORAGE_KEY, JSON.stringify(sanitized));
     } catch {
       // Ignore storage quota errors
     }
@@ -2230,6 +2516,24 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         if (hydrated.vouchers) {
           setVouchers(hydrated.vouchers);
           persistVouchers(hydrated.vouchers);
+        }
+        if (hydrated.vendors) {
+          setVendors(hydrated.vendors);
+          persistVendors(hydrated.vendors);
+        }
+        if (hydrated.restockRequests) {
+          setRestockRequests(hydrated.restockRequests);
+          persistRestockRequests(hydrated.restockRequests);
+        }
+        if (hydrated.customNotifications) {
+          setCustomNotifications(hydrated.customNotifications);
+          persistOpsNotifications(hydrated.customNotifications);
+        }
+        if (hydrated.whatsappLogs) {
+          setWhatsappLogs(hydrated.whatsappLogs);
+        }
+        if (hydrated.loginAuditLogs) {
+          setUsernameLoginLogs(hydrated.loginAuditLogs);
         }
       }
 
@@ -2302,7 +2606,14 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     } catch {
       // Keep local state intact if remote tables are not yet created
     }
-  }, [persistEmployees, persistVideos, persistVouchers]);
+  }, [
+    persistEmployees,
+    persistVideos,
+    persistVouchers,
+    persistVendors,
+    persistRestockRequests,
+    persistOpsNotifications,
+  ]);
 
   useEffect(() => {
     if (!supabase) return;
@@ -2644,7 +2955,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       } else if (normalizedUser && !target.has_password && !target.password_hash) {
         return {
           ok: false,
-          error: 'Atur kata sandi (minimal 6 karakter) saat pertama kali mengaktifkan username login.',
+          error: 'Atur kata sandi (minimal 8 karakter) saat pertama kali mengaktifkan username login.',
         };
       }
 
@@ -2789,6 +3100,41 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       return { ok: true };
     },
     [employees, persistEmployees, deleteEmployeeFromSupabase]
+  );
+
+  const revokeAllEmployeeSessions = useCallback(
+    async (
+      employeeId: string
+    ): Promise<{ ok: boolean; revokedCount?: number; error?: string }> => {
+      if (!supabase || !isUuid(employeeId)) {
+        return {
+          ok: false,
+          error: 'Sesi hanya dapat dicabut untuk akun karyawan yang tersinkron di Supabase.',
+        };
+      }
+      try {
+        const { data, error } = await supabase.rpc('revoke_all_employee_sessions', {
+          p_employee_id: employeeId,
+        });
+        if (error) {
+          return { ok: false, error: error.message };
+        }
+        const payload = data as { ok?: boolean; revoked_count?: number; error?: string } | null;
+        if (payload?.ok) {
+          return { ok: true, revokedCount: payload.revoked_count ?? 0 };
+        }
+        return {
+          ok: false,
+          error: payload?.error || 'Gagal mencabut sesi aktif karyawan di Supabase.',
+        };
+      } catch (err) {
+        return {
+          ok: false,
+          error: err instanceof Error ? err.message : 'Gagal mencabut sesi karyawan.',
+        };
+      }
+    },
+    []
   );
 
   const updateEmployeeRole = useCallback(
@@ -3010,6 +3356,9 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       notifications,
       hasDueOpname,
       lowStockItems,
+      pendingOfflineOrdersCount,
+      isSyncingOfflineQueue,
+      syncOfflineQueueNow,
       addVendor,
       updateVendor,
       deleteVendor,
@@ -3064,6 +3413,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       setEmployeeCredentials,
       recordUsernameLoginLog,
       deleteEmployee,
+      revokeAllEmployeeSessions,
       updateEmployeeRole,
       updateSettings,
     }),
@@ -3093,6 +3443,9 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       notifications,
       hasDueOpname,
       lowStockItems,
+      pendingOfflineOrdersCount,
+      isSyncingOfflineQueue,
+      syncOfflineQueueNow,
       addVendor,
       updateVendor,
       deleteVendor,
@@ -3147,6 +3500,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       setEmployeeCredentials,
       recordUsernameLoginLog,
       deleteEmployee,
+      revokeAllEmployeeSessions,
       updateEmployeeRole,
       updateSettings,
     ]
